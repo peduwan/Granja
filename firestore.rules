@@ -72,6 +72,18 @@ service cloud.firestore {
       allow read: if isAuthorizedUser();
       allow write: if false;
     }
+
+    // Control de Flujo Oficial AEAT (<TiempoEsperaEnvio>) distribuido (Gestionado exclusivamente por Backend)
+    match /aeat_flow_control/{obligadoId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    // Cerrojo Distribuido de Envío AEAT en Vuelo (Gestionado exclusivamente por Backend)
+    match /aeat_send_locks/{obligadoId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
   }
 }
 

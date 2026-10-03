@@ -87,6 +87,24 @@ const SHARED_STATE_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_chai
 const SHARED_RECORDS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_records.json');
 const SHARED_SUBMISSIONS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_submissions.json');
 const SHARED_EVENTS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_events.json');
+const SHARED_FLOW_CONTROL_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_flow_control.json');
+const SHARED_SEND_LOCKS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_send_locks.json');
+
+export interface CloudFlowControlDoc {
+  obligadoTributarioId: string;
+  tiempoEsperaEnvioSegundos: number;
+  lastResponseTimestamp: number;
+  nextAllowedSendTimestamp: number;
+  updatedAt: string;
+}
+
+export interface CloudSendLockDoc {
+  obligadoTributarioId: string;
+  locked: boolean;
+  ownerToken: string;
+  acquiredAt: number;
+  expiresAt: number;
+}
 
 function commitSharedCloudTransaction(record: FiscalRecord): CloudChainState {
   const dir = path.dirname(SHARED_STATE_FILE);
@@ -452,6 +470,277 @@ export class CloudDistributedChainCoordinator {
   }
 
   /**
+   * Consulta en la autoridad distribuida todas las sumisiones asociadas a un FiscalRecord.
+   * Permite garantizar idempotencia trans-instancia y detectar envíos en vuelo o ya aceptados.
+   */
+  public static async getSubmissionsForRecord(fiscalRecordId: string): Promise<FiscalSubmission[]> {
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para getSubmissionsForRecord (Fail-Closed).'
+        );
+      }
+      const snap = await firestore
+        .collection('fiscal_submissions')
+        .where('fiscalRecordId', '==', fiscalRecordId)
+        .get();
+      if (snap.empty) return [];
+      const list: FiscalSubmission[] = [];
+      snap.forEach((doc) => {
+        list.push(doc.data() as FiscalSubmission);
+      });
+      return list;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_SUBMISSIONS_FILE)) {
+      const raw = fs.readFileSync(SHARED_SUBMISSIONS_FILE, 'utf-8');
+      const allSubmissions: Record<string, FiscalSubmission> = JSON.parse(raw);
+      return Object.values(allSubmissions).filter(s => s.fiscalRecordId === fiscalRecordId);
+    }
+    return [];
+  }
+
+  /**
+   * Adquiere atómicamente el cerrojo distribuido de envío AEAT para un obligado tributario.
+   * Utiliza transacciones OCC en Firestore (`/aeat_send_locks/{obligadoId}`) para garantizar
+   * exclusión mutua global entre múltiples instancias de Cloud Run.
+   */
+  public static async acquireDistributedSendLock(
+    obligadoId: string,
+    ownerToken: string,
+    ttlMs = 60000
+  ): Promise<boolean> {
+    if (!obligadoId) return false;
+    const mode = getCoordinatorMode();
+    const now = Date.now();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para acquireDistributedSendLock (Fail-Closed).'
+        );
+      }
+      const lockRef = firestore.collection('aeat_send_locks').doc(obligadoId);
+      return await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(lockRef);
+        if (snap.exists) {
+          const data = snap.data() as CloudSendLockDoc;
+          if (data.locked && data.expiresAt > now && data.ownerToken !== ownerToken) {
+            return false;
+          }
+        }
+        const newLock: CloudSendLockDoc = {
+          obligadoTributarioId: obligadoId,
+          locked: true,
+          ownerToken,
+          acquiredAt: now,
+          expiresAt: now + ttlMs
+        };
+        tx.set(lockRef, newLock as any);
+        return true;
+      });
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    const dir = path.dirname(SHARED_SEND_LOCKS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    let allLocks: Record<string, CloudSendLockDoc> = {};
+    if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
+      allLocks = JSON.parse(fs.readFileSync(SHARED_SEND_LOCKS_FILE, 'utf-8'));
+    }
+    const existing = allLocks[obligadoId];
+    if (existing && existing.locked && existing.expiresAt > now && existing.ownerToken !== ownerToken) {
+      return false;
+    }
+    allLocks[obligadoId] = {
+      obligadoTributarioId: obligadoId,
+      locked: true,
+      ownerToken,
+      acquiredAt: now,
+      expiresAt: now + ttlMs
+    };
+    const tmp = `${SHARED_SEND_LOCKS_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(allLocks, null, 2), 'utf-8');
+    fs.renameSync(tmp, SHARED_SEND_LOCKS_FILE);
+    return true;
+  }
+
+  /**
+   * Libera atómicamente el cerrojo distribuido de envío AEAT para un obligado tributario.
+   */
+  public static async releaseDistributedSendLock(obligadoId: string, ownerToken?: string): Promise<void> {
+    if (!obligadoId) return;
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para releaseDistributedSendLock (Fail-Closed).'
+        );
+      }
+      const lockRef = firestore.collection('aeat_send_locks').doc(obligadoId);
+      await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(lockRef);
+        if (!snap.exists) return;
+        const data = snap.data() as CloudSendLockDoc;
+        if (ownerToken && data.ownerToken && data.ownerToken !== ownerToken) {
+          return;
+        }
+        tx.set(lockRef, {
+          obligadoTributarioId: obligadoId,
+          locked: false,
+          ownerToken: '',
+          acquiredAt: 0,
+          expiresAt: 0
+        });
+      });
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
+      const allLocks: Record<string, CloudSendLockDoc> = JSON.parse(fs.readFileSync(SHARED_SEND_LOCKS_FILE, 'utf-8'));
+      const existing = allLocks[obligadoId];
+      if (existing && (!ownerToken || !existing.ownerToken || existing.ownerToken === ownerToken)) {
+        delete allLocks[obligadoId];
+        const tmp = `${SHARED_SEND_LOCKS_FILE}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(allLocks, null, 2), 'utf-8');
+        fs.renameSync(tmp, SHARED_SEND_LOCKS_FILE);
+      }
+    }
+  }
+
+  /**
+   * Comprueba en la autoridad distribuida si el obligado tributario tiene un envío en vuelo bloqueado.
+   */
+  public static async isDistributedSendLocked(obligadoId: string): Promise<boolean> {
+    if (!obligadoId) return false;
+    const mode = getCoordinatorMode();
+    const now = Date.now();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para isDistributedSendLocked (Fail-Closed).'
+        );
+      }
+      const snap = await firestore.collection('aeat_send_locks').doc(obligadoId).get();
+      if (!snap.exists) return false;
+      const data = snap.data() as CloudSendLockDoc;
+      return Boolean(data.locked && data.expiresAt > now);
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
+      const allLocks: Record<string, CloudSendLockDoc> = JSON.parse(fs.readFileSync(SHARED_SEND_LOCKS_FILE, 'utf-8'));
+      const existing = allLocks[obligadoId];
+      return Boolean(existing && existing.locked && existing.expiresAt > now);
+    }
+    return false;
+  }
+
+  /**
+   * Compromete de forma autoritativa y fail-closed el estado de control de flujo AEAT (<TiempoEsperaEnvio>)
+   * en la autoridad distribuida de la nube.
+   */
+  public static async commitFlowControlState(state: CloudFlowControlDoc): Promise<void> {
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para commitFlowControlState (Fail-Closed).'
+        );
+      }
+      await firestore
+        .collection('aeat_flow_control')
+        .doc(state.obligadoTributarioId)
+        .set(JSON.parse(JSON.stringify(state)));
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    const dir = path.dirname(SHARED_FLOW_CONTROL_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    let allFlow: Record<string, CloudFlowControlDoc> = {};
+    if (fs.existsSync(SHARED_FLOW_CONTROL_FILE)) {
+      allFlow = JSON.parse(fs.readFileSync(SHARED_FLOW_CONTROL_FILE, 'utf-8'));
+    }
+    allFlow[state.obligadoTributarioId] = state;
+    const tmp = `${SHARED_FLOW_CONTROL_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(allFlow, null, 2), 'utf-8');
+    fs.renameSync(tmp, SHARED_FLOW_CONTROL_FILE);
+  }
+
+  /**
+   * Obtiene de forma autoritativa y fail-closed el estado de control de flujo AEAT (<TiempoEsperaEnvio>)
+   * desde la autoridad distribuida de la nube.
+   */
+  public static async getFlowControlState(obligadoId: string): Promise<CloudFlowControlDoc | null> {
+    if (!obligadoId) return null;
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para getFlowControlState (Fail-Closed).'
+        );
+      }
+      const snap = await firestore.collection('aeat_flow_control').doc(obligadoId).get();
+      if (snap.exists) {
+        return snap.data() as CloudFlowControlDoc;
+      }
+      return null;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_FLOW_CONTROL_FILE)) {
+      const allFlow: Record<string, CloudFlowControlDoc> = JSON.parse(fs.readFileSync(SHARED_FLOW_CONTROL_FILE, 'utf-8'));
+      return allFlow[obligadoId] || null;
+    }
+    return null;
+  }
+
+  /**
    * Resetea el simulador de estado en la nube (exclusivo para pruebas).
    */
   public static resetCloudState(): void {
@@ -467,6 +756,12 @@ export class CloudDistributedChainCoordinator {
       }
       if (fs.existsSync(SHARED_EVENTS_FILE)) {
         fs.unlinkSync(SHARED_EVENTS_FILE);
+      }
+      if (fs.existsSync(SHARED_FLOW_CONTROL_FILE)) {
+        fs.unlinkSync(SHARED_FLOW_CONTROL_FILE);
+      }
+      if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
+        fs.unlinkSync(SHARED_SEND_LOCKS_FILE);
       }
     } catch {}
   }

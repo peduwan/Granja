@@ -23,6 +23,8 @@ import { AeatCertificateProvider } from '../src/fiscal/aeatCertificateProvider';
 import { calculateAltaHash } from '../src/fiscal/hashService';
 import { Factura, FiscalRecord } from '../src/types';
 
+process.env.NODE_ENV = 'test';
+
 const OBLIGADO_TEST_A = 'B91111111';
 const OBLIGADO_TEST_B = 'B92222222';
 
@@ -104,6 +106,8 @@ async function main() {
       'fiscal_chain_state',
       'fiscal_submissions',
       'fiscal_events',
+      'aeat_flow_control',
+      'aeat_send_locks',
       'registros_facturacion',
       'facturas_inmutables'
     ];
@@ -732,6 +736,144 @@ async function main() {
 
     CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
     CloudDistributedChainCoordinator.setMode(null);
+  });
+
+  await runAdversarialTest('5.9: Cerrojo distribuido AEAT (acquireDistributedSendLock) garantiza exclusión mutua trans-instancia', async () => {
+    const { AeatFlowControlManager } = await import('../src/fiscal/aeatTransport');
+    AeatFlowControlManager.reset();
+    CloudDistributedChainCoordinator.setMode('firestore');
+
+    const lockStore: Record<string, any> = {};
+    const mockFirestoreLocks = {
+      collection: (col: string) => ({
+        doc: (docId: string) => ({
+          get: async () => ({
+            exists: Boolean(lockStore[`${col}/${docId}`]),
+            data: () => lockStore[`${col}/${docId}`]
+          })
+        })
+      }),
+      runTransaction: async (fn: any) => {
+        const tx = {
+          get: async (ref: any) => ref.get(),
+          set: (ref: any, data: any) => {
+            lockStore['aeat_send_locks/B12345678'] = data;
+          }
+        };
+        return await fn(tx);
+      }
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFirestoreLocks as any);
+
+    // Instancia Cloud Run A adquiere el cerrojo en Firestore
+    const acquiredByInstanceA = await CloudDistributedChainCoordinator.acquireDistributedSendLock(
+      'B12345678',
+      'instance-A-token',
+      60000
+    );
+    assert.strictEqual(acquiredByInstanceA, true, 'Instancia A debe adquirir el cerrojo distribuido');
+
+    // Instancia Cloud Run B (con otro proceso/memoria local vacía) intenta adquirir el cerrojo para el mismo NIF
+    const acquiredByInstanceB = await CloudDistributedChainCoordinator.acquireDistributedSendLock(
+      'B12345678',
+      'instance-B-token',
+      60000
+    );
+    assert.strictEqual(acquiredByInstanceB, false, 'Instancia B debe ser bloqueada por el cerrojo distribuido en Firestore');
+
+    // Instancia A libera su cerrojo
+    await CloudDistributedChainCoordinator.releaseDistributedSendLock('B12345678', 'instance-A-token');
+
+    // Ahora Instancia B sí puede adquirirlo
+    const acquiredByInstanceBAfter = await CloudDistributedChainCoordinator.acquireDistributedSendLock(
+      'B12345678',
+      'instance-B-token',
+      60000
+    );
+    assert.strictEqual(acquiredByInstanceBAfter, true, 'Instancia B adquiere el cerrojo tras liberarlo Instancia A');
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+    CloudDistributedChainCoordinator.setMode(null);
+    AeatFlowControlManager.reset();
+  });
+
+  await runAdversarialTest('5.10: TiempoEsperaEnvio (updateFromResponseAsync) es autoritativo en nube y Fail-Closed sin escrituras parciales', async () => {
+    const { AeatFlowControlManager } = await import('../src/fiscal/aeatTransport');
+    AeatFlowControlManager.reset();
+    CloudDistributedChainCoordinator.setMode('firestore');
+
+    const mockFailingFlowFirestore = {
+      collection: () => ({
+        doc: () => ({
+          get: async () => ({ exists: false }),
+          set: async () => {
+            throw new Error('UNAVAILABLE: Fallo de Firestore al persistir TiempoEsperaEnvio');
+          }
+        })
+      })
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFailingFlowFirestore as any);
+
+    // Si Firestore falla al guardar TiempoEsperaEnvio, updateFromResponseAsync lanza excepción y NO muta el estado local
+    await assert.rejects(async () => {
+      await AeatFlowControlManager.updateFromResponseAsync('B55667788', 240, Date.now());
+    }, /Fallo de Firestore al persistir TiempoEsperaEnvio/);
+
+    assert.strictEqual(
+      AeatFlowControlManager.getFlowState('B55667788'),
+      undefined,
+      'El estado local de flujo NO debe haberse mutado si el commit en la nube falló'
+    );
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+    CloudDistributedChainCoordinator.setMode(null);
+    AeatFlowControlManager.reset();
+  });
+
+  await runAdversarialTest('5.11: Idempotencia de envío AEAT y Outbox Pre-Commit (SENDING persistido antes del envío de red)', async () => {
+    const { executeAeatSubmission, AeatFlowControlManager } = await import('../src/fiscal/aeatTransport');
+    const { createFiscalSubmission } = await import('../src/fiscal/submissionService');
+    const { createDefaultFiscalConfiguration } = await import('../src/fiscal/modelTransformers');
+    AeatFlowControlManager.reset();
+    CloudDistributedChainCoordinator.setMode('simulator');
+
+    const existingRecord = BackendFiscalCustody.getAllFiscalRecords(OBLIGADO_TEST_A)[0];
+    const config = createDefaultFiscalConfiguration({
+      nif: OBLIGADO_TEST_A,
+      nombreRazon: 'Granja Avícola Test A S.L.'
+    });
+
+    const sub = createFiscalSubmission(existingRecord, config, { numeroIntento: 1 });
+    let preCommittedStatus: string | null = null;
+
+    const result = await executeAeatSubmission({
+      submission: sub,
+      fiscalRecord: existingRecord,
+      config,
+      options: {
+        transportMode: 'mock',
+        mockScenario: 'ACCEPTANCE',
+        onBeforeNetworkSend: async (sendingSub, startEvt) => {
+          // Verificar que ANTES de enviar por red el estado ya es SENDING y se compromete en custodia
+          preCommittedStatus = sendingSub.estado;
+          await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
+          await BackendFiscalCustody.saveFiscalEvent(startEvt);
+        }
+      }
+    });
+
+    assert.strictEqual(preCommittedStatus, 'SENDING', 'Debe pre-comprometerse en estado SENDING antes del transporte SOAP');
+    assert.strictEqual(result.submission.estado, 'ACCEPTED');
+    await BackendFiscalCustody.saveFiscalSubmission(result.submission);
+
+    // Consultar las sumisiones en la autoridad distribuida para este registro
+    const remoteSubs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(existingRecord.id);
+    assert.ok(remoteSubs.some(s => s.estado === 'ACCEPTED'), 'La autoridad distribuida registra la sumisión ACCEPTED para garantizar idempotencia');
+
+    CloudDistributedChainCoordinator.setMode(null);
+    AeatFlowControlManager.reset();
   });
 
   // Limpieza final de estados de prueba

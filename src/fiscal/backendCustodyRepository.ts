@@ -598,6 +598,27 @@ export class BackendFiscalCustody {
   }
 
   /**
+   * Consulta autoritativa asíncrona en la nube de todas las FiscalSubmission asociadas a un FiscalRecord.
+   * Garantiza idempotencia trans-instancia y evita envíos duplicados ante timeouts o respuestas perdidas.
+   */
+  public static async getFiscalSubmissionsForRecordAsync(fiscalRecordId: string): Promise<FiscalSubmission[]> {
+    this.init();
+    loadFromDisk();
+    const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    const remoteSubs = await CloudDistributedChainCoordinator.getSubmissionsForRecord(fiscalRecordId);
+    // Sincronizar con caché local si hay sumisiones remotas que no estaban en la réplica local
+    for (const remote of remoteSubs) {
+      const idx = submissionsCache.findIndex(s => s.id === remote.id);
+      if (idx !== -1) {
+        submissionsCache[idx] = Object.freeze(remote);
+      } else {
+        submissionsCache.push(Object.freeze(remote));
+      }
+    }
+    return remoteSubs;
+  }
+
+  /**
    * Registra un FiscalEvent de auditoría en la custodia del backend con cerrojo global y persistencia fail-closed.
    * Compromete PRIMERO en la autoridad distribuida de la nube y SÓLO después actualiza la réplica local.
    */

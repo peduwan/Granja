@@ -1,7 +1,7 @@
 {
-  "B88888888": {
+  "B12345678": {
     "tiempoEsperaEnvioSegundos": 180,
-    "lastResponseTimestamp": 1791045993650,
-    "nextAllowedSendTimestamp": 1791046173650
+    "lastResponseTimestamp": 1791046697749,
+    "nextAllowedSendTimestamp": 1791046877749
   }
 }

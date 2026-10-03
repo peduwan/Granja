@@ -84,39 +84,42 @@ const FLOW_CONTROL_FILE = path.resolve(process.cwd(), 'data', 'aeat_flow_control
 export class AeatFlowControlManager {
   private static flowStateByObligado: Map<string, FlowControlState> = new Map();
   private static activeLocks: Set<string> = new Set();
+  private static activeDistributedTokens: Map<string, string> = new Map();
   private static diskInitialized = false;
 
   private static initFromDisk(): void {
     if (this.diskInitialized || typeof window !== 'undefined') return;
-    try {
-      if (fs.existsSync(FLOW_CONTROL_FILE)) {
-        const raw = fs.readFileSync(FLOW_CONTROL_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        for (const [k, v] of Object.entries(parsed)) {
-          this.flowStateByObligado.set(k, v as FlowControlState);
-        }
+    if (fs.existsSync(FLOW_CONTROL_FILE)) {
+      const raw = fs.readFileSync(FLOW_CONTROL_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      for (const [k, v] of Object.entries(parsed)) {
+        this.flowStateByObligado.set(k, v as FlowControlState);
       }
-    } catch {}
+    }
     this.diskInitialized = true;
   }
 
+  /**
+   * Persiste en disco de forma atómica (write tmp + rename) y Fail-Closed (sin catch silencioso).
+   */
   private static persistToDisk(): void {
     if (typeof window !== 'undefined') return;
-    try {
-      const dataDir = path.dirname(FLOW_CONTROL_FILE);
-      if (!fs.existsSync(dataDir)) {
-        fs.mkdirSync(dataDir, { recursive: true });
-      }
-      const obj: Record<string, FlowControlState> = {};
-      for (const [k, v] of this.flowStateByObligado.entries()) {
-        obj[k] = v;
-      }
-      fs.writeFileSync(FLOW_CONTROL_FILE, JSON.stringify(obj, null, 2), 'utf-8');
-    } catch {}
+    const dataDir = path.dirname(FLOW_CONTROL_FILE);
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    const obj: Record<string, FlowControlState> = {};
+    for (const [k, v] of this.flowStateByObligado.entries()) {
+      obj[k] = v;
+    }
+    const tmpFile = `${FLOW_CONTROL_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2), 'utf-8');
+    fs.renameSync(tmpFile, FLOW_CONTROL_FILE);
   }
 
   /**
-   * Actualiza el control de flujo oficial a partir del <TiempoEsperaEnvio> devuelto por la AEAT.
+   * Actualiza el control de flujo oficial a partir del <TiempoEsperaEnvio> devuelto por la AEAT
+   * en la memoria local y disco local (para uso síncrono).
    */
   public static updateFromResponse(
     obligadoTributarioId: string,
@@ -142,6 +145,56 @@ export class AeatFlowControlManager {
   }
 
   /**
+   * Actualiza de forma distribuida, autoritativa y FAIL-CLOSED el control de flujo oficial
+   * (<TiempoEsperaEnvio>) en la autoridad de nube (Firestore) ANTES de actualizar la réplica local.
+   */
+  public static async updateFromResponseAsync(
+    obligadoTributarioId: string,
+    tiempoEsperaSegundos?: number,
+    responseTimestampMs?: number
+  ): Promise<FlowControlState> {
+    this.initFromDisk();
+    const timestamp = responseTimestampMs ?? Date.now();
+
+    let previousWait = this.flowStateByObligado.get(obligadoTributarioId)?.tiempoEsperaEnvioSegundos;
+    if (previousWait === undefined && typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      const remoteFlow = await CloudDistributedChainCoordinator.getFlowControlState(obligadoTributarioId);
+      if (remoteFlow) {
+        previousWait = remoteFlow.tiempoEsperaEnvioSegundos;
+      }
+    }
+
+    const waitSeconds = typeof tiempoEsperaSegundos === 'number' && !isNaN(tiempoEsperaSegundos)
+      ? Math.max(0, tiempoEsperaSegundos)
+      : (previousWait ?? DEFAULT_AEAT_TIEMPO_ESPERA_SEGUNDOS);
+
+    const nextAllowed = timestamp + waitSeconds * 1000;
+    const state: FlowControlState = {
+      tiempoEsperaEnvioSegundos: waitSeconds,
+      lastResponseTimestamp: timestamp,
+      nextAllowedSendTimestamp: nextAllowed
+    };
+
+    if (typeof window === 'undefined') {
+      // 1. Compromiso distribuido autoritativo y Fail-Closed en la nube PRIMERO
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      await CloudDistributedChainCoordinator.commitFlowControlState({
+        obligadoTributarioId,
+        tiempoEsperaEnvioSegundos: state.tiempoEsperaEnvioSegundos,
+        lastResponseTimestamp: state.lastResponseTimestamp,
+        nextAllowedSendTimestamp: state.nextAllowedSendTimestamp,
+        updatedAt: new Date(timestamp).toISOString()
+      });
+    }
+
+    // 2. Actualizar réplica local en memoria y disco atómico SÓLO tras éxito en la nube
+    this.flowStateByObligado.set(obligadoTributarioId, state);
+    this.persistToDisk();
+    return state;
+  }
+
+  /**
    * Obtiene los segundos de espera oficiales vigentes según la última respuesta de la AEAT.
    */
   public static getCurrentFlowWaitSeconds(obligadoTributarioId: string): number {
@@ -158,10 +211,31 @@ export class AeatFlowControlManager {
   }
 
   /**
-   * Obtiene el estado completo de control de flujo para un obligado tributario.
+   * Obtiene el estado completo de control de flujo para un obligado tributario (síncrono, réplica local).
    */
   public static getFlowState(obligadoTributarioId: string): FlowControlState | undefined {
     this.initFromDisk();
+    return this.flowStateByObligado.get(obligadoTributarioId);
+  }
+
+  /**
+   * Obtiene el estado de control de flujo consultando PRIMERO la autoridad distribuida en la nube (Fail-Closed).
+   */
+  public static async getFlowStateAsync(obligadoTributarioId: string): Promise<FlowControlState | undefined> {
+    this.initFromDisk();
+    if (typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      const remote = await CloudDistributedChainCoordinator.getFlowControlState(obligadoTributarioId);
+      if (remote) {
+        const state: FlowControlState = {
+          tiempoEsperaEnvioSegundos: remote.tiempoEsperaEnvioSegundos,
+          lastResponseTimestamp: remote.lastResponseTimestamp,
+          nextAllowedSendTimestamp: remote.nextAllowedSendTimestamp
+        };
+        this.flowStateByObligado.set(obligadoTributarioId, state);
+        return state;
+      }
+    }
     return this.flowStateByObligado.get(obligadoTributarioId);
   }
 
@@ -183,24 +257,35 @@ export class AeatFlowControlManager {
     currentTimestampMs?: number,
     pendingRecordsCount?: number
   ): boolean {
-    // Condición B: Capacidad máxima del lote alcanzada (>= 1.000 registros)
-    // Permite el envío inmediato sin esperar la expiración de TiempoEsperaEnvio.
     if (typeof pendingRecordsCount === 'number' && pendingRecordsCount >= MAX_AEAT_RECORDS_PER_SUBMISSION) {
       return true;
     }
 
-    // Condición A: Expiración del temporizador de espera desde la última respuesta
     const now = currentTimestampMs ?? Date.now();
     const nextAllowed = this.getNextAllowedSendTimestamp(obligadoTributarioId);
     return now >= nextAllowed;
   }
 
   /**
-   * CERROJO DE ENVÍO EN VUELO (Exclusión mutua por obligadoTributarioId)
-   *
-   * Impide que dos ejecuciones concurrentes del mismo obligado tributario
-   * realicen simultáneamente dos envíos SOAP, garantizando control de flujo
-   * y evitando colisiones en el outbox.
+   * Evaluación asíncrona y distribuida de la regla disyuntiva oficial AEAT consultando la autoridad cloud.
+   */
+  public static async isSendAllowedAsync(
+    obligadoTributarioId: string,
+    currentTimestampMs?: number,
+    pendingRecordsCount?: number
+  ): Promise<boolean> {
+    if (typeof pendingRecordsCount === 'number' && pendingRecordsCount >= MAX_AEAT_RECORDS_PER_SUBMISSION) {
+      return true;
+    }
+
+    const now = currentTimestampMs ?? Date.now();
+    const state = await this.getFlowStateAsync(obligadoTributarioId);
+    const nextAllowed = state?.nextAllowedSendTimestamp ?? 0;
+    return now >= nextAllowed;
+  }
+
+  /**
+   * CERROJO DE ENVÍO EN VUELO DE PROCESO (Síncrono)
    */
   public static acquireSendLock(obligadoTributarioId: string): boolean {
     if (!obligadoTributarioId) return false;
@@ -212,19 +297,80 @@ export class AeatFlowControlManager {
   }
 
   /**
-   * Libera el cerrojo de envío en vuelo para el obligado tributario especificado.
-   * Se debe invocar SIEMPRE dentro de un bloque finally.
+   * CERROJO DISTRIBUIDO DE ENVÍO EN VUELO (Exclusión mutua global multi-instancia Cloud Run / Firestore)
+   * Impide que dos instancias distintas de Cloud Run o dos ejecuciones concurrentes del mismo obligado
+   * realicen simultáneamente dos envíos SOAP a la AEAT.
+   */
+  public static async acquireSendLockAsync(
+    obligadoTributarioId: string,
+    ownerToken?: string,
+    ttlMs = 60000
+  ): Promise<boolean> {
+    if (!obligadoTributarioId) return false;
+    if (this.activeLocks.has(obligadoTributarioId)) {
+      return false;
+    }
+
+    const token = ownerToken || `lock-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    if (typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      const distributedAcquired = await CloudDistributedChainCoordinator.acquireDistributedSendLock(
+        obligadoTributarioId,
+        token,
+        ttlMs
+      );
+      if (!distributedAcquired) {
+        return false;
+      }
+    }
+
+    this.activeLocks.add(obligadoTributarioId);
+    this.activeDistributedTokens.set(obligadoTributarioId, token);
+    return true;
+  }
+
+  /**
+   * Libera el cerrojo de envío en vuelo de proceso.
    */
   public static releaseSendLock(obligadoTributarioId: string): void {
     if (!obligadoTributarioId) return;
     this.activeLocks.delete(obligadoTributarioId);
+    this.activeDistributedTokens.delete(obligadoTributarioId);
   }
 
   /**
-   * Comprueba si el obligado tributario tiene un envío en vuelo bloqueado.
+   * Libera atómicamente el cerrojo distribuido de envío en vuelo en la autoridad de nube y en el proceso local.
+   */
+  public static async releaseSendLockAsync(obligadoTributarioId: string): Promise<void> {
+    if (!obligadoTributarioId) return;
+    const token = this.activeDistributedTokens.get(obligadoTributarioId);
+    this.activeLocks.delete(obligadoTributarioId);
+    this.activeDistributedTokens.delete(obligadoTributarioId);
+
+    if (typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      await CloudDistributedChainCoordinator.releaseDistributedSendLock(obligadoTributarioId, token);
+    }
+  }
+
+  /**
+   * Comprueba si el obligado tributario tiene un envío en vuelo bloqueado en este proceso.
    */
   public static isSendLocked(obligadoTributarioId: string): boolean {
     return this.activeLocks.has(obligadoTributarioId);
+  }
+
+  /**
+   * Comprueba en la autoridad distribuida si el obligado tributario tiene un envío en vuelo bloqueado en cualquier instancia.
+   */
+  public static async isSendLockedAsync(obligadoTributarioId: string): Promise<boolean> {
+    if (this.activeLocks.has(obligadoTributarioId)) return true;
+    if (typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      return await CloudDistributedChainCoordinator.isDistributedSendLocked(obligadoTributarioId);
+    }
+    return false;
   }
 
   /**
@@ -233,10 +379,19 @@ export class AeatFlowControlManager {
   public static reset(): void {
     this.flowStateByObligado.clear();
     this.activeLocks.clear();
+    this.activeDistributedTokens.clear();
     this.diskInitialized = true;
     try {
       if (fs.existsSync(FLOW_CONTROL_FILE)) {
         fs.unlinkSync(FLOW_CONTROL_FILE);
+      }
+      const sharedLocks = path.resolve(process.cwd(), 'data', 'cloud_shared_send_locks.json');
+      if (fs.existsSync(sharedLocks)) {
+        fs.unlinkSync(sharedLocks);
+      }
+      const sharedFlow = path.resolve(process.cwd(), 'data', 'cloud_shared_flow_control.json');
+      if (fs.existsSync(sharedFlow)) {
+        fs.unlinkSync(sharedFlow);
       }
     } catch {}
   }
@@ -275,24 +430,29 @@ export interface AeatTransportOptions {
   readonly httpHeaders?: Record<string, string>;
   readonly customFetch?: (url: string, init: any) => Promise<any>;
   readonly acquireLock?: boolean;
+  /**
+   * Hook de persistencia previa al envío de red (Outbox Pre-Commit) para garantizar
+   * idempotencia distribuida ante caídas o timeouts tras el envío SOAP.
+   */
+  readonly onBeforeNetworkSend?: (sendingSubmission: FiscalSubmission, startEvent: FiscalEvent) => Promise<void>;
 }
 
 /**
- * Ejecuta una operación de remisión SOAP protegida con cerrojo de exclusión mutua
+ * Ejecuta una operación de remisión SOAP protegida con cerrojo distribuido de exclusión mutua
  * por obligadoTributarioId. Garantiza que el cerrojo se libere SIEMPRE en un bloque finally.
  */
 export async function executeWithAeatLock<T>(
   obligadoTributarioId: string,
   operation: () => Promise<T>
 ): Promise<{ executed: true; result: T } | { executed: false; reason: string }> {
-  if (!AeatFlowControlManager.acquireSendLock(obligadoTributarioId)) {
+  if (!(await AeatFlowControlManager.acquireSendLockAsync(obligadoTributarioId))) {
     return { executed: false, reason: 'CONCURRENT_SEND_LOCKED' };
   }
   try {
     const result = await operation();
     return { executed: true, result };
   } finally {
-    AeatFlowControlManager.releaseSendLock(obligadoTributarioId);
+    await AeatFlowControlManager.releaseSendLockAsync(obligadoTributarioId);
   }
 }
 
@@ -438,7 +598,7 @@ export async function executeAeatSubmission(params: {
 
   const shouldManageLock = options?.acquireLock !== false;
   if (shouldManageLock) {
-    const lockAcquired = AeatFlowControlManager.acquireSendLock(fiscalRecord.obligadoTributarioId);
+    const lockAcquired = await AeatFlowControlManager.acquireSendLockAsync(fiscalRecord.obligadoTributarioId);
     if (!lockAcquired) {
       throw new Error(`executeAeatSubmission: Envío concurrente bloqueado para el obligado tributario ${fiscalRecord.obligadoTributarioId}. Ya existe un envío en vuelo.`);
     }
@@ -447,7 +607,7 @@ export async function executeAeatSubmission(params: {
   try {
     // 2. Transición a estado SENDING y emisión de evento de auditoría
     const sendingSubmission = transitionSubmissionStatus(submission, 'SENDING');
-    createTransportFiscalEvent({
+    const startEvent = createTransportFiscalEvent({
       obligadoTributarioId: fiscalRecord.obligadoTributarioId,
       tipo: 'ENVIO_AEAT_INICIADO',
       fiscalRecordId: fiscalRecord.id,
@@ -460,6 +620,11 @@ export async function executeAeatSubmission(params: {
         endpoint: submission.endpoint
       }
     });
+
+    // 2.b Compromiso previo al envío de red (Outbox Pre-Commit) si se suministró hook autoritativo
+    if (options?.onBeforeNetworkSend) {
+      await options.onBeforeNetworkSend(sendingSubmission, startEvent);
+    }
 
     const soapPayload = wrapInAeatSoapEnvelope(xmlParaEnvio);
 
@@ -701,9 +866,9 @@ export async function executeAeatSubmission(params: {
       }
 
       // 6. Transición según el estado funcional de la respuesta AEAT
-      // Actualizar control de flujo oficial AEAT si la respuesta contiene TiempoEsperaEnvio
+      // Actualizar control de flujo oficial AEAT de forma distribuida y fail-closed si la respuesta contiene TiempoEsperaEnvio
       if (parsed.tiempoEsperaEnvio !== undefined) {
-        AeatFlowControlManager.updateFromResponse(
+        await AeatFlowControlManager.updateFromResponseAsync(
           fiscalRecord.obligadoTributarioId,
           parsed.tiempoEsperaEnvio,
           Date.now()
@@ -841,7 +1006,7 @@ export async function executeAeatSubmission(params: {
     }
   } finally {
     if (shouldManageLock) {
-      AeatFlowControlManager.releaseSendLock(fiscalRecord.obligadoTributarioId);
+      await AeatFlowControlManager.releaseSendLockAsync(fiscalRecord.obligadoTributarioId);
     }
   }
 }
