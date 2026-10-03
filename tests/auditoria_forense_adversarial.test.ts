@@ -876,6 +876,120 @@ async function main() {
     AeatFlowControlManager.reset();
   });
 
+  await runAdversarialTest('5.12: Renovación de lease (Heartbeat) verifica ownerToken en transacción OCC y evita expiración prematura', async () => {
+    const { AeatFlowControlManager } = await import('../src/fiscal/aeatTransport');
+    AeatFlowControlManager.reset();
+    CloudDistributedChainCoordinator.setMode('firestore');
+
+    const lockStore: Record<string, any> = {};
+    const mockFirestoreLocks = {
+      collection: (col: string) => ({
+        doc: (docId: string) => ({
+          get: async () => ({
+            exists: Boolean(lockStore[`${col}/${docId}`]),
+            data: () => lockStore[`${col}/${docId}`]
+          })
+        })
+      }),
+      runTransaction: async (fn: any) => {
+        const tx = {
+          get: async (ref: any) => ref.get(),
+          set: (ref: any, data: any) => {
+            lockStore['aeat_send_locks/B88888888'] = data;
+          }
+        };
+        return await fn(tx);
+      }
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFirestoreLocks as any);
+
+    // 1. Instancia A adquiere lock con TTL inicial corto (100ms)
+    const acquired = await CloudDistributedChainCoordinator.acquireDistributedSendLock('B88888888', 'owner-A', 100);
+    assert.strictEqual(acquired, true);
+    const initialExpiresAt = lockStore['aeat_send_locks/B88888888'].expiresAt;
+
+    // 2. Intento de renovación por un impostor (owner-B) DEBE fallar (false) y no alterar el ownerToken
+    const spoofRenew = await CloudDistributedChainCoordinator.renewDistributedSendLock('B88888888', 'owner-B', 5000);
+    assert.strictEqual(spoofRenew, false, 'Un proceso con distinto ownerToken NO puede renovar el lease');
+    assert.strictEqual(lockStore['aeat_send_locks/B88888888'].ownerToken, 'owner-A');
+
+    // 3. Renovación legítima por owner-A extiende expiresAt
+    await new Promise(r => setTimeout(r, 15));
+    const validRenew = await CloudDistributedChainCoordinator.renewDistributedSendLock('B88888888', 'owner-A', 5000);
+    assert.strictEqual(validRenew, true, 'El propietario legítimo renueva el lease con éxito');
+    assert.ok(
+      lockStore['aeat_send_locks/B88888888'].expiresAt > initialExpiresAt + 4000,
+      'expiresAt se ha extendido mediante heartbeat'
+    );
+
+    // 4. Probar el heartbeat automático de AeatFlowControlManager
+    AeatFlowControlManager.reset();
+    delete lockStore['aeat_send_locks/B88888888'];
+    const lockWithHeartbeat = await AeatFlowControlManager.acquireSendLockAsync('B88888888', 'owner-hb', 80, 25);
+    assert.strictEqual(lockWithHeartbeat, true);
+    const exp1 = lockStore['aeat_send_locks/B88888888'].expiresAt;
+
+    // Esperar ~60ms para que el heartbeat de 25ms se ejecute al menos dos veces
+    await new Promise(r => setTimeout(r, 60));
+    const exp2 = lockStore['aeat_send_locks/B88888888'].expiresAt;
+    assert.ok(exp2 > exp1, 'El heartbeat periódico renovó automáticamente el lease antes de su expiración');
+
+    await AeatFlowControlManager.releaseSendLockAsync('B88888888');
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+    CloudDistributedChainCoordinator.setMode(null);
+    AeatFlowControlManager.reset();
+  });
+
+  await runAdversarialTest('5.13: Techo matemático de timeout frente a TTL y código 409 en colisión de cerrojo concurrente', async () => {
+    const { executeAeatSubmission, AeatFlowControlManager, MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS } = await import('../src/fiscal/aeatTransport');
+    const { createFiscalSubmission } = await import('../src/fiscal/submissionService');
+    const { createDefaultFiscalConfiguration } = await import('../src/fiscal/modelTransformers');
+    AeatFlowControlManager.reset();
+    CloudDistributedChainCoordinator.setMode('simulator');
+
+    const existingRecord = BackendFiscalCustody.getAllFiscalRecords(OBLIGADO_TEST_A)[0];
+    const config = createDefaultFiscalConfiguration({
+      nif: OBLIGADO_TEST_A,
+      nombreRazon: 'Granja Avícola Test A S.L.'
+    });
+    const sub = createFiscalSubmission(existingRecord, config, { numeroIntento: 2 });
+
+    // 1. Prohibición matemática de timeout superior a MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS (45000ms)
+    await assert.rejects(async () => {
+      await executeAeatSubmission({
+        submission: sub,
+        fiscalRecord: existingRecord,
+        config,
+        options: {
+          transportMode: 'mock',
+          timeoutMs: MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS + 5000
+        }
+      });
+    }, /supera el máximo permitido de seguridad/);
+
+    // 2. Si el cerrojo ya está adquirido por otra operación, executeAeatSubmission lanza error con statusCode=409
+    await AeatFlowControlManager.acquireSendLockAsync(existingRecord.obligadoTributarioId, 'other-owner');
+    try {
+      await executeAeatSubmission({
+        submission: sub,
+        fiscalRecord: existingRecord,
+        config,
+        options: {
+          transportMode: 'mock'
+        }
+      });
+      assert.fail('Debió lanzar excepción de conflicto concurrente');
+    } catch (err: any) {
+      assert.strictEqual(err.statusCode, 409, 'El error de cerrojo concurrente debe señalizar HTTP 409 Conflict');
+      assert.strictEqual(err.code, 'CONCURRENT_SEND_LOCKED');
+    } finally {
+      await AeatFlowControlManager.releaseSendLockAsync(existingRecord.obligadoTributarioId);
+      CloudDistributedChainCoordinator.setMode(null);
+      AeatFlowControlManager.reset();
+    }
+  });
+
   // Limpieza final de estados de prueba
   BackendFiscalCustody.resetCustody();
   CloudDistributedChainCoordinator.resetCloudState();

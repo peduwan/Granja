@@ -72,6 +72,9 @@ export const AEAT_SOAP_ENDPOINTS = {
  */
 export const DEFAULT_AEAT_TIEMPO_ESPERA_SEGUNDOS = 60;
 export const MAX_AEAT_RECORDS_PER_SUBMISSION = 1000;
+export const DEFAULT_AEAT_LOCK_LEASE_TTL_MS = 60000;
+export const DEFAULT_AEAT_LOCK_HEARTBEAT_INTERVAL_MS = 20000;
+export const MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS = 45000;
 
 export interface FlowControlState {
   readonly tiempoEsperaEnvioSegundos: number;
@@ -85,6 +88,7 @@ export class AeatFlowControlManager {
   private static flowStateByObligado: Map<string, FlowControlState> = new Map();
   private static activeLocks: Set<string> = new Set();
   private static activeDistributedTokens: Map<string, string> = new Map();
+  private static activeHeartbeatTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private static diskInitialized = false;
 
   private static initFromDisk(): void {
@@ -304,7 +308,8 @@ export class AeatFlowControlManager {
   public static async acquireSendLockAsync(
     obligadoTributarioId: string,
     ownerToken?: string,
-    ttlMs = 60000
+    ttlMs = DEFAULT_AEAT_LOCK_LEASE_TTL_MS,
+    heartbeatIntervalMs = DEFAULT_AEAT_LOCK_HEARTBEAT_INTERVAL_MS
   ): Promise<boolean> {
     if (!obligadoTributarioId) return false;
     if (this.activeLocks.has(obligadoTributarioId)) {
@@ -327,7 +332,78 @@ export class AeatFlowControlManager {
 
     this.activeLocks.add(obligadoTributarioId);
     this.activeDistributedTokens.set(obligadoTributarioId, token);
+
+    if (typeof window === 'undefined' && heartbeatIntervalMs > 0) {
+      this.startLockHeartbeat(obligadoTributarioId, token, ttlMs, heartbeatIntervalMs);
+    }
+
     return true;
+  }
+
+  /**
+   * Renueva explícitamente el lease del cerrojo distribuido de envío AEAT verificando ownerToken.
+   */
+  public static async renewSendLockAsync(
+    obligadoTributarioId: string,
+    ownerToken?: string,
+    ttlMs = DEFAULT_AEAT_LOCK_LEASE_TTL_MS
+  ): Promise<boolean> {
+    if (!obligadoTributarioId) return false;
+    const token = ownerToken || this.activeDistributedTokens.get(obligadoTributarioId);
+    if (!token) return false;
+
+    if (typeof window === 'undefined') {
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      return await CloudDistributedChainCoordinator.renewDistributedSendLock(
+        obligadoTributarioId,
+        token,
+        ttlMs
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Inicia un heartbeat periódico que extiende el lease en la autoridad distribuida mientras la operación SOAP sigue en curso.
+   */
+  public static startLockHeartbeat(
+    obligadoTributarioId: string,
+    ownerToken: string,
+    ttlMs = DEFAULT_AEAT_LOCK_LEASE_TTL_MS,
+    intervalMs = DEFAULT_AEAT_LOCK_HEARTBEAT_INTERVAL_MS
+  ): void {
+    this.stopLockHeartbeat(obligadoTributarioId);
+    const timer = setInterval(async () => {
+      try {
+        const currentToken = this.activeDistributedTokens.get(obligadoTributarioId);
+        if (currentToken !== ownerToken) {
+          this.stopLockHeartbeat(obligadoTributarioId);
+          return;
+        }
+        const renewed = await this.renewSendLockAsync(obligadoTributarioId, ownerToken, ttlMs);
+        if (!renewed) {
+          this.stopLockHeartbeat(obligadoTributarioId);
+        }
+      } catch {
+        // Error transitorio en heartbeat: se reintentará en el siguiente pulso dentro del margen del TTL
+      }
+    }, intervalMs);
+
+    if (typeof (timer as any).unref === 'function') {
+      (timer as any).unref();
+    }
+    this.activeHeartbeatTimers.set(obligadoTributarioId, timer);
+  }
+
+  /**
+   * Detiene el heartbeat periódico de renovación de lease para un obligado tributario.
+   */
+  public static stopLockHeartbeat(obligadoTributarioId: string): void {
+    const existingTimer = this.activeHeartbeatTimers.get(obligadoTributarioId);
+    if (existingTimer) {
+      clearInterval(existingTimer);
+      this.activeHeartbeatTimers.delete(obligadoTributarioId);
+    }
   }
 
   /**
@@ -335,6 +411,7 @@ export class AeatFlowControlManager {
    */
   public static releaseSendLock(obligadoTributarioId: string): void {
     if (!obligadoTributarioId) return;
+    this.stopLockHeartbeat(obligadoTributarioId);
     this.activeLocks.delete(obligadoTributarioId);
     this.activeDistributedTokens.delete(obligadoTributarioId);
   }
@@ -344,6 +421,7 @@ export class AeatFlowControlManager {
    */
   public static async releaseSendLockAsync(obligadoTributarioId: string): Promise<void> {
     if (!obligadoTributarioId) return;
+    this.stopLockHeartbeat(obligadoTributarioId);
     const token = this.activeDistributedTokens.get(obligadoTributarioId);
     this.activeLocks.delete(obligadoTributarioId);
     this.activeDistributedTokens.delete(obligadoTributarioId);
@@ -377,6 +455,10 @@ export class AeatFlowControlManager {
    * Limpia el almacén de control de flujo y cerrojos activos (útil para pruebas).
    */
   public static reset(): void {
+    for (const timer of this.activeHeartbeatTimers.values()) {
+      clearInterval(timer);
+    }
+    this.activeHeartbeatTimers.clear();
     this.flowStateByObligado.clear();
     this.activeLocks.clear();
     this.activeDistributedTokens.clear();
@@ -596,11 +678,29 @@ export async function executeAeatSubmission(params: {
   const actor: FiscalActor = options?.actor || { tipo: 'SYSTEM', nombre: 'AeatTransportService' };
   const startTime = Date.now();
 
+  // Validar techo matemático del timeout de transporte frente al lease inicial del cerrojo (Opción A + B)
+  const requestedTimeoutMs = options?.timeoutMs ?? config.transporte?.timeoutMs ?? 30000;
+  if (requestedTimeoutMs > MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS) {
+    throw new Error(
+      `executeAeatSubmission: El timeout de transporte configurado (${requestedTimeoutMs}ms) supera el máximo permitido de seguridad (${MAX_ALLOWED_AEAT_TRANSPORT_TIMEOUT_MS}ms) frente al TTL de lease (${DEFAULT_AEAT_LOCK_LEASE_TTL_MS}ms).`
+    );
+  }
+
   const shouldManageLock = options?.acquireLock !== false;
   if (shouldManageLock) {
-    const lockAcquired = await AeatFlowControlManager.acquireSendLockAsync(fiscalRecord.obligadoTributarioId);
+    const lockAcquired = await AeatFlowControlManager.acquireSendLockAsync(
+      fiscalRecord.obligadoTributarioId,
+      undefined,
+      DEFAULT_AEAT_LOCK_LEASE_TTL_MS,
+      DEFAULT_AEAT_LOCK_HEARTBEAT_INTERVAL_MS
+    );
     if (!lockAcquired) {
-      throw new Error(`executeAeatSubmission: Envío concurrente bloqueado para el obligado tributario ${fiscalRecord.obligadoTributarioId}. Ya existe un envío en vuelo.`);
+      const conflictErr: any = new Error(
+        `executeAeatSubmission: Envío concurrente bloqueado para el obligado tributario ${fiscalRecord.obligadoTributarioId}. Ya existe un envío en vuelo.`
+      );
+      conflictErr.statusCode = 409;
+      conflictErr.code = 'CONCURRENT_SEND_LOCKED';
+      throw conflictErr;
     }
   }
 

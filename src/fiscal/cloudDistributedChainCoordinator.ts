@@ -581,6 +581,71 @@ export class CloudDistributedChainCoordinator {
   }
 
   /**
+   * Renueva atómicamente (Heartbeat) el lease del cerrojo distribuido de envío AEAT.
+   * Comprueba obligatoriamente en transacción OCC que el `ownerToken` actual del cerrojo
+   * siga coincidiendo exactamente con el `ownerToken` del proceso emisor antes de extender `expiresAt`.
+   * Si otro proceso tomó el cerrojo o fue liberado, devuelve `false`.
+   */
+  public static async renewDistributedSendLock(
+    obligadoId: string,
+    ownerToken: string,
+    ttlMs = 60000
+  ): Promise<boolean> {
+    if (!obligadoId || !ownerToken) return false;
+    const mode = getCoordinatorMode();
+    const now = Date.now();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para renewDistributedSendLock (Fail-Closed).'
+        );
+      }
+      const lockRef = firestore.collection('aeat_send_locks').doc(obligadoId);
+      return await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(lockRef);
+        if (!snap.exists) {
+          return false;
+        }
+        const data = snap.data() as CloudSendLockDoc;
+        if (!data.locked || data.ownerToken !== ownerToken) {
+          return false;
+        }
+        const renewedLock: CloudSendLockDoc = {
+          ...data,
+          expiresAt: now + ttlMs
+        };
+        tx.set(lockRef, renewedLock as any);
+        return true;
+      });
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (!fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
+      return false;
+    }
+    const allLocks: Record<string, CloudSendLockDoc> = JSON.parse(fs.readFileSync(SHARED_SEND_LOCKS_FILE, 'utf-8'));
+    const existing = allLocks[obligadoId];
+    if (!existing || !existing.locked || existing.ownerToken !== ownerToken) {
+      return false;
+    }
+    allLocks[obligadoId] = {
+      ...existing,
+      expiresAt: now + ttlMs
+    };
+    const tmp = `${SHARED_SEND_LOCKS_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(allLocks, null, 2), 'utf-8');
+    fs.renameSync(tmp, SHARED_SEND_LOCKS_FILE);
+    return true;
+  }
+
+  /**
    * Libera atómicamente el cerrojo distribuido de envío AEAT para un obligado tributario.
    */
   public static async releaseDistributedSendLock(obligadoId: string, ownerToken?: string): Promise<void> {

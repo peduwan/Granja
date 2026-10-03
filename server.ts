@@ -1050,65 +1050,7 @@ app.post("/api/fiscal/submit", requireFiscalAuthMiddleware, async (req: FiscalAu
       });
     }
 
-    // 4. Idempotencia y Control de Outbox Distribuido en la Nube (Prevención de envíos duplicados o a ciegas)
-    const existingSubmissions = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(recordToSubmit.id);
-    const sortedSubmissions = [...existingSubmissions].sort(
-      (a, b) => (b.numeroIntento || 0) - (a.numeroIntento || 0)
-    );
-    const latestSubmission = sortedSubmissions[0];
-
-    if (latestSubmission) {
-      // 4.a Idempotencia estricta: Si el registro ya fue aceptado por la AEAT, devolver resultado existente sin reenviar SOAP
-      if (latestSubmission.estado === 'ACCEPTED' || latestSubmission.estado === 'ACCEPTED_WITH_ERRORS') {
-        const existingEvents = BackendFiscalCustody.getFiscalEvents(recordToSubmit.id);
-        return res.json({
-          submission: latestSubmission,
-          fiscalEvent: existingEvents[existingEvents.length - 1] || null,
-          isTechnicalError: false,
-          idempotentReplay: true
-        });
-      }
-
-      // 4.b Si existe un envío en vuelo (SENDING) en cualquier instancia, bloquear duplicación concurrente
-      if (latestSubmission.estado === 'SENDING') {
-        return res.status(409).json({
-          error: `Remisión en vuelo detectada: El registro '${recordToSubmit.id}' ya tiene un envío activo en estado 'SENDING' (${latestSubmission.id}). Prohibido duplicar envíos concurrentes.`
-        });
-      }
-
-      // 4.c Si fue rechazado funcionalmente por la AEAT, prohibir reenvío ciego sin subsanación
-      if (latestSubmission.estado === 'REJECTED') {
-        return res.status(409).json({
-          error: `Remisión bloqueada: El registro '${recordToSubmit.id}' fue rechazado funcionalmente por la AEAT ([${latestSubmission.codigoAeat}] ${latestSubmission.descripcion}). Requiere subsanación reglamentaria, no admite reenvío automático.`
-        });
-      }
-
-      // 4.d Si alcanzó el límite máximo de intentos técnicos
-      if (latestSubmission.numeroIntento >= 3 && latestSubmission.estado === 'FAILED_TECHNICAL') {
-        return res.status(429).json({
-          error: `Límite máximo de reintentos técnicos (3) alcanzado para el registro '${recordToSubmit.id}'.`
-        });
-      }
-    }
-
-    // 4.e Verificar ventana distribuida de control de flujo AEAT (<TiempoEsperaEnvio>) antes de enviar
-    const sendAllowedByFlow = await AeatFlowControlManager.isSendAllowedAsync(recordToSubmit.obligadoTributarioId);
-    if (!sendAllowedByFlow) {
-      const nextAllowed = (await AeatFlowControlManager.getFlowStateAsync(recordToSubmit.obligadoTributarioId))?.nextAllowedSendTimestamp ?? 0;
-      const waitSec = Math.max(1, Math.ceil((nextAllowed - Date.now()) / 1000));
-      return res.status(429).json({
-        error: `Control de flujo oficial AEAT activo para el obligado ${recordToSubmit.obligadoTributarioId}. Debe aguardar ${waitSec}s (<TiempoEsperaEnvio>) antes del próximo envío.`
-      });
-    }
-
-    // 5. Configuración y Sumisión resueltas EXCLUSIVAMENTE en servidor (cero autoridad de cliente)
-    const serverFiscalConfig = getServerFiscalConfig(recordToSubmit);
-    const nextAttemptNumber = latestSubmission ? latestSubmission.numeroIntento + 1 : 1;
-    const serverSubmission = createFiscalSubmission(recordToSubmit, serverFiscalConfig, {
-      numeroIntento: nextAttemptNumber
-    });
-
-    // 6. Transporte estrictamente confiable con FAIL-CLOSED en producción (P1 / Punto 10)
+    // 4. Transporte estrictamente confiable con FAIL-CLOSED en producción (P1 / Punto 10)
     const isProduction = process.env.NODE_ENV === 'production';
     if (isProduction) {
       if (!AeatCertificateProvider.hasCertificate()) {
@@ -1123,39 +1065,116 @@ app.post("/api/fiscal/submit", requireFiscalAuthMiddleware, async (req: FiscalAu
       }
     }
 
-    const serverTransportMode = isProduction
-      ? 'real'
-      : (process.env.AEAT_TRANSPORT_MODE || (AeatCertificateProvider.hasCertificate() ? 'real' : 'mock'));
+    // 5. ADQUISICIÓN ATÓMICA DEL CERROJO DISTRIBUIDO CON HEARTBEAT (Elimina carrera TOCTOU)
+    // Se adquiere el cerrojo ANTES de inspeccionar las sumisiones del Outbox y el control de flujo,
+    // garantizando que toda la evaluación de estado + pre-commit SENDING + envío SOAP sea atómica.
+    const lockAcquired = await AeatFlowControlManager.acquireSendLockAsync(recordToSubmit.obligadoTributarioId);
+    if (!lockAcquired) {
+      return res.status(409).json({
+        error: `Remisión en vuelo bloqueada: Ya existe un envío concurrente activo para el obligado tributario '${recordToSubmit.obligadoTributarioId}'. Prohibido duplicar envíos en paralelo.`
+      });
+    }
 
-    const result = await executeAeatSubmission({
-      submission: serverSubmission,
-      fiscalRecord: recordToSubmit,
-      config: serverFiscalConfig,
-      options: {
-        transportMode: serverTransportMode as any,
-        actor: {
-          tipo: 'USER',
-          id: req.fiscalUser?.uid,
-          email: req.fiscalUser?.email,
-          nombre: req.fiscalUser?.email || 'AuthenticatedOperator'
-        },
-        // Outbox Pre-Commit: Persiste en la autoridad distribuida el estado SENDING ANTES de enviar por red
-        onBeforeNetworkSend: async (sendingSub, startEvt) => {
-          await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
-          await BackendFiscalCustody.saveFiscalEvent(startEvt);
+    try {
+      // 6. Idempotencia y Control de Outbox Distribuido en la Nube DENTRO del cerrojo exclusivo
+      const existingSubmissions = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(recordToSubmit.id);
+      const sortedSubmissions = [...existingSubmissions].sort(
+        (a, b) => (b.numeroIntento || 0) - (a.numeroIntento || 0)
+      );
+      const latestSubmission = sortedSubmissions[0];
+
+      if (latestSubmission) {
+        // 6.a Idempotencia estricta: Si el registro ya fue aceptado por la AEAT, devolver resultado existente sin reenviar SOAP
+        if (latestSubmission.estado === 'ACCEPTED' || latestSubmission.estado === 'ACCEPTED_WITH_ERRORS') {
+          const existingEvents = BackendFiscalCustody.getFiscalEvents(recordToSubmit.id);
+          return res.json({
+            submission: latestSubmission,
+            fiscalEvent: existingEvents[existingEvents.length - 1] || null,
+            isTechnicalError: false,
+            idempotentReplay: true
+          });
+        }
+
+        // 6.b Autoridad adicional sobre estado SENDING (Opción C): Incluso si un lease anterior expiró,
+        // no iniciar otro envío mientras conste un SENDING vigente en el Outbox autoritativo.
+        if (latestSubmission.estado === 'SENDING') {
+          return res.status(409).json({
+            error: `Remisión en vuelo detectada: El registro '${recordToSubmit.id}' ya tiene un envío activo en estado 'SENDING' (${latestSubmission.id}). Prohibido duplicar envíos concurrentes.`
+          });
+        }
+
+        // 6.c Si fue rechazado funcionalmente por la AEAT, prohibir reenvío ciego sin subsanación
+        if (latestSubmission.estado === 'REJECTED') {
+          return res.status(409).json({
+            error: `Remisión bloqueada: El registro '${recordToSubmit.id}' fue rechazado funcionalmente por la AEAT ([${latestSubmission.codigoAeat}] ${latestSubmission.descripcion}). Requiere subsanación reglamentaria, no admite reenvío automático.`
+          });
+        }
+
+        // 6.d Si alcanzó el límite máximo de intentos técnicos
+        if (latestSubmission.numeroIntento >= 3 && latestSubmission.estado === 'FAILED_TECHNICAL') {
+          return res.status(429).json({
+            error: `Límite máximo de reintentos técnicos (3) alcanzado para el registro '${recordToSubmit.id}'.`
+          });
         }
       }
-    });
 
-    // 7. Persistencia fail-closed del estado terminal en custodia de backend (si falla persistir, lanza 500)
-    await BackendFiscalCustody.saveFiscalSubmission(result.submission);
-    await BackendFiscalCustody.saveFiscalEvent(result.fiscalEvent);
+      // 6.e Verificar ventana distribuida de control de flujo AEAT (<TiempoEsperaEnvio>) antes de enviar
+      const sendAllowedByFlow = await AeatFlowControlManager.isSendAllowedAsync(recordToSubmit.obligadoTributarioId);
+      if (!sendAllowedByFlow) {
+        const nextAllowed = (await AeatFlowControlManager.getFlowStateAsync(recordToSubmit.obligadoTributarioId))?.nextAllowedSendTimestamp ?? 0;
+        const waitSec = Math.max(1, Math.ceil((nextAllowed - Date.now()) / 1000));
+        return res.status(429).json({
+          error: `Control de flujo oficial AEAT activo para el obligado ${recordToSubmit.obligadoTributarioId}. Debe aguardar ${waitSec}s (<TiempoEsperaEnvio>) antes del próximo envío.`
+        });
+      }
 
-    res.json(result);
+      // 7. Configuración y Sumisión resueltas EXCLUSIVAMENTE en servidor (cero autoridad de cliente)
+      const serverFiscalConfig = getServerFiscalConfig(recordToSubmit);
+      const nextAttemptNumber = latestSubmission ? latestSubmission.numeroIntento + 1 : 1;
+      const serverSubmission = createFiscalSubmission(recordToSubmit, serverFiscalConfig, {
+        numeroIntento: nextAttemptNumber
+      });
+
+      const serverTransportMode = isProduction
+        ? 'real'
+        : (process.env.AEAT_TRANSPORT_MODE || (AeatCertificateProvider.hasCertificate() ? 'real' : 'mock'));
+
+      // 8. Ejecutar transporte indicando acquireLock: false porque el cerrojo distribuido con heartbeat
+      // ya está adquirido por este contexto y se libera en el bloque finally exterior.
+      const result = await executeAeatSubmission({
+        submission: serverSubmission,
+        fiscalRecord: recordToSubmit,
+        config: serverFiscalConfig,
+        options: {
+          transportMode: serverTransportMode as any,
+          acquireLock: false,
+          actor: {
+            tipo: 'USER',
+            id: req.fiscalUser?.uid,
+            email: req.fiscalUser?.email,
+            nombre: req.fiscalUser?.email || 'AuthenticatedOperator'
+          },
+          // Outbox Pre-Commit: Persiste en la autoridad distribuida el estado SENDING ANTES de enviar por red
+          onBeforeNetworkSend: async (sendingSub, startEvt) => {
+            await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
+            await BackendFiscalCustody.saveFiscalEvent(startEvt);
+          }
+        }
+      });
+
+      // 9. Persistencia fail-closed del estado terminal en custodia de backend (si falla persistir, lanza 500)
+      await BackendFiscalCustody.saveFiscalSubmission(result.submission);
+      await BackendFiscalCustody.saveFiscalEvent(result.fiscalEvent);
+
+      return res.json(result);
+    } finally {
+      await AeatFlowControlManager.releaseSendLockAsync(recordToSubmit.obligadoTributarioId);
+    }
   } catch (err: any) {
     console.error("Error en remisión AEAT backend:", err.message);
-    res.status(500).json({
-      error: "Error en el transporte AEAT",
+    const statusCode = err?.statusCode === 409 || err?.code === 'CONCURRENT_SEND_LOCKED' ? 409 : 500;
+    res.status(statusCode).json({
+      error: statusCode === 409 ? "Conflicto de concurrencia en remisión AEAT" : "Error en el transporte AEAT",
       message: err.message
     });
   }
