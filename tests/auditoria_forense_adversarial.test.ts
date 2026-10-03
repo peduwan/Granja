@@ -628,7 +628,13 @@ async function main() {
     CloudDistributedChainCoordinator.setMode(null);
   });
 
-  await runAdversarialTest('5.7: saveFiscalSubmission y saveFiscalEvent son estrictamente Fail-Closed en Firestore', async () => {
+  await runAdversarialTest('5.7: saveFiscalSubmission y saveFiscalEvent son estrictamente Fail-Closed y sin escrituras parciales en disco local', async () => {
+    const subsBefore = BackendFiscalCustody.getFiscalSubmissions().length;
+    const eventsBefore = BackendFiscalCustody.getFiscalEvents().length;
+
+    const subId = `sub-test-fail-${Date.now()}`;
+    const evtId = `evt-test-fail-${Date.now()}`;
+
     CloudDistributedChainCoordinator.setMode('firestore');
 
     const mockFailingFirestore = {
@@ -643,10 +649,10 @@ async function main() {
 
     CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFailingFirestore as any);
 
-    // 1. saveFiscalSubmission DEBE lanzar la excepción y no absorberla con warning
+    // 1. saveFiscalSubmission DEBE lanzar la excepción y NO escribir en memoria ni en disco local
     await assert.rejects(async () => {
       await BackendFiscalCustody.saveFiscalSubmission({
-        id: `sub-test-${Date.now()}`,
+        id: subId,
         fiscalRecordId: 'rec-test',
         obligadoTributarioId: OBLIGADO_TEST_A,
         numeroFactura: 'FAC-TEST-01',
@@ -659,10 +665,14 @@ async function main() {
       });
     }, /Firestore connection failed during submission\/event commit/);
 
-    // 2. saveFiscalEvent DEBE lanzar la excepción y no absorberla con warning
+    const subsAfter = BackendFiscalCustody.getFiscalSubmissions();
+    assert.strictEqual(subsAfter.length, subsBefore, 'El número de submissions locales no debe variar si Firestore falla');
+    assert.strictEqual(subsAfter.find(s => s.id === subId), undefined, 'La submission rechazada por Firestore NO debe existir en disco ni en caché local');
+
+    // 2. saveFiscalEvent DEBE lanzar la excepción y NO escribir en memoria ni en disco local
     await assert.rejects(async () => {
       await BackendFiscalCustody.saveFiscalEvent({
-        id: `evt-test-${Date.now()}`,
+        id: evtId,
         tipo: 'GENERACION_REGISTRO',
         actor: { tipo: 'SYSTEM' },
         obligadoTributarioId: OBLIGADO_TEST_A,
@@ -670,6 +680,55 @@ async function main() {
         fechaHora: new Date().toISOString()
       });
     }, /Firestore connection failed during submission\/event commit/);
+
+    const eventsAfter = BackendFiscalCustody.getFiscalEvents();
+    assert.strictEqual(eventsAfter.length, eventsBefore, 'El número de eventos locales no debe variar si Firestore falla');
+    assert.strictEqual(eventsAfter.find(e => e.id === evtId), undefined, 'El evento rechazado por Firestore NO debe existir en disco ni en caché local');
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+    CloudDistributedChainCoordinator.setMode(null);
+  });
+
+  await runAdversarialTest('5.8: getFiscalRecordByIdAsync consulta PRIMERO la autoridad cloud y rechaza copias locales huérfanas o divergentes', async () => {
+    const existingLocal = BackendFiscalCustody.getAllFiscalRecords(OBLIGADO_TEST_A)[0];
+    assert.ok(existingLocal, 'Debe existir un registro local previo para la prueba');
+
+    CloudDistributedChainCoordinator.setMode('firestore');
+
+    // Caso A: El registro existe en disco local pero NO existe en Firestore -> debe abortar por discrepancia
+    const mockMissingInCloud = {
+      collection: () => ({
+        doc: () => ({
+          get: async () => ({ exists: false, data: () => null })
+        })
+      })
+    };
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockMissingInCloud as any);
+
+    await assert.rejects(async () => {
+      await BackendFiscalCustody.getFiscalRecordByIdAsync(existingLocal.id);
+    }, /Discrepancia crítica de autoridad fiscal.*existe en la réplica local pero NO existe en la autoridad distribuida/);
+
+    // Caso B: El registro en Firestore tiene huella distinta de la copia local -> debe abortar por corrupción/divergencia
+    const tamperedCloudRecord: FiscalRecord = {
+      ...existingLocal,
+      huella: {
+        ...existingLocal.huella,
+        hash: '9999999999999999999999999999999999999999999999999999999999999999'
+      }
+    };
+    const mockTamperedCloud = {
+      collection: () => ({
+        doc: () => ({
+          get: async () => ({ exists: true, data: () => tamperedCloudRecord })
+        })
+      })
+    };
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockTamperedCloud as any);
+
+    await assert.rejects(async () => {
+      await BackendFiscalCustody.getFiscalRecordByIdAsync(existingLocal.id);
+    }, /Violación de integridad criptográfica|Corrupción o divergencia/);
 
     CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
     CloudDistributedChainCoordinator.setMode(null);

@@ -46,7 +46,6 @@ import {
   buildFiscalQrUrl,
   generateQrDataUri
 } from './qrService';
-import { saveFiscalRecordToCloud } from '../utils/firebase';
 
 export interface EmitFiscalInvoiceParams {
   invoiceDraft: Factura;
@@ -206,11 +205,12 @@ async function executeEmitFiscalInvoice(
 ): Promise<EmitFiscalInvoiceResult> {
   const { invoiceDraft, fiscalConfig, persistRecordFn } = params;
 
-  let releaseProcessLock: (() => void) | null = null;
-  if (typeof window === 'undefined') {
-    const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-    releaseProcessLock = await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
+  if (typeof window !== 'undefined') {
+    throw new Error('VIOLACIÓN DE AUTORIDAD FISCAL: executeEmitFiscalInvoice está restringido exclusivamente al servidor backend.');
   }
+
+  const { BackendFiscalCustody } = await import('./backendCustodyRepository');
+  const releaseProcessLock = await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
 
   try {
     // 1. Obtener la huella anterior DENTRO de la sección serializada
@@ -219,18 +219,11 @@ async function executeEmitFiscalInvoice(
     if (params.previousRecordRef !== undefined) {
       previousRecord = params.previousRecordRef;
     } else {
-      if (typeof window === 'undefined') {
-        // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
-        // Se resuelve exclusivamente contra la custodia distribuida de la nube.
-        // Si la autoridad falla o está inaccesible, se arroja excepción inmediata (sin degradación a memoria local).
-        const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-        const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
-        previousRecord = latestFromCustody || latestEmittedByObligado.get(obligadoTributarioId) || null;
-      } else {
-        previousRecord = getLastFiscalRecord(obligadoTributarioId, {
-          candidateRefs: params.existingRecordRefs
-        });
-      }
+      // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
+      // Se resuelve exclusivamente contra la custodia distribuida de la nube.
+      // Si la autoridad falla o está inaccesible, se arroja excepción inmediata (sin degradación a memoria local).
+      const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
+      previousRecord = latestFromCustody || latestEmittedByObligado.get(obligadoTributarioId) || null;
     }
 
   let hashAnterior = '';
@@ -338,15 +331,10 @@ async function executeEmitFiscalInvoice(
     throw new Error('emitFiscalInvoice: FiscalRecord inválido. No se permite <pending_xml/>.');
   }
 
-  // 7. Persistir el FiscalRecord en su única fuente persistente (/fiscal_records/{recordId})
+  // 7. Persistir el FiscalRecord en la autoridad fiscal del backend
   // Si la persistencia falla, el error debe propagarse obligatoriamente al llamador
   const defaultSaveFn = async (rec: FiscalRecord) => {
-    if (typeof window === 'undefined') {
-      const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-      await BackendFiscalCustody.saveFiscalRecord(rec);
-    } else {
-      await saveFiscalRecordToCloud(rec).catch(() => {});
-    }
+    await BackendFiscalCustody.saveFiscalRecord(rec);
     return true;
   };
   const saveFn = persistRecordFn || defaultSaveFn;
@@ -460,27 +448,21 @@ async function executeEmitFiscalAnulacion(
 ): Promise<EmitFiscalAnulacionResult> {
   const { fiscalConfig, facturaAnulada, persistRecordFn } = params;
 
-  let releaseProcessLock: (() => void) | null = null;
-  if (typeof window === 'undefined') {
-    const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-    releaseProcessLock = await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
+  if (typeof window !== 'undefined') {
+    throw new Error('VIOLACIÓN DE AUTORIDAD FISCAL: executeEmitFiscalAnulacion está restringido exclusivamente al servidor backend.');
   }
+
+  const { BackendFiscalCustody } = await import('./backendCustodyRepository');
+  const releaseProcessLock = await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
 
   try {
     let previousRecord: FiscalRecordRef | FiscalRecord | null = null;
     if (params.previousRecordRef !== undefined) {
       previousRecord = params.previousRecordRef;
     } else {
-      if (typeof window === 'undefined') {
-        // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
-        const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-        const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
-        previousRecord = latestFromCustody || latestEmittedByObligado.get(obligadoTributarioId) || null;
-      } else {
-        previousRecord = getLastFiscalRecord(obligadoTributarioId, {
-          candidateRefs: params.existingRecordRefs
-        });
-      }
+      // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
+      const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
+      previousRecord = latestFromCustody || latestEmittedByObligado.get(obligadoTributarioId) || null;
     }
 
   let hashAnterior = '';
@@ -526,12 +508,7 @@ async function executeEmitFiscalAnulacion(
   }
 
   const defaultSaveFn = async (rec: FiscalRecord) => {
-    if (typeof window === 'undefined') {
-      const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-      await BackendFiscalCustody.saveFiscalRecord(rec);
-    } else {
-      await saveFiscalRecordToCloud(rec).catch(() => {});
-    }
+    await BackendFiscalCustody.saveFiscalRecord(rec);
     return true;
   };
   const saveFn = persistRecordFn || defaultSaveFn;

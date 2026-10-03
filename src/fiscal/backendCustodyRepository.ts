@@ -491,21 +491,50 @@ export class BackendFiscalCustody {
   }
 
   /**
-   * Recupera un registro fiscal por ID de forma asíncrona, consultando la nube de forma estricta si no está en disco local.
+   * Recupera un registro fiscal por ID de forma asíncrona, consultando PRIMERO la autoridad distribuida
+   * en la nube (Firestore) y contrastando la integridad criptográfica contra la réplica local.
+   * NUNCA confía directamente en la copia local sin contrastar con la autoridad cloud (Fail-Closed).
    */
   public static async getFiscalRecordByIdAsync(recordId: string): Promise<FiscalRecord | null> {
-    const local = this.getFiscalRecordById(recordId);
-    if (local) return local;
+    this.init();
+    loadFromDisk();
 
     const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    // 1. Consultar primero y de forma obligatoria la autoridad distribuida en la nube
     const remote = await CloudDistributedChainCoordinator.getRecordById(recordId);
-    if (remote) {
-      recordsCache.push(Object.freeze(remote));
-      try { persistRecordsToDisk(); } catch {}
-      return remote;
+    const local = recordsCache.find(r => r.id === recordId) || null;
+
+    if (!remote) {
+      if (local) {
+        throw new Error(
+          `BackendFiscalCustody: Discrepancia crítica de autoridad fiscal. El registro '${recordId}' existe en la réplica local pero NO existe en la autoridad distribuida de la nube. Operación abortada (Fail-Closed).`
+        );
+      }
+      return null;
     }
 
-    return null;
+    // 2. Verificar integridad criptográfica del registro oficial recuperado de la nube
+    const integrity = await verifyFiscalRecordHash(remote);
+    if (!integrity.valid) {
+      throw new Error(
+        `BackendFiscalCustody: Violación de integridad criptográfica en el registro '${recordId}' recuperado de la nube (${integrity.reason}). Operación abortada.`
+      );
+    }
+
+    // 3. Si existe copia en la réplica local, contrastar que su huella no diverja del registro oficial
+    if (local && local.huella.hash !== remote.huella.hash) {
+      throw new Error(
+        `BackendFiscalCustody: Corrupción o divergencia detectada en la réplica local del registro '${recordId}'. Su huella local (${local.huella.hash}) difiere de la huella oficial en la nube (${remote.huella.hash}). Operación abortada.`
+      );
+    }
+
+    // 4. Sincronizar la réplica local si no estaba presente
+    if (!local) {
+      recordsCache.push(Object.freeze(remote));
+      try { persistRecordsToDisk(); } catch {}
+    }
+
+    return remote;
   }
 
   /**
@@ -522,6 +551,7 @@ export class BackendFiscalCustody {
 
   /**
    * Registra una FiscalSubmission en la custodia de envíos con cerrojo global y persistencia fail-closed.
+   * Compromete PRIMERO en la autoridad distribuida de la nube y SÓLO después actualiza la réplica local.
    */
   public static async saveFiscalSubmission(submission: FiscalSubmission): Promise<void> {
     if (!submission || !submission.id) {
@@ -533,6 +563,12 @@ export class BackendFiscalCustody {
       this.init();
       loadFromDisk(); // Lectura atómica del estado en disco
 
+      // 1. C1: Persistir PRIMERO en la autoridad de nube de forma autoritativa y FAIL-CLOSED.
+      // Si la nube rechaza o falla, la memoria local y el disco local NO se modifican (cero escrituras parciales).
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      await CloudDistributedChainCoordinator.commitSubmission(submission);
+
+      // 2. Actualizar la réplica local en memoria y disco SÓLO tras éxito en la autoridad cloud
       const idx = submissionsCache.findIndex(s => s.id === submission.id);
       if (idx !== -1) {
         submissionsCache[idx] = Object.freeze(submission);
@@ -540,12 +576,7 @@ export class BackendFiscalCustody {
         submissionsCache.push(Object.freeze(submission));
       }
 
-      // Persistir a disco atómicamente; si falla, relanzar el error (fail-closed)
       persistSubmissionsToDisk();
-
-      // C1: Persistir FiscalSubmission en la autoridad de nube de forma autoritativa y FAIL-CLOSED
-      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
-      await CloudDistributedChainCoordinator.commitSubmission(submission);
     } catch (err: any) {
       console.error('BackendFiscalCustody: Error persistiendo submission:', err);
       throw err;
@@ -568,6 +599,7 @@ export class BackendFiscalCustody {
 
   /**
    * Registra un FiscalEvent de auditoría en la custodia del backend con cerrojo global y persistencia fail-closed.
+   * Compromete PRIMERO en la autoridad distribuida de la nube y SÓLO después actualiza la réplica local.
    */
   public static async saveFiscalEvent(event: FiscalEvent): Promise<void> {
     if (!event || !event.id) {
@@ -579,14 +611,14 @@ export class BackendFiscalCustody {
       this.init();
       loadFromDisk(); // Lectura atómica del estado en disco
 
-      eventsCache.push(Object.freeze(event));
-
-      // Persistir a disco atómicamente; si falla, relanzar el error (fail-closed)
-      persistEventsToDisk();
-
-      // C1: Persistir FiscalEvent en la autoridad de nube de forma autoritativa y FAIL-CLOSED
+      // 1. C1: Persistir PRIMERO en la autoridad de nube de forma autoritativa y FAIL-CLOSED.
+      // Si la nube rechaza o falla, la memoria local y el disco local NO se modifican (cero escrituras parciales).
       const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
       await CloudDistributedChainCoordinator.commitEvent(event);
+
+      // 2. Actualizar la réplica local en memoria y disco SÓLO tras éxito en la autoridad cloud
+      eventsCache.push(Object.freeze(event));
+      persistEventsToDisk();
     } catch (err: any) {
       console.error('BackendFiscalCustody: Error persistiendo event:', err);
       throw err;
