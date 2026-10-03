@@ -1,0 +1,96 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Perfil de usuario con rol de acceso a la granja",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "operario"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "role"]
+    },
+    "FarmData": {
+      "title": "FarmData",
+      "description": "Registros completos de trazabilidad, lotes, albaranes, facturas y catálogos de la granja",
+      "type": "object",
+      "properties": {
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      }
+    },
+    "RegistroFacturacionVeriFactu": {
+      "title": "RegistroFacturacionVeriFactu",
+      "description": "Registro inmutable con huella criptográfica SHA-256 encadenada según normativa Veri*Factu (Orden HAC/1177/2024)",
+      "type": "object",
+      "properties": {
+        "facturaId": { "type": "string" },
+        "numeroFactura": { "type": "string" },
+        "fechaExpedicion": { "type": "string" },
+        "tipoFactura": { "type": "string" },
+        "nifEmisor": { "type": "string" },
+        "totalFactura": { "type": "number" },
+        "hashAnterior": { "type": "string" },
+        "hashActual": { "type": "string" },
+        "fechaHoraSellado": { "type": "string", "format": "date-time" },
+        "datosXml": { "type": "string" }
+      },
+      "required": ["numeroFactura", "hashActual", "hashAnterior", "fechaHoraSellado"]
+    },
+    "AuthorizedUser": {
+      "title": "AuthorizedUser",
+      "description": "Usuario de Google explícitamente autorizado por el propietario con su rol y estado de activación",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "nombre": { "type": "string" },
+        "rol": { "type": "string", "enum": ["propietario", "admin", "operario", "lector"] },
+        "activo": { "type": "boolean" },
+        "agregadoPor": { "type": "string" },
+        "fechaAlta": { "type": "string", "format": "date-time" },
+        "ultimoAcceso": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "rol", "activo"]
+    }
+  },
+  "firestore": {
+    "/authorized_users/{userEmail}": {
+      "schema": "AuthorizedUser",
+      "description": "Lista blanca de correos de Google con autorización concedida por el propietario"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Perfil y configuración del usuario autenticado"
+    },
+    "/farms/{farmId}": {
+      "schema": "FarmData",
+      "description": "Datos centralizados y sincronizados de la explotación avícola"
+    },
+    "/registros_facturacion/{registroId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "HISTÓRICA/LEGACY: Solo lectura de auditoría histórica, sin nuevas emisiones"
+    },
+    "/facturas_inmutables/{facturaId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "HISTÓRICA/LEGACY: Colección inmutable de facturas para auditoría tributaria previa"
+    },
+    "/fiscal_records/{recordId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "Libro mayor de registros de facturación de alta inmutables y encadenados según SIF (RD 1007/2023)"
+    },
+    "/fiscal_chain_state/{obligadoId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "Documento de estado atómico de secuencia y punta de cadena por obligado tributario para cerrojo distribuido en Cloud Run"
+    },
+    "/fiscal_submissions/{submissionId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "Historial de sumisiones y reintentos ante AEAT"
+    },
+    "/fiscal_events/{eventId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "Libro de auditoría de eventos inmutables del sistema fiscal"
+    }
+  }
+}

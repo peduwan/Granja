@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fef3c7" />
+      <stop offset="50%" stop-color="#f59e0b" />
+      <stop offset="100%" stop-color="#b45309" />
+    </linearGradient>
+    <linearGradient id="eggGrad" x1="20%" y1="10%" x2="80%" y2="90%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="70%" stop-color="#fef3c7" />
+      <stop offset="100%" stop-color="#fde68a" />
+    </linearGradient>
+    <linearGradient id="crestGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ef4444" />
+      <stop offset="100%" stop-color="#b91c1c" />
+    </linearGradient>
+    <filter id="dropShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-opacity="0.25" flood-color="#78350f" />
+    </filter>
+  </defs>
+
+  <!-- Background rounded squircle -->
+  <rect width="512" height="512" rx="115" fill="url(#bgGrad)" />
+
+  <!-- Inner subtle border -->
+  <rect x="16" y="16" width="480" height="480" rx="100" fill="none" stroke="#ffffff" stroke-width="4" stroke-opacity="0.3" />
+
+  <!-- Main Golden Egg Illustration -->
+  <g filter="url(#dropShadow)">
+    <!-- Egg body -->
+    <path d="M 256 100 C 335 100 395 210 395 315 C 395 395 335 440 256 440 C 177 440 117 395 117 315 C 117 210 177 100 256 100 Z" fill="url(#eggGrad)" />
+    
+    <!-- Egg highlight shine -->
+    <ellipse cx="215" cy="205" rx="35" ry="65" transform="rotate(-28 215 205)" fill="#ffffff" opacity="0.65" />
+    
+    <!-- Avícola Rooster Crest Detail atop the egg -->
+    <path d="M 230 110 C 230 75 250 65 260 78 C 270 65 290 75 290 105 C 290 115 285 125 275 130 Z" fill="url(#crestGrad)" />
+
+    <!-- Stylized Wheat / Agriculture Stems at base -->
+    <path d="M 195 385 Q 256 365 317 385" stroke="#d97706" stroke-width="8" stroke-linecap="round" fill="none" opacity="0.4" />
+    <path d="M 215 405 Q 256 390 297 405" stroke="#d97706" stroke-width="6" stroke-linecap="round" fill="none" opacity="0.4" />
+
+    <!-- Organic Farm Tag checkmark / leaf -->
+    <path d="M 256 260 L 272 280 L 305 245" fill="none" stroke="#16a34a" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+</svg>

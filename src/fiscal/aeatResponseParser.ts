@@ -1,0 +1,276 @@
+/**
+ * PARSER DE RESPUESTAS OFICIALES AEAT VERI*FACTU (FASE 3.1)
+ *
+ * Normativa Oficial:
+ * - Real Decreto 1007/2023 (Reglamento Veri*Factu / SIF)
+ * - Orden HAC/1177/2024
+ * - Esquema oficial RespuestaSuministro.xsd
+ *
+ * RESPONSABILIDAD ÚNICA:
+ * Convierte la respuesta XML/SOAP oficial devuelta por la AEAT en un modelo tipado interno.
+ * No ejecuta lógica de negocio, no muta registros fiscales y preserva el XML original íntegro.
+ */
+
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
+
+export interface AeatResponseLine {
+  readonly idFactura: {
+    readonly idEmisorFactura: string;
+    readonly numSerieFactura: string;
+    readonly fechaExpedicionFactura: string;
+  };
+  readonly operacion?: string;
+  readonly refExterna?: string;
+  readonly estadoRegistro: 'Correcto' | 'AceptadoConErrores' | 'Incorrecto' | string;
+  readonly codigoErrorRegistro?: string;
+  readonly descripcionErrorRegistro?: string;
+  readonly registroDuplicado?: any;
+}
+
+export type SoapFaultCategory = 'SOAP_FAULT_SERVER' | 'SOAP_FAULT_CLIENT' | 'SOAP_FAULT_UNKNOWN';
+
+export interface SoapFaultClassification {
+  readonly category: SoapFaultCategory;
+  readonly isRetryable: boolean;
+  readonly faultcode: string;
+  readonly faultstring: string;
+  readonly detail?: string;
+}
+
+export interface AeatParsedResponse {
+  readonly rawXml: string;
+  readonly isSoapFault: boolean;
+  readonly fault?: SoapFaultClassification;
+  readonly csv?: string;
+  readonly datosPresentacion?: {
+    readonly nifPresentador?: string;
+    readonly timestampPresentacion?: string;
+  };
+  readonly cabecera?: any;
+  readonly tiempoEsperaEnvio?: number;
+  readonly estadoEnvio?: 'Correcto' | 'ParcialmenteCorrecto' | 'Incorrecto' | string;
+  readonly lineas: ReadonlyArray<AeatResponseLine>;
+  /**
+   * Mapeo reglamentario al estado interno de FiscalSubmission
+   */
+  readonly mappedSubmissionStatus: 'ACCEPTED' | 'ACCEPTED_WITH_ERRORS' | 'REJECTED' | 'FAILED_TECHNICAL';
+  /**
+   * Indica si el error o estado admite reintento técnico automático según las reglas de la AEAT.
+   */
+  readonly isRetryable: boolean;
+  readonly avisos: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
+  readonly errores: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
+}
+
+/**
+ * Clasifica un SOAP Fault conforme a la especificación SOAP 1.1 y directrices de la AEAT.
+ */
+export function classifySoapFault(
+  faultcode: string,
+  faultstring: string,
+  detail?: string
+): SoapFaultClassification {
+  const cleanCode = (faultcode || '').toLowerCase().trim();
+  const cleanString = (faultstring || '').toLowerCase().trim();
+  const cleanDetail = (detail || '').toLowerCase().trim();
+
+  let category: SoapFaultCategory = 'SOAP_FAULT_UNKNOWN';
+  let isRetryable = false;
+
+  if (
+    cleanCode.includes('server') ||
+    cleanCode.includes('500') ||
+    cleanCode.includes('502') ||
+    cleanCode.includes('503') ||
+    cleanCode.includes('504') ||
+    cleanCode.includes('timeout') ||
+    cleanCode.includes('unavailable')
+  ) {
+    category = 'SOAP_FAULT_SERVER';
+    isRetryable = true; // Error de infraestructura en la AEAT: reintento permitido
+  } else if (
+    cleanCode.includes('client') ||
+    cleanCode.includes('versionmismatch') ||
+    cleanCode.includes('mustunderstand') ||
+    cleanCode.includes('dataencodingunknown') ||
+    cleanCode.includes('badrequest') ||
+    cleanCode.includes('400') ||
+    cleanString.includes('cvc-') ||
+    cleanString.includes('invalid content') ||
+    cleanDetail.includes('cvc-') ||
+    cleanDetail.includes('invalid content')
+  ) {
+    category = 'SOAP_FAULT_CLIENT';
+    isRetryable = false; // Error de sintaxis o mensaje del cliente: NO reintentar a ciegas
+  } else {
+    category = 'SOAP_FAULT_UNKNOWN';
+    isRetryable = false; // Desconocido: no asumir reintento para evitar bucles infinitos
+  }
+
+  return {
+    category,
+    isRetryable,
+    faultcode,
+    faultstring,
+    detail
+  };
+}
+
+/**
+ * Parsea el XML oficial devuelto por los servicios web de la AEAT.
+ */
+export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
+  if (!xmlString || typeof xmlString !== 'string' || xmlString.trim() === '') {
+    throw new Error('parseAeatXmlResponse: Respuesta vacía o nula recibida de la AEAT.');
+  }
+
+  // 1. Validar sintaxis XML básica
+  const validationResult = XMLValidator.validate(xmlString);
+  if (validationResult !== true) {
+    throw new Error(`parseAeatXmlResponse: Sintaxis XML inválida en la respuesta de la AEAT: ${JSON.stringify(validationResult)}`);
+  }
+
+  // 2. Parsear el árbol XML eliminando prefijos de namespace para una extracción limpia
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    removeNSPrefix: true,
+    parseTagValue: false, // Preservar strings sin conversión automática a booleanos/números
+    trimValues: true
+  });
+
+  const parsed = parser.parse(xmlString);
+
+  // 3. Comprobar si es un SOAP Fault
+  // Puede estar en Envelope.Body.Fault o directamente en Fault
+  const envelope = parsed.Envelope || parsed;
+  const body = envelope.Body || envelope;
+  const fault = body.Fault || parsed.Fault;
+
+  if (fault) {
+    const faultcode = fault.faultcode || fault.Code || 'soapenv:Server';
+    const faultstring = fault.faultstring || fault.Reason || 'Error SOAP de infraestructura';
+    const detail = typeof fault.detail === 'object' ? JSON.stringify(fault.detail) : String(fault.detail || '');
+
+    const classification = classifySoapFault(String(faultcode), String(faultstring), detail || undefined);
+
+    return {
+      rawXml: xmlString,
+      isSoapFault: true,
+      fault: classification,
+      lineas: [],
+      mappedSubmissionStatus: 'FAILED_TECHNICAL',
+      isRetryable: classification.isRetryable,
+      avisos: [],
+      errores: [
+        {
+          codigo: String(faultcode),
+          descripcion: String(faultstring)
+        }
+      ]
+    };
+  }
+
+  // 4. Localizar el nodo raíz RespuestaRegFactuSistemaFacturacion
+  const respuestaRoot = body.RespuestaRegFactuSistemaFacturacion || parsed.RespuestaRegFactuSistemaFacturacion;
+  if (!respuestaRoot) {
+    throw new Error('parseAeatXmlResponse: El XML no contiene el elemento raíz oficial RespuestaRegFactuSistemaFacturacion.');
+  }
+
+  // 5. Extraer campos de cabecera y estado global
+  const csv = respuestaRoot.CSV ? String(respuestaRoot.CSV) : undefined;
+  const estadoEnvio = respuestaRoot.EstadoEnvio ? String(respuestaRoot.EstadoEnvio) : undefined;
+  const tiempoEsperaEnvio = (respuestaRoot.TiempoEsperaEnvio !== undefined && respuestaRoot.TiempoEsperaEnvio !== null && String(respuestaRoot.TiempoEsperaEnvio).trim() !== '')
+    ? parseInt(String(respuestaRoot.TiempoEsperaEnvio), 10)
+    : undefined;
+
+  const datosPresentacion = respuestaRoot.DatosPresentacion ? {
+    nifPresentador: respuestaRoot.DatosPresentacion.NIFPresentador ? String(respuestaRoot.DatosPresentacion.NIFPresentador) : undefined,
+    timestampPresentacion: respuestaRoot.DatosPresentacion.TimestampPresentacion ? String(respuestaRoot.DatosPresentacion.TimestampPresentacion) : undefined
+  } : undefined;
+
+  // 6. Extraer y normalizar las líneas de respuesta
+  let rawLineas = respuestaRoot.RespuestaLinea;
+  if (!rawLineas) {
+    rawLineas = [];
+  } else if (!Array.isArray(rawLineas)) {
+    rawLineas = [rawLineas];
+  }
+
+  const lineas: AeatResponseLine[] = [];
+  const avisos: Array<{ codigo: string; descripcion: string }> = [];
+  const errores: Array<{ codigo: string; descripcion: string }> = [];
+
+  for (const item of rawLineas) {
+    const idFacturaNode = item.IDFactura || {};
+    const idFactura = {
+      idEmisorFactura: String(idFacturaNode.IDEmisorFactura || ''),
+      numSerieFactura: String(idFacturaNode.NumSerieFactura || ''),
+      fechaExpedicionFactura: String(idFacturaNode.FechaExpedicionFactura || '')
+    };
+
+    const estadoRegistro = String(item.EstadoRegistro || 'Incorrecto');
+    const codigoError = item.CodigoErrorRegistro ? String(item.CodigoErrorRegistro) : undefined;
+    const descripcionError = item.DescripcionErrorRegistro ? String(item.DescripcionErrorRegistro) : undefined;
+
+    lineas.push({
+      idFactura,
+      operacion: item.Operacion ? String(item.Operacion) : undefined,
+      refExterna: item.RefExterna ? String(item.RefExterna) : undefined,
+      estadoRegistro,
+      codigoErrorRegistro: codigoError,
+      descripcionErrorRegistro: descripcionError,
+      registroDuplicado: item.RegistroDuplicado
+    });
+
+    if (estadoRegistro === 'AceptadoConErrores' && codigoError) {
+      avisos.push({
+        codigo: codigoError,
+        descripcion: descripcionError || 'Aviso AEAT'
+      });
+    } else if (estadoRegistro === 'Incorrecto' && codigoError) {
+      errores.push({
+        codigo: codigoError,
+        descripcion: descripcionError || 'Error de rechazo AEAT'
+      });
+    }
+  }
+
+  // 7. Determinar el estado interno para FiscalSubmission
+  let mappedStatus: 'ACCEPTED' | 'ACCEPTED_WITH_ERRORS' | 'REJECTED' | 'FAILED_TECHNICAL' = 'ACCEPTED';
+
+  if (lineas.length === 0) {
+    if (estadoEnvio === 'Correcto') {
+      mappedStatus = 'ACCEPTED';
+    } else if (estadoEnvio === 'Incorrecto') {
+      mappedStatus = 'REJECTED';
+    } else {
+      mappedStatus = 'FAILED_TECHNICAL';
+    }
+  } else {
+    const anyIncorrect = lineas.some(l => l.estadoRegistro === 'Incorrecto');
+    const anyAcceptedWithErrors = lineas.some(l => l.estadoRegistro === 'AceptadoConErrores');
+
+    if (anyIncorrect || estadoEnvio === 'Incorrecto') {
+      mappedStatus = 'REJECTED';
+    } else if (anyAcceptedWithErrors || estadoEnvio === 'ParcialmenteCorrecto') {
+      mappedStatus = 'ACCEPTED_WITH_ERRORS';
+    } else {
+      mappedStatus = 'ACCEPTED';
+    }
+  }
+
+  return {
+    rawXml: xmlString,
+    isSoapFault: false,
+    csv,
+    datosPresentacion,
+    cabecera: respuestaRoot.Cabecera,
+    tiempoEsperaEnvio,
+    estadoEnvio,
+    lineas,
+    mappedSubmissionStatus: mappedStatus,
+    isRetryable: false, // Las respuestas fiscales formales (Correcto, AceptadoConErrores, Incorrecto) no se reintentan a ciegas
+    avisos,
+    errores
+  };
+}

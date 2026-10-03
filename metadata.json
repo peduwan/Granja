@@ -1,0 +1,6 @@
+{
+  "name": "Gestión Avícola",
+  "description": "Gestión integral avícola con trazabilidad sanitaria, puesta y albaranes por voz, y facturación adaptada a Veri*Factu y la Ley Antifraude con inmutabilidad, encadenamiento SHA-256 y series rectificativas.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

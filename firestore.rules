@@ -1,0 +1,77 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Función que identifica al Propietario / Super Administrador raíz
+    function isOwner() {
+      return request.auth != null &&
+        request.auth.token.email.lower() == 'peduwan@gmail.com';
+    }
+
+    // Función que valida si la cuenta de Google autenticada está autorizada por el propietario
+    function isAuthorizedUser() {
+      return request.auth != null && (
+        isOwner() ||
+        exists(/databases/$(database)/documents/authorized_users/$(request.auth.token.email.lower()))
+      );
+    }
+
+    // Datos operativos de la explotación avícola
+    match /farms/{farmId} {
+      allow read: if isAuthorizedUser();
+      allow write: if isAuthorizedUser();
+    }
+
+    // Lista blanca de usuarios autorizados: lectura para autenticados, solo el propietario puede otorgar o revocar
+    match /authorized_users/{userEmail} {
+      allow read: if request.auth != null;
+      allow write: if isOwner();
+    }
+
+    // Perfiles individuales de usuario
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && (request.auth.uid == userId || isOwner());
+    }
+
+    // --- COLECCIÓN HISTÓRICA / AUDITORÍA LEGACY ---
+    // Queda como histórica: Solo lectura para auditoría. No admite nuevas escrituras.
+    // Las nuevas emisiones se registran exclusivamente en /fiscal_records/{recordId}
+    match /registros_facturacion/{registroId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    match /facturas_inmutables/{facturaId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    // Arquitectura SIF (Fase 3.1.6): Autoridad Exclusiva de Backend
+    // Prohibida estrictamente cualquier escritura directa desde el cliente web SDK.
+    // Solo lectura para usuarios autorizados. La emisión, sellado y custodia residen exclusivamente en backend.
+    match /fiscal_records/{recordId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    // Cerrojo distribuido y estado de cadena por obligado tributario (Gestionado exclusivamente por Backend)
+    match /fiscal_chain_state/{obligadoId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    // Historial y Cola Outbox de Sumisiones AEAT (Gestionado exclusivamente por Backend)
+    match /fiscal_submissions/{submissionId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+
+    // Libro de Auditoría de Eventos del SIF (Inmutable: Gestionado exclusivamente por Backend)
+    match /fiscal_events/{eventId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
+  }
+}
+

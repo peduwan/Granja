@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+@media print {
+  /* Ocultar toda la interfaz interactiva y de navegación */
+  header, nav, aside, footer, .no-print, button, input, select {
+    display: none !important;
+  }
+
+  /* Resetear contenedores globales para impresión limpia de página completa */
+  html, body, #root, main, [class*="min-h-screen"] {
+    background: #ffffff !important;
+    color: #111827 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+  }
+
+  /* Modales de impresión: convertirlos en flujo de página estándar (no fijos) */
+  #modal-impresion-container,
+  #modal-informe-puesta-container,
+  #modal-informe-envasado-container,
+  #modal-etiqueta-container,
+  #modal-dossier-trazabilidad-container,
+  .modal-print-container {
+    position: static !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    box-shadow: none !important;
+    border: none !important;
+    display: block !important;
+    overflow: visible !important;
+    inset: auto !important;
+  }
+
+  #modal-impresion-card,
+  #modal-informe-puesta-card,
+  #modal-informe-envasado-card,
+  #modal-etiqueta-card,
+  #modal-dossier-trazabilidad-card,
+  .modal-print-card {
+    position: static !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    overflow: visible !important;
+    display: block !important;
+  }
+
+  /* Hojas y Documentos Oficiales (Facturas, Albaranes, Libros Oficiales) */
+  #hoja-documento-impresion,
+  #hoja-informe-puesta,
+  #hoja-informe-envasado,
+  #hoja-dossier-trazabilidad,
+  .hoja-impresion-oficial {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    display: block !important;
+    background: #ffffff !important;
+    color: #111827 !important;
+    overflow: visible !important;
+  }
+
+  /* Formato para Etiqueta Oficial de Estuche */
+  #hoja-etiqueta-envasado {
+    border: 2px solid #000000 !important;
+    box-shadow: none !important;
+    padding: 6mm !important;
+    margin: 6mm auto !important;
+    max-width: 110mm !important;
+    background: #ffffff !important;
+    page-break-inside: avoid !important;
+    display: block !important;
+  }
+
+  /* Tablas oficiales sin cortes de filas entre hojas */
+  table {
+    page-break-inside: auto !important;
+    width: 100% !important;
+    border-collapse: collapse !important;
+  }
+  tr {
+    page-break-inside: avoid !important;
+    page-break-after: auto !important;
+  }
+  thead {
+    display: table-header-group !important;
+  }
+  tfoot {
+    display: table-footer-group !important;
+  }
+
+  /* Configuración de página A4 con márgenes adecuados */
+  @page {
+    size: A4 portrait;
+    margin: 12mm 10mm;
+  }
+}
