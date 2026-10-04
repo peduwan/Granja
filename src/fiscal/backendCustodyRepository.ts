@@ -538,7 +538,7 @@ export class BackendFiscalCustody {
   }
 
   /**
-   * Obtiene todos los registros fiscales de la custodia.
+   * Obtiene todos los registros fiscales de la custodia local (síncrono).
    */
   public static getAllFiscalRecords(obligadoTributarioId?: string): FiscalRecord[] {
     this.init();
@@ -547,6 +547,151 @@ export class BackendFiscalCustody {
       return recordsCache.filter(r => r.obligadoTributarioId === obligadoTributarioId);
     }
     return [...recordsCache];
+  }
+
+  /**
+   * Ordena determinísticamente una colección de FiscalRecord reconstruyendo la topología exacta
+   * de la cadena criptográfica fiscal (primerRegistro -> registroAnterior.huella === prev.huella.hash).
+   * Garantiza orden determinista incluso cuando Firestore devuelve documentos sin orden intrínseco.
+   */
+  public static orderRecordsByFiscalChain(records: ReadonlyArray<FiscalRecord>): FiscalRecord[] {
+    if (!records || records.length <= 1) {
+      return records ? [...records] : [];
+    }
+
+    const presentHashes = new Set<string>();
+    const byPrevHash = new Map<string, FiscalRecord[]>();
+
+    for (const rec of records) {
+      const currHash = rec.huella?.hash;
+      if (currHash) {
+        presentHashes.add(currHash);
+      }
+      const prevHash = rec.encadenamiento?.registroAnterior?.huella;
+      if (prevHash && !rec.encadenamiento?.primerRegistro) {
+        const list = byPrevHash.get(prevHash) || [];
+        list.push(rec);
+        byPrevHash.set(prevHash, list);
+      }
+    }
+
+    const fallbackSort = (a: FiscalRecord, b: FiscalRecord): number => {
+      const tA = a.creadoEn || a.fechaHoraHusoGenRegistro || '';
+      const tB = b.creadoEn || b.fechaHoraHusoGenRegistro || '';
+      if (tA !== tB) return tA.localeCompare(tB);
+      return (a.id || '').localeCompare(b.id || '', undefined, { numeric: true });
+    };
+
+    // Identificar cabezas de cadena (primerRegistro=true o cuyo prevHash no está entre los presentes)
+    const heads = records.filter(r => {
+      if (r.encadenamiento?.primerRegistro) return true;
+      const prevHash = r.encadenamiento?.registroAnterior?.huella;
+      return !prevHash || !presentHashes.has(prevHash);
+    }).sort(fallbackSort);
+
+    const ordered: FiscalRecord[] = [];
+    const visitedIds = new Set<string>();
+
+    for (const head of heads) {
+      let current: FiscalRecord | undefined = head;
+      while (current && !visitedIds.has(current.id)) {
+        visitedIds.add(current.id);
+        ordered.push(current);
+        const nextCandidates = byPrevHash.get(current.huella?.hash || '');
+        if (nextCandidates && nextCandidates.length > 0) {
+          nextCandidates.sort(fallbackSort);
+          current = nextCandidates.find(c => !visitedIds.has(c.id));
+        } else {
+          current = undefined;
+        }
+      }
+    }
+
+    // Si quedaran registros no visitados (p.ej. registros sintéticos en tests unitarios), añadirlos con orden determinista
+    if (ordered.length < records.length) {
+      const remaining = records.filter(r => !visitedIds.has(r.id)).sort(fallbackSort);
+      ordered.push(...remaining);
+    }
+
+    return ordered;
+  }
+
+  /**
+   * Obtiene de forma autoritativa, asíncrona y FAIL-CLOSED todos los FiscalRecord de un obligado tributario
+   * consultando PRIMERO la autoridad distribuida en la nube (Firestore / Cloud Coordinator).
+   * Garantiza que cualquier instancia nueva de Cloud Run con recordsCache vacía recupere la totalidad
+   * de los registros fiscales del obligado, verifique la no-divergencia local y reconstruya el orden de cadena.
+   */
+  public static async getAllFiscalRecordsByObligadoAsync(obligadoTributarioId: string): Promise<FiscalRecord[]> {
+    const cleanObligado = (obligadoTributarioId || '').trim();
+    if (!cleanObligado) {
+      throw new Error('BackendFiscalCustody: getAllFiscalRecordsByObligadoAsync requiere un obligadoTributarioId válido.');
+    }
+
+    this.init();
+    loadFromDisk();
+
+    const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    const remoteRecords = await CloudDistributedChainCoordinator.getRecordsByObligado(cleanObligado);
+    const localForObligado = recordsCache.filter(r => r.obligadoTributarioId === cleanObligado);
+
+    const remoteById = new Map<string, FiscalRecord>();
+    for (const remote of remoteRecords) {
+      remoteById.set(remote.id, remote);
+    }
+
+    // Verificar que no existan registros huérfanos o divergentes en la réplica local frente a la autoridad cloud
+    for (const local of localForObligado) {
+      const remote = remoteById.get(local.id);
+      if (!remote) {
+        throw new Error(
+          `BackendFiscalCustody: Discrepancia crítica de autoridad fiscal. El registro '${local.id}' del obligado '${cleanObligado}' existe en la réplica local pero NO existe en la autoridad distribuida de la nube. Operación abortada (Fail-Closed).`
+        );
+      }
+      if (local.huella.hash !== remote.huella.hash) {
+        throw new Error(
+          `BackendFiscalCustody: Corrupción o divergencia detectada en la réplica local del registro '${local.id}'. Su huella local (${local.huella.hash}) difiere de la huella oficial en la nube (${remote.huella.hash}). Operación abortada.`
+        );
+      }
+    }
+
+    const orderedRemote = this.orderRecordsByFiscalChain(remoteRecords);
+
+    // Sincronizar la réplica local si la instancia tenía caché vacía o incompleta (búsqueda O(1) con Set)
+    const existingLocalIds = new Set<string>(recordsCache.map(r => r.id));
+    let cacheUpdated = false;
+    for (const remote of orderedRemote) {
+      if (!existingLocalIds.has(remote.id)) {
+        recordsCache.push(Object.freeze(remote));
+        existingLocalIds.add(remote.id);
+        cacheUpdated = true;
+      }
+    }
+    if (cacheUpdated) {
+      try { persistRecordsToDisk(); } catch {}
+    }
+
+    return orderedRemote;
+  }
+
+  /**
+   * Custodia de forma atómica una secuencia de registros fiscales previamente sellados y encadenados.
+   */
+  public static async saveFiscalRecordsBatch(records: ReadonlyArray<FiscalRecord>): Promise<void> {
+    if (!records || records.length === 0) return;
+    const releaseLock = await acquireGlobalPersistenceLock(15000);
+    try {
+      this.init();
+      loadFromDisk();
+      const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+      await CloudDistributedChainCoordinator.commitChainedRecordsBatch(records);
+      for (const rec of records) {
+        recordsCache.push(Object.freeze(rec));
+      }
+      persistRecordsToDisk();
+    } finally {
+      releaseLock();
+    }
   }
 
   /**
@@ -621,6 +766,48 @@ export class BackendFiscalCustody {
       }
     }
     return remoteSubs;
+  }
+
+  /**
+   * Consulta autoritativa asíncrona en la nube de todas las FiscalSubmission de un obligado tributario.
+   * Garantiza que una nueva instancia de Cloud Run con caché local vacía recupere el estado real del Outbox.
+   */
+  public static async getFiscalSubmissionsByObligadoAsync(obligadoTributarioId: string): Promise<FiscalSubmission[]> {
+    const cleanObligado = (obligadoTributarioId || '').trim();
+    if (!cleanObligado) {
+      throw new Error('BackendFiscalCustody: getFiscalSubmissionsByObligadoAsync requiere un obligadoTributarioId válido.');
+    }
+
+    this.init();
+    loadFromDisk();
+    const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    const remoteSubs = await CloudDistributedChainCoordinator.getSubmissionsByObligado(cleanObligado);
+
+    for (const remote of remoteSubs) {
+      const idx = submissionsCache.findIndex(s => s.id === remote.id);
+      if (idx !== -1) {
+        submissionsCache[idx] = Object.freeze(remote);
+      } else {
+        submissionsCache.push(Object.freeze(remote));
+      }
+    }
+    return remoteSubs;
+  }
+
+  /**
+   * Simula el arranque en frío de una nueva instancia de Cloud Run limpiando únicamente la réplica
+   * local (memoria y disco local de la instancia) pero preservando intacta la autoridad distribuida en la nube.
+   */
+  public static clearLocalReplicaCacheForInstanceSimulation(): void {
+    recordsCache = [];
+    submissionsCache = [];
+    eventsCache = [];
+    initialized = true;
+    try {
+      if (fs.existsSync(RECORDS_FILE)) fs.unlinkSync(RECORDS_FILE);
+      if (fs.existsSync(SUBMISSIONS_FILE)) fs.unlinkSync(SUBMISSIONS_FILE);
+      if (fs.existsSync(EVENTS_FILE)) fs.unlinkSync(EVENTS_FILE);
+    } catch {}
   }
 
   /**

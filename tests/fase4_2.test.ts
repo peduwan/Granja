@@ -48,7 +48,8 @@ import {
 import { BackendFiscalCustody } from '../src/fiscal/backendCustodyRepository';
 import { CloudDistributedChainCoordinator } from '../src/fiscal/cloudDistributedChainCoordinator';
 import { validateAeatXmlAgainstXsd } from '../src/fiscal/aeatXsdValidatorNode';
-import { verifyFiscalRecordHash } from '../src/fiscal/hashService';
+import { verifyFiscalRecordHash, calculateAltaHash } from '../src/fiscal/hashService';
+import { buildAeatVerifactuXml } from '../src/fiscal/aeatVerifactuXmlBuilder';
 
 const NIF_BATCH_OBLIGADO = 'B42424242';
 const NOMBRE_BATCH_OBLIGADO = 'Granja Avícola Batch VeriFactu S.L.';
@@ -648,6 +649,281 @@ async function main() {
       );
     } finally {
       await AeatFlowControlManager.releaseSendLockAsync(NIF_BATCH_OBLIGADO);
+    }
+  });
+
+  // Helper de alta velocidad para sembrar N registros encadenados criptográficamente en custodia autoritativa
+  async function seedAuthoritativeChainedRecords(
+    count: number,
+    fiscalConf: FiscalConfiguration,
+    prefix: string
+  ): Promise<FiscalRecord[]> {
+    const seeded: FiscalRecord[] = [];
+    for (let i = 1; i <= count; i++) {
+      const numFactura = `${prefix}-${String(i).padStart(4, '0')}`;
+      const inv = createSampleInvoice(numFactura);
+      const prev = i > 1 ? seeded[i - 2] : null;
+      const fechaGen = `2026-04-10T10:${String(Math.floor(i / 60) % 60).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}+02:00`;
+
+      const hashRes = await calculateAltaHash({
+        nifEmisor: fiscalConf.nifEmisor,
+        numSerieFactura: numFactura,
+        fechaExpedicion: inv.fecha,
+        tipoFactura: inv.tipoFactura || 'F1',
+        cuotaTotal: inv.totales.cuotaIva,
+        importeTotal: inv.totales.totalDocumento,
+        huellaAnterior: prev ? prev.huella.hash : '',
+        fechaHoraHusoGenRegistro: fechaGen
+      });
+
+      const baseRec = createFiscalRecordFromInvoice(inv, fiscalConf, prev, {
+        hashActual: hashRes.hash,
+        fechaHoraSellado: fechaGen
+      });
+
+      const finalRec: FiscalRecord = {
+        ...baseRec,
+        id: `frec-${prefix}-${String(i).padStart(4, '0')}`,
+        huella: {
+          ...baseRec.huella,
+          hash: hashRes.hash,
+          cadenaTextoCanonico: hashRes.canonicalString
+        },
+        xmlOficial: `<sfLR:RegFactuSistemaFacturacion><!-- ${numFactura} --></sfLR:RegFactuSistemaFacturacion>`
+      };
+
+      seeded.push(finalRec);
+    }
+    await BackendFiscalCustody.saveFiscalRecordsBatch(seeded);
+    return seeded;
+  }
+
+  await runTest('4.3 (P1): El disparador de 1.000 pendientes salta realmente TiempoEsperaEnvio con conteo autoritativo en servidor', async () => {
+    resetAllState();
+
+    // Configurar TiempoEsperaEnvio activo de 300 segundos en el futuro
+    await AeatFlowControlManager.updateFromResponseAsync(NIF_BATCH_OBLIGADO, 300, Date.now());
+    const flowBefore = await AeatFlowControlManager.getFlowStateAsync(NIF_BATCH_OBLIGADO);
+    assert.ok(flowBefore && flowBefore.nextAllowedSendTimestamp > Date.now() + 250000);
+
+    // Con 1.000 registros pendientes reales en custodia, la regla disyuntiva AEAT (pendientes >= 1.000)
+    // DEBE saltar TiempoEsperaEnvio y permitir el envío inmediato
+    const records1000 = await seedAuthoritativeChainedRecords(1000, config, 'FAC-TRIG1000');
+
+    const res = await executeAuthoritativeOutboxSubmission({
+      batchFromOutbox: true,
+      obligadoTributarioId: NIF_BATCH_OBLIGADO,
+      internalTestOptions: {
+        mockScenario: 'ACCEPTANCE',
+        mockTiempoEsperaEnvio: 300
+      }
+    });
+
+    assert.strictEqual(res.authoritativePendingCountBeforeSend, 1000);
+    assert.strictEqual(res.cantidadRegistros, 1000);
+    assert.strictEqual(res.cantidadLotes, 1);
+    assert.strictEqual(res.submission?.estado, 'ACCEPTED');
+    assert.strictEqual(res.submission?.cantidadRegistros, 1000);
+    assert.strictEqual(res.resultadosIndividuales?.length, 1000);
+    assert.strictEqual(res.resultadosIndividuales?.[0].fiscalRecordId, records1000[0].id);
+    assert.strictEqual(res.resultadosIndividuales?.[999].fiscalRecordId, records1000[999].id);
+
+    // Verificar que la identidad del batch NO depende del primer FiscalRecord
+    assert.ok(!res.submission!.id.includes(records1000[0].id), 'El ID de un batch FiscalSubmission no debe depender del primer FiscalRecord');
+  });
+
+  await runTest('4.4 (P1): Drenado automático real >1.000 pendientes (2.501 registros -> SOAP #1: 1.000, SOAP #2: 1.000, SOAP #3: 501)', async () => {
+    resetAllState();
+
+    // Sembrar 2.501 registros pendientes encadenados en la custodia autoritativa
+    const records2501 = await seedAuthoritativeChainedRecords(2501, config, 'FAC-DRAIN2501');
+
+    // Incluso con TiempoEsperaEnvio previo activo (300s), al haber 2.501 >= 1.000 pendientes se activa el drenado
+    // y partitionRecordsIntoBatches divide y envía automáticamente los 3 lotes (1000 + 1000 + 501)
+    await AeatFlowControlManager.updateFromResponseAsync(NIF_BATCH_OBLIGADO, 300, Date.now());
+
+    const drainResult = await executeAuthoritativeOutboxSubmission({
+      batchFromOutbox: true,
+      obligadoTributarioId: NIF_BATCH_OBLIGADO,
+      internalTestOptions: {
+        mockScenario: 'ACCEPTANCE',
+        mockTiempoEsperaEnvio: 60
+      }
+    });
+
+    assert.strictEqual(drainResult.authoritativePendingCountBeforeSend, 2501);
+    assert.strictEqual(drainResult.cantidadRegistros, 2501);
+    assert.strictEqual(drainResult.cantidadLotes, 3);
+    assert.strictEqual(drainResult.submissions?.length, 3);
+    assert.strictEqual(drainResult.submissions?.[0].cantidadRegistros, 1000);
+    assert.strictEqual(drainResult.submissions?.[1].cantidadRegistros, 1000);
+    assert.strictEqual(drainResult.submissions?.[2].cantidadRegistros, 501);
+    assert.strictEqual(drainResult.submissions?.[0].estado, 'ACCEPTED');
+    assert.strictEqual(drainResult.submissions?.[1].estado, 'ACCEPTED');
+    assert.strictEqual(drainResult.submissions?.[2].estado, 'ACCEPTED');
+    assert.strictEqual(drainResult.resultadosIndividuales?.length, 2501);
+    assert.strictEqual(drainResult.resultadosIndividuales?.[0].fiscalRecordId, records2501[0].id);
+    assert.strictEqual(drainResult.resultadosIndividuales?.[1000].fiscalRecordId, records2501[1000].id);
+    assert.strictEqual(drainResult.resultadosIndividuales?.[2500].fiscalRecordId, records2501[2500].id);
+
+    // Verificar que ya quedan 0 registros pendientes en el Outbox
+    const afterDrain = await collectEligibleOutboxRecordsForObligado(NIF_BATCH_OBLIGADO);
+    assert.strictEqual(afterDrain.totalPendingCount, 0);
+    assert.strictEqual(afterDrain.eligibleRecords.length, 0);
+  });
+
+  await runTest('4.5 (P1): Multi-instancia Cloud Run — el Outbox consulta Firestore/Cloud Authority cuando recordsCache local está vacía y reconstruye el orden de cadena', async () => {
+    resetAllState();
+    const records = await emitAndCustodyBatch(4, config, 'FAC-CLOUD-COLD');
+
+    // Aceptar el primer registro en la instancia A
+    await executeAuthoritativeOutboxSubmission({
+      fiscalRecordId: records[0].id,
+      internalTestOptions: {
+        mockScenario: 'ACCEPTANCE',
+        mockTiempoEsperaEnvio: 0
+      }
+    });
+
+    const acceptedSubsInCloud = await CloudDistributedChainCoordinator.getSubmissionsByObligado(NIF_BATCH_OBLIGADO);
+    assert.strictEqual(acceptedSubsInCloud.length, 1);
+
+    // Simular arranque en frío de una nueva instancia B de Cloud Run:
+    // 1. Vaciar por completo la caché local de memoria y disco de BackendFiscalCustody
+    BackendFiscalCustody.clearLocalReplicaCacheForInstanceSimulation();
+    assert.strictEqual(
+      BackendFiscalCustody.getAllFiscalRecords(NIF_BATCH_OBLIGADO).length,
+      0,
+      'La caché local de la nueva instancia debe estar vacía (0 registros locales)'
+    );
+
+    // 2. Configurar modo Firestore simulando que Firestore devuelve los 4 documentos desordenados ([R3, R1, R0, R2])
+    CloudDistributedChainCoordinator.setMode('firestore');
+    const shuffledFirestoreDocs = [records[3], records[1], records[0], records[2]];
+    const cloudSubmissionsStore: any[] = [...acceptedSubsInCloud];
+    const cloudEventsStore: any[] = [];
+    const lockStore: Record<string, any> = {};
+    const flowStore: Record<string, any> = {};
+
+    const mockFirestoreMultiInstance = {
+      collection: (colName: string) => ({
+        where: (field: string, op: string, val: any) => ({
+          get: async () => {
+            if (colName === 'fiscal_records' && field === 'obligadoTributarioId' && op === '==') {
+              const matched = shuffledFirestoreDocs.filter(r => r.obligadoTributarioId === val);
+              return {
+                empty: matched.length === 0,
+                forEach: (cb: any) => matched.forEach(m => cb({ data: () => m }))
+              };
+            }
+            if (colName === 'fiscal_submissions') {
+              let matched: any[] = [];
+              if (field === 'obligadoTributarioId' && op === '==') {
+                matched = cloudSubmissionsStore.filter(s => s.obligadoTributarioId === val);
+              } else if (field === 'fiscalRecordId' && op === '==') {
+                matched = cloudSubmissionsStore.filter(s => s.fiscalRecordId === val);
+              } else if (field === 'fiscalRecordIds' && op === 'array-contains') {
+                matched = cloudSubmissionsStore.filter(s => Array.isArray(s.fiscalRecordIds) && s.fiscalRecordIds.includes(val));
+              }
+              return {
+                empty: matched.length === 0,
+                forEach: (cb: any) => matched.forEach(m => cb({ data: () => m }))
+              };
+            }
+            return { empty: true, forEach: () => {} };
+          }
+        }),
+        doc: (docId: string) => ({
+          get: async () => {
+            if (colName === 'aeat_send_locks') {
+              return { exists: Boolean(lockStore[docId]), data: () => lockStore[docId] };
+            }
+            if (colName === 'aeat_flow_control') {
+              return { exists: Boolean(flowStore[docId]), data: () => flowStore[docId] };
+            }
+            return { exists: false, data: () => null };
+          },
+          set: async (data: any) => {
+            if (colName === 'fiscal_submissions') {
+              const idx = cloudSubmissionsStore.findIndex(s => s.id === data.id);
+              if (idx !== -1) cloudSubmissionsStore[idx] = data;
+              else cloudSubmissionsStore.push(data);
+            } else if (colName === 'fiscal_events') {
+              cloudEventsStore.push(data);
+            } else if (colName === 'aeat_flow_control') {
+              flowStore[docId] = data;
+            }
+          }
+        })
+      }),
+      runTransaction: async (fn: any) => {
+        const tx = {
+          get: async (ref: any) => ref.get(),
+          set: (_ref: any, data: any) => {
+            lockStore[data.obligadoTributarioId] = data;
+          }
+        };
+        return await fn(tx);
+      }
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFirestoreMultiInstance as any);
+
+    try {
+      // Ejecutar drenado de Outbox en la instancia nueva (que tenía recordsCache = 0)
+      const coldInstanceDrain = await executeAuthoritativeOutboxSubmission({
+        batchFromOutbox: true,
+        obligadoTributarioId: NIF_BATCH_OBLIGADO,
+        internalTestOptions: {
+          mockScenario: 'ACCEPTANCE',
+          mockTiempoEsperaEnvio: 0
+        }
+      });
+
+      // Debe haber encontrado los 3 registros pendientes desde Firestore y ordenarlos por cadena: [R1, R2, R3]
+      assert.strictEqual(coldInstanceDrain.cantidadRegistros, 3);
+      assert.deepStrictEqual(
+        coldInstanceDrain.submission?.fiscalRecordIds,
+        [records[1].id, records[2].id, records[3].id],
+        'Debe reconstruir exactamente el orden de encadenamiento criptográfico [R1, R2, R3] y excluir R0 ya aceptado'
+      );
+    } finally {
+      CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+      CloudDistributedChainCoordinator.setMode('simulator');
+    }
+  });
+
+  await runTest('4.6 (P1): Fail-Closed estricto en getSubmissionsForRecord — un fallo de Firestore en array-contains NO se absorbe con catch silencioso', async () => {
+    resetAllState();
+    CloudDistributedChainCoordinator.setMode('firestore');
+
+    // Simular que la primera consulta (fiscalRecordId == X) tiene éxito (vacía),
+    // pero la segunda consulta de batch (fiscalRecordIds array-contains X) falla en Firestore
+    const mockFailingBatchQueryFirestore = {
+      collection: () => ({
+        where: (field: string, op: string) => ({
+          get: async () => {
+            if (field === 'fiscalRecordIds' && op === 'array-contains') {
+              throw new Error('FAILED_PRECONDITION: Firestore error executing array-contains query on fiscal_submissions');
+            }
+            return { empty: true, forEach: () => {} };
+          }
+        })
+      })
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(mockFailingBatchQueryFirestore as any);
+
+    try {
+      await assert.rejects(
+        async () => {
+          await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync('rec-any-id');
+        },
+        /FAILED_PRECONDITION: Firestore error executing array-contains query/
+      );
+    } finally {
+      CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+      CloudDistributedChainCoordinator.setMode('simulator');
     }
   });
 

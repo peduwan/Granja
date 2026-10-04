@@ -194,10 +194,10 @@ export function createFiscalSubmission(
 
   const idPrefix = records.length === 1
     ? `fsub-${firstRecord.id}`
-    : `fsub-batch-${records.length}-${firstRecord.id}`;
+    : `fsub-batch-${primaryObligado}-${records.length}`;
 
   const submission: FiscalSubmission = {
-    id: `${idPrefix}-${intento}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: `${idPrefix}-${intento}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     obligadoTributarioId: primaryObligado,
     fiscalRecordId: firstRecord.id,
     numeroFactura: firstRecord.factura.numeroFactura,

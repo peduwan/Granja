@@ -344,6 +344,90 @@ export class CloudDistributedChainCoordinator {
   }
 
   /**
+   * Compromete atómicamente una secuencia encadenada de FiscalRecord en la autoridad distribuida
+   * validando encadenamiento e inmutabilidad eslabón a eslabón.
+   */
+  public static async commitChainedRecordsBatch(records: ReadonlyArray<FiscalRecord>): Promise<void> {
+    if (!records || records.length === 0) return;
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      for (const rec of records) {
+        await this.commitRecord(rec);
+      }
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    const dir = path.dirname(SHARED_STATE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    let allStates: Record<string, CloudChainState> = {};
+    if (fs.existsSync(SHARED_STATE_FILE)) {
+      try { allStates = JSON.parse(fs.readFileSync(SHARED_STATE_FILE, 'utf-8')); } catch {}
+    }
+    let allRecords: Record<string, FiscalRecord> = {};
+    if (fs.existsSync(SHARED_RECORDS_FILE)) {
+      try { allRecords = JSON.parse(fs.readFileSync(SHARED_RECORDS_FILE, 'utf-8')); } catch {}
+    }
+
+    for (const record of records) {
+      if (allRecords[record.id]) {
+        throw new Error(`CloudDistributedChainCoordinator: Violación de inmutabilidad. El registro ${record.id} ya existe en la nube.`);
+      }
+      const current = allStates[record.obligadoTributarioId] || null;
+      let newState: CloudChainState;
+      if (current) {
+        if (record.encadenamiento.primerRegistro) {
+          throw new Error(`CloudDistributedChainCoordinator: Violación de encadenamiento en lote.`);
+        }
+        if (record.encadenamiento.registroAnterior?.huella !== current.latestHuella) {
+          throw new Error(`CloudDistributedChainCoordinator: Bifurcación de cadena detectada en lote.`);
+        }
+        newState = {
+          obligadoTributarioId: record.obligadoTributarioId,
+          latestRecordId: record.id,
+          latestHuella: record.huella.hash,
+          latestNumeroFactura: record.factura.numeroFactura,
+          latestFecha: record.factura.fechaExpedicion,
+          totalRecords: (current.totalRecords || 0) + 1,
+          sequence: (current.sequence || 0) + 1,
+          updatedAt: new Date().toISOString()
+        };
+      } else {
+        if (!record.encadenamiento.primerRegistro) {
+          throw new Error(`CloudDistributedChainCoordinator: Violación de encadenamiento inicial en lote.`);
+        }
+        newState = {
+          obligadoTributarioId: record.obligadoTributarioId,
+          latestRecordId: record.id,
+          latestHuella: record.huella.hash,
+          latestNumeroFactura: record.factura.numeroFactura,
+          latestFecha: record.factura.fechaExpedicion,
+          totalRecords: 1,
+          sequence: 1,
+          updatedAt: new Date().toISOString()
+        };
+      }
+      allStates[record.obligadoTributarioId] = newState;
+      allRecords[record.id] = record;
+    }
+
+    const tmpState = `${SHARED_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpState, JSON.stringify(allStates), 'utf-8');
+    fs.renameSync(tmpState, SHARED_STATE_FILE);
+
+    const tmpRecords = `${SHARED_RECORDS_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpRecords, JSON.stringify(allRecords), 'utf-8');
+    fs.renameSync(tmpRecords, SHARED_RECORDS_FILE);
+  }
+
+  /**
    * Obtiene el estado oficial de la cadena en la nube para un obligado tributario.
    * En modo firestore, NUNCA cae a disco local si Firestore devuelve error o no responde.
    */
@@ -389,6 +473,96 @@ export class CloudDistributedChainCoordinator {
     }
 
     return readSharedCloudRecord(recordId);
+  }
+
+  /**
+   * Recupera de forma autoritativa y fail-closed TODOS los FiscalRecord pertenecientes a un obligado tributario
+   * directamente desde la autoridad distribuida (Firestore / Cloud Simulator).
+   * Garantiza que una nueva instancia de Cloud Run con caché local vacía obtenga la totalidad de los registros.
+   */
+  public static async getRecordsByObligado(obligadoId: string): Promise<FiscalRecord[]> {
+    if (!obligadoId || obligadoId.trim() === '') {
+      throw new Error('CloudDistributedChainCoordinator: getRecordsByObligado requiere un obligadoId válido.');
+    }
+    const cleanObligado = obligadoId.trim();
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible en modo firestore para getRecordsByObligado (Fail-Closed).'
+        );
+      }
+      const snap = await firestore
+        .collection('fiscal_records')
+        .where('obligadoTributarioId', '==', cleanObligado)
+        .get();
+      if (!snap || snap.empty) return [];
+      const records: FiscalRecord[] = [];
+      snap.forEach((doc: any) => {
+        const data = doc.data() as FiscalRecord;
+        if (data) records.push(data);
+      });
+      return records;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_RECORDS_FILE)) {
+      const raw = fs.readFileSync(SHARED_RECORDS_FILE, 'utf-8');
+      const allRecords: Record<string, FiscalRecord> = JSON.parse(raw);
+      return Object.values(allRecords).filter(r => r.obligadoTributarioId === cleanObligado);
+    }
+    return [];
+  }
+
+  /**
+   * Recupera de forma autoritativa y fail-closed todas las FiscalSubmission de un obligado tributario.
+   */
+  public static async getSubmissionsByObligado(obligadoId: string): Promise<FiscalSubmission[]> {
+    if (!obligadoId || obligadoId.trim() === '') {
+      throw new Error('CloudDistributedChainCoordinator: getSubmissionsByObligado requiere un obligadoId válido.');
+    }
+    const cleanObligado = obligadoId.trim();
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible en modo firestore para getSubmissionsByObligado (Fail-Closed).'
+        );
+      }
+      const snap = await firestore
+        .collection('fiscal_submissions')
+        .where('obligadoTributarioId', '==', cleanObligado)
+        .get();
+      if (!snap || snap.empty) return [];
+      const submissions: FiscalSubmission[] = [];
+      snap.forEach((doc: any) => {
+        const data = doc.data() as FiscalSubmission;
+        if (data) submissions.push(data);
+      });
+      return submissions;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_SUBMISSIONS_FILE)) {
+      const raw = fs.readFileSync(SHARED_SUBMISSIONS_FILE, 'utf-8');
+      const allSubmissions: Record<string, FiscalSubmission> = JSON.parse(raw);
+      return Object.values(allSubmissions).filter(s => s.obligadoTributarioId === cleanObligado);
+    }
+    return [];
   }
 
   /**
@@ -473,6 +647,11 @@ export class CloudDistributedChainCoordinator {
    * Consulta en la autoridad distribuida todas las sumisiones asociadas a un FiscalRecord.
    * Permite garantizar idempotencia trans-instancia y detectar envíos en vuelo o ya aceptados,
    * tanto en remisiones individuales como en lotes de 1 a 1000 registros.
+   *
+   * POLÍTICA FAIL-CLOSED ESTRICTA:
+   * Si cualquiera de las consultas a Firestore (fiscalRecordId o fiscalRecordIds array-contains) falla,
+   * se propaga inmediatamente la excepción. Queda terminantemente prohibido absorber errores de Firestore
+   * o continuar con resultados parciales.
    */
   public static async getSubmissionsForRecord(fiscalRecordId: string): Promise<FiscalSubmission[]> {
     const mode = getCoordinatorMode();
@@ -485,9 +664,11 @@ export class CloudDistributedChainCoordinator {
         );
       }
       const col = firestore.collection('fiscal_submissions');
-      const snapPrimary = await col
-        .where('fiscalRecordId', '==', fiscalRecordId)
-        .get();
+      const [snapPrimary, snapBatch] = await Promise.all([
+        col.where('fiscalRecordId', '==', fiscalRecordId).get(),
+        col.where('fiscalRecordIds', 'array-contains', fiscalRecordId).get()
+      ]);
+
       const map = new Map<string, FiscalSubmission>();
       if (snapPrimary && !snapPrimary.empty) {
         snapPrimary.forEach((doc: any) => {
@@ -497,20 +678,13 @@ export class CloudDistributedChainCoordinator {
           }
         });
       }
-      try {
-        const snapBatch = await col
-          .where('fiscalRecordIds', 'array-contains', fiscalRecordId)
-          .get();
-        if (snapBatch && !snapBatch.empty) {
-          snapBatch.forEach((doc: any) => {
-            const data = doc.data() as FiscalSubmission;
-            if (data) {
-              map.set(data.id || `doc-${map.size}`, data);
-            }
-          });
-        }
-      } catch {
-        // Si un mock de test solo implementa consulta por fiscalRecordId, conservar snapPrimary
+      if (snapBatch && !snapBatch.empty) {
+        snapBatch.forEach((doc: any) => {
+          const data = doc.data() as FiscalSubmission;
+          if (data) {
+            map.set(data.id || `doc-${map.size}`, data);
+          }
+        });
       }
       return Array.from(map.values());
     }

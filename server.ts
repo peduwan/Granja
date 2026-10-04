@@ -1089,8 +1089,8 @@ app.get("/api/fiscal/outbox/pending", requireFiscalAuthMiddleware, async (req: F
       return res.status(authErr.statusCode || 403).json({ error: authErr.message });
     }
 
-    const { eligibleRecords, statesByRecordId } = await collectEligibleOutboxRecordsForObligado(obligado, 1000);
-    const allRecords = BackendFiscalCustody.getAllFiscalRecords(obligado);
+    const { eligibleRecords, totalPendingCount, batches, statesByRecordId } = await collectEligibleOutboxRecordsForObligado(obligado);
+    const allRecords = await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(obligado);
     const summaryByRecord = allRecords.map(r => {
       const st = statesByRecordId.get(r.id) || resolveRecordOutboxState(r.id, BackendFiscalCustody.getFiscalSubmissions(r.id));
       return {
@@ -1110,7 +1110,8 @@ app.get("/api/fiscal/outbox/pending", requireFiscalAuthMiddleware, async (req: F
 
     return res.json({
       obligadoTributarioId: obligado,
-      pendingCount: eligibleRecords.length,
+      pendingCount: totalPendingCount,
+      batchesCount: batches.length,
       pendingRecordIds: eligibleRecords.map(r => r.id),
       recordsSummary: summaryByRecord
     });

@@ -30,6 +30,7 @@ import {
   partitionRecordsIntoBatches,
   resolveRecordOutboxState,
   RecordAuthoritativeOutboxState,
+  submissionContainsRecord,
   MAX_RECORDS_PER_AEAT_SUBMISSION
 } from './submissionService';
 import {
@@ -76,10 +77,14 @@ export interface AuthoritativeSubmitRequest {
 
 export interface AuthoritativeSubmitResponse extends Omit<Partial<AeatTransportResult>, 'fiscalEvent'> {
   readonly submission?: FiscalSubmission;
+  readonly submissions?: ReadonlyArray<FiscalSubmission>;
   readonly fiscalEvent?: FiscalEvent | null;
+  readonly fiscalEvents?: ReadonlyArray<FiscalEvent>;
   readonly resultadosIndividuales?: ReadonlyArray<FiscalRecordSubmissionResult>;
   readonly recordResult?: FiscalRecordSubmissionResult;
   readonly cantidadRegistros?: number;
+  readonly cantidadLotes?: number;
+  readonly authoritativePendingCountBeforeSend?: number;
   readonly esBatch?: boolean;
   readonly isTechnicalError: boolean;
   readonly idempotentReplay?: boolean;
@@ -128,18 +133,27 @@ export function buildServerAuthoritativeFiscalConfig(record: FiscalRecord): Fisc
 }
 
 /**
- * Recopila del Outbox autoritativo todos los FiscalRecord pendientes o reintentables
- * para un obligado tributario, preservando el orden de emisión/cadena y excluyendo:
+ * Recopila del Outbox autoritativo (consultando Firestore / CloudDistributedChainCoordinator)
+ * todos los FiscalRecord pendientes o reintentables para un obligado tributario,
+ * preservando el orden determinista de la cadena fiscal y excluyendo:
  * - Registros ya aceptados (ACCEPTED o ACCEPTED_WITH_ERRORS, incluso dentro de lotes PARTIALLY_ACCEPTED)
  * - Registros en vuelo (SENDING)
  * - Registros rechazados funcionalmente (REJECTED, requieren subsanación)
  * - Registros que hayan agotado el límite de reintentos técnicos (MAX_RETRY_ATTEMPTS)
+ *
+ * IMPORTANTE:
+ * - No trunca artificialmente a 1.000 registros si no se especifica `maxRecords`, permitiendo
+ *   conocer el `totalPendingCount` autoritativo real (ej. 2.501 pendientes) y particionarlo en lotes
+ *   de hasta 1.000 registros mediante `partitionRecordsIntoBatches`.
  */
 export async function collectEligibleOutboxRecordsForObligado(
   obligadoTributarioId: string,
-  maxRecords: number = MAX_RECORDS_PER_AEAT_SUBMISSION
+  maxRecords?: number
 ): Promise<{
   eligibleRecords: FiscalRecord[];
+  allEligibleRecords: FiscalRecord[];
+  totalPendingCount: number;
+  batches: FiscalRecord[][];
   statesByRecordId: Map<string, RecordAuthoritativeOutboxState>;
 }> {
   const cleanObligado = (obligadoTributarioId || '').trim();
@@ -151,14 +165,56 @@ export async function collectEligibleOutboxRecordsForObligado(
     );
   }
 
-  const effectiveLimit = Math.max(1, Math.min(Number(maxRecords) || MAX_RECORDS_PER_AEAT_SUBMISSION, MAX_RECORDS_PER_AEAT_SUBMISSION));
-  const allRecords = BackendFiscalCustody.getAllFiscalRecords(cleanObligado);
-  const eligibleRecords: FiscalRecord[] = [];
+  // 1. Obtener autoritativamente TODOS los FiscalRecord del obligado desde Firestore / Cloud Authority
+  // y ordenarlos según el encadenamiento criptográfico fiscal (nunca depender solo de recordsCache local).
+  const allRecords = await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(cleanObligado);
+
+  // 2. Obtener autoritativamente todas las FiscalSubmission del obligado desde Firestore / Cloud Authority
+  const allObligadoSubmissions = await BackendFiscalCustody.getFiscalSubmissionsByObligadoAsync(cleanObligado);
+
+  // Pre-indexar sumisiones por fiscalRecordId en O(S) para evitar escaneos cuadráticos en lotes de >1.000 registros
+  const subsByRecordId = new Map<string, FiscalSubmission[]>();
+  const addSubForRecord = (recId: string | undefined, sub: FiscalSubmission) => {
+    if (!recId) return;
+    let list = subsByRecordId.get(recId);
+    if (!list) {
+      list = [];
+      subsByRecordId.set(recId, list);
+    }
+    if (!list.some(existing => existing.id === sub.id)) {
+      list.push(sub);
+    }
+  };
+
+  for (const sub of allObligadoSubmissions) {
+    addSubForRecord(sub.fiscalRecordId, sub);
+    if (Array.isArray(sub.fiscalRecordIds)) {
+      for (const rId of sub.fiscalRecordIds) {
+        addSubForRecord(rId, sub);
+      }
+    }
+    if (Array.isArray(sub.resultadosIndividuales)) {
+      for (const resItem of sub.resultadosIndividuales) {
+        addSubForRecord(resItem.fiscalRecordId, sub);
+      }
+    }
+  }
+
+  const allEligibleRecords: FiscalRecord[] = [];
   const statesByRecordId = new Map<string, RecordAuthoritativeOutboxState>();
 
   for (const rec of allRecords) {
-    const subs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(rec.id);
-    const state = resolveRecordOutboxState(rec.id, subs);
+    let subsForRec = subsByRecordId.get(rec.id) || [];
+    // Si el conjunto de registros es pequeño, contrastar también con getFiscalSubmissionsForRecordAsync
+    if (allRecords.length <= 25) {
+      const directSubs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(rec.id);
+      const mergedMap = new Map<string, FiscalSubmission>();
+      for (const s of subsForRec) mergedMap.set(s.id, s);
+      for (const s of directSubs) mergedMap.set(s.id, s);
+      subsForRec = Array.from(mergedMap.values());
+    }
+
+    const state = resolveRecordOutboxState(rec.id, subsForRec);
     statesByRecordId.set(rec.id, state);
 
     if (
@@ -168,18 +224,40 @@ export async function collectEligibleOutboxRecordsForObligado(
       !state.isRejected &&
       state.totalAttempts < MAX_RETRY_ATTEMPTS
     ) {
-      eligibleRecords.push(rec);
-      if (eligibleRecords.length >= effectiveLimit) {
-        break;
-      }
+      allEligibleRecords.push(rec);
     }
   }
 
-  return { eligibleRecords, statesByRecordId };
+  const totalPendingCount = allEligibleRecords.length;
+  const eligibleRecords =
+    typeof maxRecords === 'number' && maxRecords > 0
+      ? allEligibleRecords.slice(0, maxRecords)
+      : allEligibleRecords;
+
+  const effectiveBatchSize =
+    typeof maxRecords === 'number' && maxRecords > 0
+      ? Math.min(maxRecords, MAX_RECORDS_PER_AEAT_SUBMISSION)
+      : MAX_RECORDS_PER_AEAT_SUBMISSION;
+
+  const batches = partitionRecordsIntoBatches(eligibleRecords, effectiveBatchSize);
+
+  return {
+    eligibleRecords,
+    allEligibleRecords,
+    totalPendingCount,
+    batches,
+    statesByRecordId
+  };
 }
 
 /**
- * Ejecuta de forma autoritativa y transaccional la remisión AEAT (unitaria o por lote de 1 a 1.000 registros).
+ * Ejecuta de forma autoritativa y transaccional la remisión AEAT:
+ * - Unitaria (1 registro)
+ * - Lote explícito (1..1.000 registros o particionado automático si >1.000)
+ * - Drenado automático del Outbox (`batchFromOutbox: true`), dividiendo >1.000 pendientes en múltiples
+ *   peticiones SOAP consecutivas de hasta 1.000 registros mediante `partitionRecordsIntoBatches`
+ *   (ej. 2.501 pendientes -> SOAP #1: 1.000, SOAP #2: 1.000, SOAP #3: 501) y activando el disparador
+ *   autoritativo de >=1.000 pendientes frente a <TiempoEsperaEnvio>.
  */
 export async function executeAuthoritativeOutboxSubmission(
   request: AuthoritativeSubmitRequest
@@ -195,7 +273,7 @@ export async function executeAuthoritativeOutboxSubmission(
     internalTestOptions
   } = request;
 
-  // 1. Determinar modo de selección de registros (unitario, lote explícito 1..1000, o drenado de Outbox)
+  // 1. Determinar modo de selección de registros (unitario, lote explícito, o drenado de Outbox)
   let targetRecordIds: string[] = [];
   let isExplicitBatchRequest = false;
 
@@ -205,14 +283,14 @@ export async function executeAuthoritativeOutboxSubmission(
       throw new FiscalSubmissionHttpError(
         400,
         'EMPTY_BATCH',
-        "El array 'fiscalRecordIds' no puede estar vacío. Se requiere entre 1 y 1000 registros fiscales."
+        "El array 'fiscalRecordIds' no puede estar vacío. Se requiere al menos 1 registro fiscal."
       );
     }
-    if (fiscalRecordIds.length > MAX_RECORDS_PER_AEAT_SUBMISSION) {
+    if (fiscalRecordIds.length > MAX_RECORDS_PER_AEAT_SUBMISSION && !batchFromOutbox) {
       throw new FiscalSubmissionHttpError(
         400,
         'BATCH_LIMIT_EXCEEDED',
-        `El lote excede el límite máximo normativo AEAT de ${MAX_RECORDS_PER_AEAT_SUBMISSION} registros por envío SOAP (recibidos: ${fiscalRecordIds.length}).`
+        `El lote explícito excede el límite máximo normativo AEAT de ${MAX_RECORDS_PER_AEAT_SUBMISSION} registros por envío SOAP (recibidos: ${fiscalRecordIds.length}).`
       );
     }
 
@@ -285,7 +363,7 @@ export async function executeAuthoritativeOutboxSubmission(
     }
   }
 
-  // 3.Si es explícito por IDs, recuperar y verificar criptográficamente cada FiscalRecord antes de bloquear
+  // 3. Si es explícito por IDs, recuperar y verificar criptográficamente cada FiscalRecord antes de bloquear
   let recordsToSubmit: FiscalRecord[] = [];
   let targetObligado: string = obligadoTributarioId ? obligadoTributarioId.trim() : '';
 
@@ -349,17 +427,22 @@ export async function executeAuthoritativeOutboxSubmission(
   }
 
   try {
-    // 5. Si es batchFromOutbox, recolectar registros elegibles DENTRO del cerrojo exclusivo
+    // 5. Consultar el estado autoritativo completo del Outbox para este obligado DENTRO del cerrojo exclusivo
+    let authoritativeOutboxSnapshot = await collectEligibleOutboxRecordsForObligado(
+      targetObligado,
+      batchFromOutbox ? maxBatchSize : undefined
+    );
+
     if (batchFromOutbox) {
-      const { eligibleRecords } = await collectEligibleOutboxRecordsForObligado(
-        targetObligado,
-        maxBatchSize ?? MAX_RECORDS_PER_AEAT_SUBMISSION
-      );
+      const { eligibleRecords } = authoritativeOutboxSnapshot;
       if (eligibleRecords.length === 0) {
         return {
           emptyOutbox: true,
           cantidadRegistros: 0,
+          cantidadLotes: 0,
+          authoritativePendingCountBeforeSend: 0,
           esBatch: false,
+          submissions: [],
           resultadosIndividuales: [],
           isTechnicalError: false,
           message: `No existen registros fiscales pendientes de remisión en el Outbox para el obligado '${targetObligado}'.`
@@ -380,11 +463,18 @@ export async function executeAuthoritativeOutboxSubmission(
       targetRecordIds = eligibleRecords.map(r => r.id);
     }
 
-    // 6. Evaluación autoritativa del estado Outbox por cada FiscalRecord DENTRO del cerrojo exclusivo
+    // 6. Evaluación autoritativa del estado Outbox por cada FiscalRecord solicitado DENTRO del cerrojo exclusivo
     const states: RecordAuthoritativeOutboxState[] = [];
+    const statesMap = new Map<string, RecordAuthoritativeOutboxState>();
+
     for (const rec of recordsToSubmit) {
-      const subs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(rec.id);
-      states.push(resolveRecordOutboxState(rec.id, subs));
+      let state = authoritativeOutboxSnapshot.statesByRecordId.get(rec.id);
+      if (!state || recordsToSubmit.length <= 25) {
+        const subs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(rec.id);
+        state = resolveRecordOutboxState(rec.id, subs);
+      }
+      states.push(state);
+      statesMap.set(rec.id, state);
     }
 
     // 6.a Caso 1: Todos los registros solicitados ya están aceptados
@@ -400,10 +490,12 @@ export async function executeAuthoritativeOutboxSubmission(
         const existingEvents = BackendFiscalCustody.getFiscalEvents(recordsToSubmit[0].id);
         return {
           submission: firstAcceptedSub,
+          submissions: [firstAcceptedSub],
           fiscalEvent: existingEvents[existingEvents.length - 1] || null,
           resultadosIndividuales: firstAcceptedSub.resultadosIndividuales,
           recordResult: states[0].latestRecordResult,
           cantidadRegistros: recordsToSubmit.length,
+          cantidadLotes: 1,
           esBatch: recordsToSubmit.length > 1,
           isTechnicalError: false,
           idempotentReplay: true
@@ -464,68 +556,123 @@ export async function executeAuthoritativeOutboxSubmission(
       );
     }
 
-    // 6.f Verificar ventana distribuida de control de flujo AEAT (<TiempoEsperaEnvio>) antes de enviar
-    const sendAllowedByFlow = await AeatFlowControlManager.isSendAllowedAsync(targetObligado);
+    // 6.f Verificar ventana distribuida de control de flujo AEAT (<TiempoEsperaEnvio>)
+    // pasando el conteo AUTORITATIVO de registros pendientes en el Outbox de servidor
+    // (Regla disyuntiva AEAT: se envía si ahora >= nextAllowedSendTimestamp O si pendientes >= 1.000).
+    const authoritativePendingCount = Math.max(
+      authoritativeOutboxSnapshot.totalPendingCount,
+      recordsToSubmit.length
+    );
+
+    const sendAllowedByFlow = await AeatFlowControlManager.isSendAllowedAsync(
+      targetObligado,
+      undefined,
+      authoritativePendingCount
+    );
     if (!sendAllowedByFlow) {
       const nextAllowed = (await AeatFlowControlManager.getFlowStateAsync(targetObligado))?.nextAllowedSendTimestamp ?? 0;
       const waitSec = Math.max(1, Math.ceil((nextAllowed - Date.now()) / 1000));
       throw new FiscalSubmissionHttpError(
         429,
         'FLOW_CONTROL_WAIT_ACTIVE',
-        `Control de flujo oficial AEAT activo para el obligado ${targetObligado}. Debe aguardar ${waitSec}s (<TiempoEsperaEnvio>) antes del próximo envío.`,
-        { waitSeconds: waitSec }
+        `Control de flujo oficial AEAT activo para el obligado ${targetObligado}. Debe aguardar ${waitSec}s (<TiempoEsperaEnvio>) o acumular ${MAX_RECORDS_PER_AEAT_SUBMISSION} registros pendientes (actuales: ${authoritativePendingCount}) antes del próximo envío.`,
+        { waitSeconds: waitSec, authoritativePendingCount }
       );
     }
 
-    // 7. Construir FiscalSubmission (1..1000 registros) y configuración autoritativa en servidor
-    const primaryRecord = recordsToSubmit[0];
-    const serverFiscalConfig = buildServerAuthoritativeFiscalConfig(primaryRecord);
-    const maxPreviousAttempts = states.reduce((max, s) => Math.max(max, s.totalAttempts), 0);
-    const nextAttemptNumber = maxPreviousAttempts + 1;
+    // 7. Particionar los registros pendientes en lotes normativos de 1..1.000 usando partitionRecordsIntoBatches
+    // (Ej.: 2.501 pendientes -> Lote 1 = 1.000, Lote 2 = 1.000, Lote 3 = 501)
+    const effectiveBatchSize =
+      typeof maxBatchSize === 'number' && maxBatchSize > 0
+        ? Math.min(maxBatchSize, MAX_RECORDS_PER_AEAT_SUBMISSION)
+        : MAX_RECORDS_PER_AEAT_SUBMISSION;
 
-    const serverSubmission = createFiscalSubmission(
-      recordsToSubmit.length === 1 && !isExplicitBatchRequest ? primaryRecord : recordsToSubmit,
-      serverFiscalConfig,
-      { numeroIntento: nextAttemptNumber }
-    );
+    const batches = partitionRecordsIntoBatches(recordsToSubmit, effectiveBatchSize);
 
     const serverTransportMode = isProduction
       ? 'real'
       : (process.env.AEAT_TRANSPORT_MODE || (AeatCertificateProvider.hasCertificate() ? 'real' : 'mock'));
 
-    // 8. Ejecutar transporte SOAP con un único envío para los 1..1000 registros del lote
-    const result = await executeAeatSubmission({
-      submission: serverSubmission,
-      fiscalRecords: recordsToSubmit,
-      config: serverFiscalConfig,
-      options: {
-        transportMode: serverTransportMode as any,
-        mockScenario: internalTestOptions?.mockScenario,
-        mockTiempoEsperaEnvio: internalTestOptions?.mockTiempoEsperaEnvio,
-        mockLineOverrides: internalTestOptions?.mockLineOverrides,
-        acquireLock: false,
-        actor: actor || {
-          tipo: 'SYSTEM',
-          nombre: 'OutboxBatchProcessor'
-        },
-        // Outbox Pre-Commit: Persiste en la autoridad distribuida el estado SENDING ANTES de enviar por red
-        onBeforeNetworkSend: async (sendingSub, startEvt) => {
-          await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
-          await BackendFiscalCustody.saveFiscalEvent(startEvt);
-        }
-      }
-    });
+    const batchSubmissions: FiscalSubmission[] = [];
+    const batchEvents: FiscalEvent[] = [];
+    const allResultadosIndividuales: FiscalRecordSubmissionResult[] = [];
+    let lastTransportResult: AeatTransportResult | undefined;
+    let anyTechnicalError = false;
 
-    // 9. Persistencia fail-closed del estado terminal (con resultadosIndividuales por registro) y evento
-    await BackendFiscalCustody.saveFiscalSubmission(result.submission);
-    await BackendFiscalCustody.saveFiscalEvent(result.fiscalEvent);
+    // 8. Ejecutar secuencialmente cada lote de hasta 1.000 registros como una petición SOAP independiente
+    for (let i = 0; i < batches.length; i++) {
+      const batchRecords = batches[i];
+      const primaryRecord = batchRecords[0];
+      const serverFiscalConfig = buildServerAuthoritativeFiscalConfig(primaryRecord);
+
+      const batchStates = batchRecords.map(r => statesMap.get(r.id)).filter(Boolean) as RecordAuthoritativeOutboxState[];
+      const maxPreviousAttempts = batchStates.reduce((max, s) => Math.max(max, s.totalAttempts), 0);
+      const nextAttemptNumber = maxPreviousAttempts + 1;
+
+      const serverSubmission = createFiscalSubmission(
+        batchRecords.length === 1 && !isExplicitBatchRequest && batches.length === 1
+          ? primaryRecord
+          : batchRecords,
+        serverFiscalConfig,
+        { numeroIntento: nextAttemptNumber }
+      );
+
+      const result = await executeAeatSubmission({
+        submission: serverSubmission,
+        fiscalRecords: batchRecords,
+        config: serverFiscalConfig,
+        options: {
+          transportMode: serverTransportMode as any,
+          mockScenario: internalTestOptions?.mockScenario,
+          mockTiempoEsperaEnvio: internalTestOptions?.mockTiempoEsperaEnvio,
+          mockLineOverrides: internalTestOptions?.mockLineOverrides,
+          acquireLock: false,
+          actor: actor || {
+            tipo: 'SYSTEM',
+            nombre: 'OutboxBatchProcessor'
+          },
+          // Outbox Pre-Commit: Persiste en la autoridad distribuida el estado SENDING ANTES de enviar por red
+          onBeforeNetworkSend: async (sendingSub, startEvt) => {
+            await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
+            await BackendFiscalCustody.saveFiscalEvent(startEvt);
+          }
+        }
+      });
+
+      // 9. Persistencia fail-closed del estado terminal (con resultadosIndividuales por registro) y evento
+      await BackendFiscalCustody.saveFiscalSubmission(result.submission);
+      await BackendFiscalCustody.saveFiscalEvent(result.fiscalEvent);
+
+      batchSubmissions.push(result.submission);
+      batchEvents.push(result.fiscalEvent);
+      if (result.submission.resultadosIndividuales) {
+        allResultadosIndividuales.push(...result.submission.resultadosIndividuales);
+      }
+      lastTransportResult = result;
+
+      // Si el transporte falla técnicamente (HTTP 5xx, timeout, red), detener el drenado de los lotes subsiguientes
+      if (result.isTechnicalError) {
+        anyTechnicalError = true;
+        break;
+      }
+    }
+
+    const primaryOrLastSub = batchSubmissions[batchSubmissions.length - 1];
+    const primaryOrLastEvt = batchEvents[batchEvents.length - 1] || null;
 
     return {
-      ...result,
-      resultadosIndividuales: result.submission.resultadosIndividuales,
-      recordResult: result.submission.resultadosIndividuales?.[0],
-      cantidadRegistros: recordsToSubmit.length,
-      esBatch: recordsToSubmit.length > 1
+      ...(lastTransportResult || {}),
+      submission: primaryOrLastSub,
+      submissions: batchSubmissions,
+      fiscalEvent: primaryOrLastEvt,
+      fiscalEvents: batchEvents,
+      resultadosIndividuales: allResultadosIndividuales,
+      recordResult: allResultadosIndividuales[0],
+      cantidadRegistros: allResultadosIndividuales.length,
+      cantidadLotes: batchSubmissions.length,
+      authoritativePendingCountBeforeSend: authoritativePendingCount,
+      esBatch: recordsToSubmit.length > 1 || batchSubmissions.length > 1,
+      isTechnicalError: anyTechnicalError
     };
   } finally {
     await AeatFlowControlManager.releaseSendLockAsync(targetObligado);

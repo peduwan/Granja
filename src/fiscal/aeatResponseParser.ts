@@ -383,9 +383,21 @@ export function getRecordCanonicalFechaExpedicion(record: FiscalRecord): string 
   return normalizeDateForAeatCorrelation(record.factura.fechaExpedicion);
 }
 
+export class AeatResponseCorrelationError extends Error {
+  public readonly code = 'ERR_CORRELATION_MISMATCH';
+  constructor(message: string) {
+    super(message);
+    this.name = 'AeatResponseCorrelationError';
+  }
+}
+
 /**
  * Correlaciona cada FiscalRecord de un envío (1..1000) con su correspondiente <sfR:RespuestaLinea>
  * devuelta por la AEAT, produciendo el resultado individual determinista de cada registro.
+ *
+ * POLÍTICA FAIL-CLOSED ESTRICTA:
+ * - Prohibido asignar respuestas por posición si los identificadores de factura no coinciden.
+ * - Si un registro no puede correlacionarse unívocamente con su <sfR:RespuestaLinea>, lanza AeatResponseCorrelationError.
  */
 export function correlateAeatResponseWithRecords(
   firstArg: ReadonlyArray<FiscalRecord> | AeatParsedResponse | undefined,
@@ -426,45 +438,49 @@ export function correlateAeatResponseWithRecords(
   const usedLineIndices = new Set<number>();
   const lines = parsedResponse.lineas || [];
 
-  return records.map((rec, idx) => {
+  // Si es un lote (>1 registro) o si la respuesta incluye líneas, el cardinal debe coincidir exactamente
+  if (records.length > 1 && lines.length !== records.length) {
+    throw new AeatResponseCorrelationError(
+      `ERROR DE INTEGRIDAD DE RESPUESTA AEAT: El lote envió ${records.length} registros fiscales pero la respuesta contiene ${lines.length} bloques <sfR:RespuestaLinea>. Correlación abortada (Fail-Closed).`
+    );
+  }
+
+  return records.map((rec) => {
     const recNif = (rec.emisor?.nif || rec.obligadoTributarioId || '').trim().toUpperCase();
     const recNum = getRecordCanonicalNumSerie(rec);
     const recRawNum = (rec.factura.numeroFactura || '').trim();
     const recFecha = getRecordCanonicalFechaExpedicion(rec);
     const recRefExterna = (rec.tipoRegistro === 'anulacion' ? rec.datosAnulacion?.refExterna : rec.factura.refExterna)?.trim();
 
-    // 1. Búsqueda exacta por clave compuesta (IDEmisorFactura + NumSerieFactura + FechaExpedicionFactura)
+    // 1. Búsqueda exacta por clave compuesta oficial (IDEmisorFactura + NumSerieFactura + FechaExpedicionFactura)
     let matchedIndex = lines.findIndex((line, lineIdx) => {
       if (usedLineIndices.has(lineIdx)) return false;
       const lineNif = (line.idFactura.idEmisorFactura || '').trim().toUpperCase();
       const lineNum = (line.idFactura.numSerieFactura || '').trim();
       const lineFecha = normalizeDateForAeatCorrelation(line.idFactura.fechaExpedicionFactura);
       const nifMatches = !lineNif || lineNif === recNif;
-      const numMatches = lineNum === recNum || lineNum === recRawNum;
+      const numMatches = lineNum !== '' && (lineNum === recNum || lineNum === recRawNum);
       const fechaMatches = !lineFecha || lineFecha === recFecha;
       return nifMatches && numMatches && fechaMatches;
     });
 
-    // 2. Búsqueda por NumSerieFactura (si la fecha tenía variación de formato)
+    // 2. Búsqueda por IDEmisorFactura + NumSerieFactura (si la fecha tenía variación de formato)
     if (matchedIndex === -1) {
       matchedIndex = lines.findIndex((line, lineIdx) => {
         if (usedLineIndices.has(lineIdx)) return false;
+        const lineNif = (line.idFactura.idEmisorFactura || '').trim().toUpperCase();
         const lineNum = (line.idFactura.numSerieFactura || '').trim();
-        return lineNum === recNum || lineNum === recRawNum;
+        const nifMatches = !lineNif || lineNif === recNif;
+        return nifMatches && lineNum !== '' && (lineNum === recNum || lineNum === recRawNum);
       });
     }
 
-    // 3. Búsqueda por RefExterna si se informó
+    // 3. Búsqueda por RefExterna unívoca si se informó en el registro
     if (matchedIndex === -1 && recRefExterna) {
       matchedIndex = lines.findIndex((line, lineIdx) => {
         if (usedLineIndices.has(lineIdx)) return false;
-        return line.refExterna === recRefExterna;
+        return Boolean(line.refExterna && line.refExterna === recRefExterna);
       });
-    }
-
-    // 4. Fallback posicional determinista cuando AEAT devuelve exactamente N líneas en el mismo orden
-    if (matchedIndex === -1 && idx < lines.length && !usedLineIndices.has(idx)) {
-      matchedIndex = idx;
     }
 
     const matchedLine = matchedIndex !== -1 ? lines[matchedIndex] : undefined;
@@ -473,7 +489,14 @@ export function correlateAeatResponseWithRecords(
     }
 
     if (!matchedLine) {
-      // Si no hay línea específica pero el estado global es Correcto / Incorrecto
+      // Si la respuesta AEAT contiene líneas pero ninguna corresponde a este registro -> FAIL-CLOSED ESTRICTO
+      if (lines.length > 0 || records.length > 1) {
+        throw new AeatResponseCorrelationError(
+          `ERROR DE INTEGRIDAD DE RESPUESTA AEAT: Imposible correlacionar de forma unívoca el registro fiscal '${rec.id}' (factura '${recNum}') con las líneas <sfR:RespuestaLinea> devueltas por la AEAT. Prohibido asignar respuestas por posición (Fail-Closed).`
+        );
+      }
+
+      // Caso legado exclusivo de envío unitario (1 registro) con respuesta sintética sin <sfR:RespuestaLinea>
       if (parsedResponse.estadoEnvio === 'Correcto' || submissionStatus === 'ACCEPTED') {
         return {
           fiscalRecordId: rec.id,
