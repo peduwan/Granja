@@ -1101,6 +1101,8 @@ app.get("/api/fiscal/outbox/pending", requireFiscalAuthMiddleware, async (req: F
         isAccepted: st.isAccepted,
         isRejected: st.isRejected,
         isSending: st.isSending,
+        isOrphanedSending: Boolean(st.isOrphanedSending),
+        resultadoAeatDesconocido: Boolean(st.resultadoAeatDesconocido),
         isPendingOrRetryable: st.isPendingOrRetryable,
         totalAttempts: st.totalAttempts,
         csv: st.latestRecordResult?.csv || st.acceptedSubmission?.csv,

@@ -432,15 +432,50 @@ export function getSubmissionsForRecord(fiscalRecordId: string): FiscalSubmissio
   return outboxSubmissions.filter(s => submissionContainsRecord(s, fiscalRecordId));
 }
 
+export const DEFAULT_ORPHANED_SENDING_THRESHOLD_MS = 60000;
+
+export interface ResolveOutboxStateOptions {
+  readonly nowMs?: number;
+  readonly staleSendingThresholdMs?: number;
+}
+
+/**
+ * Determina si una FiscalSubmission en estado SENDING ha quedado huérfana (abandonada)
+ * tras la caída/reinicio de una instancia de Cloud Run o expiración del lease distribuido.
+ */
+export function isOrphanedSendingSubmission(
+  submission: FiscalSubmission,
+  nowMs: number = Date.now(),
+  staleSendingThresholdMs: number = DEFAULT_ORPHANED_SENDING_THRESHOLD_MS
+): boolean {
+  if (!submission) return false;
+  const isSendingState =
+    submission.estado === 'SENDING' ||
+    (Array.isArray(submission.resultadosIndividuales) &&
+      submission.resultadosIndividuales.some(r => r.estado === 'SENDING'));
+  if (!isSendingState) return false;
+
+  const refIso = submission.fechaEnvio || submission.fechaIntento || submission.fechaCreacion;
+  if (!refIso) return false;
+  const sentMs = Date.parse(refIso);
+  if (isNaN(sentMs)) return false;
+
+  const threshold = Math.max(1, staleSendingThresholdMs);
+  return nowMs - sentMs >= threshold;
+}
+
 export interface RecordAuthoritativeOutboxState {
   readonly fiscalRecordId: string;
   readonly status: FiscalRecordSubmissionStatus | 'NOT_SUBMITTED';
   readonly acceptedSubmission?: FiscalSubmission;
   readonly activeSendingSubmission?: FiscalSubmission;
+  readonly orphanedSendingSubmission?: FiscalSubmission;
   readonly latestSubmission?: FiscalSubmission;
   readonly latestRecordResult?: FiscalRecordSubmissionResult;
   readonly isAccepted: boolean;
   readonly isSending: boolean;
+  readonly isOrphanedSending?: boolean;
+  readonly resultadoAeatDesconocido?: boolean;
   readonly isRejected: boolean;
   readonly isPendingOrRetryable: boolean;
   readonly totalAttempts: number;
@@ -450,13 +485,15 @@ export interface RecordAuthoritativeOutboxState {
  * Resuelve el estado autoritativo de un FiscalRecord individual a través de todas las
  * FiscalSubmission (individuales o por lote) en las que haya participado.
  *
- * Permite determinar con precisión qué registros de un lote fueron aceptados, cuáles
- * fueron rechazados funcionalmente (PARTIALLY_ACCEPTED / REJECTED) y cuáles sufrieron
- * un fallo técnico reintentable.
+ * Distingue explícitamente:
+ * - SENDING legítimamente activo (dentro de ventana de lease): bloquea envíos concurrentes (isSending=true).
+ * - SENDING huérfano/abandonado (lease expirado / instancia caída): marca isOrphanedSending=true y
+ *   resultadoAeatDesconocido=true para activar reconciliación controlada antes de reenviar.
  */
 export function resolveRecordOutboxState(
   fiscalRecordId: string,
-  submissions: ReadonlyArray<FiscalSubmission>
+  submissions: ReadonlyArray<FiscalSubmission>,
+  options?: ResolveOutboxStateOptions
 ): RecordAuthoritativeOutboxState {
   const relevant = submissions.filter(s => submissionContainsRecord(s, fiscalRecordId));
   if (relevant.length === 0) {
@@ -465,6 +502,8 @@ export function resolveRecordOutboxState(
       status: 'NOT_SUBMITTED',
       isAccepted: false,
       isSending: false,
+      isOrphanedSending: false,
+      resultadoAeatDesconocido: false,
       isRejected: false,
       isPendingOrRetryable: true,
       totalAttempts: 0
@@ -482,6 +521,8 @@ export function resolveRecordOutboxState(
         latestRecordResult: res,
         isAccepted: true,
         isSending: false,
+        isOrphanedSending: false,
+        resultadoAeatDesconocido: false,
         isRejected: false,
         isPendingOrRetryable: false,
         totalAttempts: relevant.length
@@ -489,26 +530,56 @@ export function resolveRecordOutboxState(
     }
   }
 
+  const nowMs = options?.nowMs ?? Date.now();
+  const thresholdMs = options?.staleSendingThresholdMs ?? DEFAULT_ORPHANED_SENDING_THRESHOLD_MS;
+  let detectedOrphanSub: FiscalSubmission | undefined;
+
   for (const sub of relevant) {
     const res = getRecordResultFromSubmission(sub, fiscalRecordId);
     if (sub.estado === 'SENDING' || res?.estado === 'SENDING') {
-      return {
-        fiscalRecordId,
-        status: 'SENDING',
-        activeSendingSubmission: sub,
-        latestSubmission: sub,
-        latestRecordResult: res,
-        isAccepted: false,
-        isSending: true,
-        isRejected: false,
-        isPendingOrRetryable: false,
-        totalAttempts: relevant.length
-      };
+      if (isOrphanedSendingSubmission(sub, nowMs, thresholdMs)) {
+        detectedOrphanSub = sub;
+      } else {
+        return {
+          fiscalRecordId,
+          status: 'SENDING',
+          activeSendingSubmission: sub,
+          latestSubmission: sub,
+          latestRecordResult: res,
+          isAccepted: false,
+          isSending: true,
+          isOrphanedSending: false,
+          resultadoAeatDesconocido: false,
+          isRejected: false,
+          isPendingOrRetryable: false,
+          totalAttempts: relevant.length
+        };
+      }
+    } else if (sub.codigoAeat === 'ORPHANED_SENDING_UNKNOWN_OUTCOME') {
+      detectedOrphanSub = sub;
     }
   }
 
   const latestSub = relevant[relevant.length - 1];
   const latestRes = getRecordResultFromSubmission(latestSub, fiscalRecordId);
+
+  if (detectedOrphanSub && (latestSub.estado === 'SENDING' || latestRes?.estado === 'SENDING')) {
+    return {
+      fiscalRecordId,
+      status: 'RETRY_PENDING',
+      orphanedSendingSubmission: detectedOrphanSub,
+      latestSubmission: latestSub,
+      latestRecordResult: latestRes,
+      isAccepted: false,
+      isSending: false,
+      isOrphanedSending: true,
+      resultadoAeatDesconocido: true,
+      isRejected: false,
+      isPendingOrRetryable: true,
+      totalAttempts: relevant.length
+    };
+  }
+
   const status: FiscalRecordSubmissionStatus = latestRes?.estado || (
     latestSub.estado === 'PARTIALLY_ACCEPTED' ? 'REJECTED' : latestSub.estado
   );
@@ -522,10 +593,13 @@ export function resolveRecordOutboxState(
   return {
     fiscalRecordId,
     status,
+    orphanedSendingSubmission: detectedOrphanSub,
     latestSubmission: latestSub,
     latestRecordResult: latestRes,
     isAccepted: false,
     isSending: false,
+    isOrphanedSending: Boolean(detectedOrphanSub),
+    resultadoAeatDesconocido: Boolean(detectedOrphanSub),
     isRejected,
     isPendingOrRetryable,
     totalAttempts: relevant.length

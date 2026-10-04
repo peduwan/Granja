@@ -927,6 +927,137 @@ async function main() {
     }
   });
 
+  await runTest('4.7 (P1): Reconciliación y recuperación de SENDING huérfano tras caída de Cloud Run y expiración de lease (distinguiendo SENDING activo vs huérfano y reconciliando 3000 RegistroDuplicado)', async () => {
+    resetAllState();
+    const records = await emitAndCustodyBatch(2, config, 'FAC-ORPHAN');
+    const [r1, r2] = records;
+
+    // Escenario real:
+    // T0: SENDING persistido en Firestore antes del envío de red (Outbox Pre-Commit)
+    const initialSub = createFiscalSubmission([r1, r2], config, { numeroIntento: 1 });
+    const sendingSub = transitionSubmissionStatus(initialSub, 'SENDING');
+    await BackendFiscalCustody.saveFiscalSubmission(sendingSub);
+
+    // Mientras está dentro de la ventana de lease (< 60s), SENDING se considera legítimamente activo:
+    // debe bloquear cualquier envío con 409 CONCURRENT_SUBMISSION_IN_FLIGHT
+    await assert.rejects(
+      async () => {
+        await executeAuthoritativeOutboxSubmission({
+          fiscalRecordIds: [r1.id, r2.id],
+          internalTestOptions: {
+            nowMs: Date.now() + 10000, // Solo han pasado 10s (< 60s de lease)
+            staleSendingThresholdMs: 60000
+          }
+        });
+      },
+      (err: any) => {
+        assert.strictEqual(err.statusCode, 409);
+        assert.strictEqual(err.code, 'CONCURRENT_SUBMISSION_IN_FLIGHT');
+        return true;
+      }
+    );
+
+    // T1: SOAP enviado -> T2: AEAT procesó R1 como Correcta (pero R2 no o se reenvía el lote) ->
+    // T3: Cloud Run muere antes de guardar ACCEPTED -> T4: lock expira (> 60s) -> T5: nueva instancia
+    const futureNowMs = Date.now() + 120000; // 120s > 60s TTL
+
+    // Verificar que resolveRecordOutboxState distingue el SENDING huérfano y marca resultadoAeatDesconocido=true
+    const subsR1Before = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(r1.id);
+    const stateR1Orphan = resolveRecordOutboxState(r1.id, subsR1Before, {
+      nowMs: futureNowMs,
+      staleSendingThresholdMs: 60000
+    });
+    assert.strictEqual(stateR1Orphan.isSending, false, 'Un SENDING con lease expirado no debe bloquear perpetuamente como isSending');
+    assert.strictEqual(stateR1Orphan.isOrphanedSending, true, 'Debe identificarse como SENDING huérfano');
+    assert.strictEqual(stateR1Orphan.resultadoAeatDesconocido, true, 'Debe marcarse con resultado AEAT desconocido');
+    assert.strictEqual(stateR1Orphan.isPendingOrRetryable, true, 'Debe ser elegible para reconciliación');
+
+    // Simular que en T2 AEAT YA había procesado y aceptado R1 (por lo que al reconciliar responde 3000 + RegistroDuplicado=Correcta)
+    // y R2 se procesa como Correcto
+    const reconcileResult = await executeAuthoritativeOutboxSubmission({
+      batchFromOutbox: true,
+      obligadoTributarioId: NIF_BATCH_OBLIGADO,
+      internalTestOptions: {
+        nowMs: futureNowMs,
+        staleSendingThresholdMs: 60000,
+        mockScenario: 'PARTIAL_ACCEPTANCE',
+        mockTiempoEsperaEnvio: 0,
+        mockLineOverrides: {
+          [r1.id]: {
+            estadoRegistro: 'Incorrecto',
+            codigoError: '3000',
+            descripcionError: 'Registro de facturación duplicado',
+            registroDuplicado: {
+              idPeticionRegistroDuplicado: 'PET-AEAT-DUP-2026-001',
+              estadoRegistroDuplicado: 'Correcta'
+            }
+          },
+          [r2.id]: {
+            estadoRegistro: 'Correcto'
+          }
+        }
+      }
+    });
+
+    // Verificar que la FiscalSubmission huérfana original fue reconciliada y cerrada con ORPHANED_SENDING_UNKNOWN_OUTCOME
+    assert.deepStrictEqual(reconcileResult.reconciledOrphanedSubmissionIds, [sendingSub.id]);
+    assert.deepStrictEqual(reconcileResult.reconciledRecordIds, [r1.id, r2.id]);
+
+    // Verificar que gracias a la reconciliación de 3000 + RegistroDuplicado(Correcta),
+    // tanto R1 como R2 quedan en estado ACCEPTED y la submission queda ACCEPTED
+    assert.strictEqual(reconcileResult.submission?.estado, 'ACCEPTED');
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.length, 2);
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.[0].fiscalRecordId, r1.id);
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.[0].estado, 'ACCEPTED');
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.[0].requiereSubsanacion, false);
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.[1].fiscalRecordId, r2.id);
+    assert.strictEqual(reconcileResult.resultadosIndividuales?.[1].estado, 'ACCEPTED');
+
+    // Verificar que ya no quedan registros pendientes ni bloqueados en el Outbox
+    const afterReconcile = await collectEligibleOutboxRecordsForObligado(NIF_BATCH_OBLIGADO);
+    assert.strictEqual(afterReconcile.totalPendingCount, 0);
+  });
+
+  await runTest('4.8 (P1): El lote explícito (fiscalRecordIds: [R3, R1, R2]) NO respeta el orden del cliente y reordena autoritativamente según la cadena fiscal (R1 -> R2 -> R3)', async () => {
+    resetAllState();
+    const records = await emitAndCustodyBatch(3, config, 'FAC-ORDER');
+    const [r1, r2, r3] = records;
+
+    // El cliente envía los IDs desordenados: [R3, R1, R2]
+    const res = await executeAuthoritativeOutboxSubmission({
+      fiscalRecordIds: [r3.id, r1.id, r2.id],
+      internalTestOptions: {
+        mockScenario: 'ACCEPTANCE',
+        mockTiempoEsperaEnvio: 0
+      }
+    });
+
+    assert.strictEqual(res.submission?.estado, 'ACCEPTED');
+    assert.strictEqual(res.cantidadRegistros, 3);
+
+    // 1. El orden en la FiscalSubmission DEBE ser [R1, R2, R3], nunca [R3, R1, R2]
+    assert.deepStrictEqual(
+      res.submission?.fiscalRecordIds,
+      [r1.id, r2.id, r3.id],
+      'El lote explícito debe reordenarse según la cadena criptográfica fiscal [R1, R2, R3]'
+    );
+    assert.deepStrictEqual(
+      res.submission?.numerosFactura,
+      [r1.factura.numeroFactura, r2.factura.numeroFactura, r3.factura.numeroFactura]
+    );
+
+    // 2. El XML enviado a AEAT debe contener los bloques <sfLR:RegistroFactura> en el orden exacto R1 -> R2 -> R3
+    const xml = res.submission?.xmlEnviado || '';
+    const idxR1 = xml.indexOf(r1.factura.numeroFactura);
+    const idxR2 = xml.indexOf(r2.factura.numeroFactura);
+    const idxR3 = xml.indexOf(r3.factura.numeroFactura);
+    assert.ok(idxR1 !== -1 && idxR2 !== -1 && idxR3 !== -1, 'Las 3 facturas deben estar presentes en el XML enviado');
+    assert.ok(
+      idxR1 < idxR2 && idxR2 < idxR3,
+      `El XML del lote explícito debe preservar el orden de cadena R1 (${idxR1}) < R2 (${idxR2}) < R3 (${idxR3})`
+    );
+  });
+
   resetAllState();
 
   console.log('\n================================================================');

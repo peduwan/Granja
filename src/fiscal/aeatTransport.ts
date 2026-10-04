@@ -520,6 +520,11 @@ export interface AeatTransportOptions {
   readonly customFetch?: (url: string, init: any) => Promise<any>;
   readonly acquireLock?: boolean;
   /**
+   * Identificadores de registros que están siendo reconciliados tras un estado SENDING huérfano
+   * con resultado AEAT desconocido.
+   */
+  readonly reconcilingRecordIds?: ReadonlyArray<string>;
+  /**
    * Hook de persistencia previa al envío de red (Outbox Pre-Commit) para garantizar
    * idempotencia distribuida ante caídas o timeouts tras el envío SOAP.
    */
@@ -1068,12 +1073,40 @@ export async function executeAeatSubmission(params: {
       }
 
       // Correlacionar cada RespuestaLinea con el FiscalRecord individual correspondiente
-      const resultadosIndividuales = correlateAeatResponseWithRecords(parsed, records);
+      const resultadosIndividuales = correlateAeatResponseWithRecords(parsed, records, {
+        submissionStatus: parsed.mappedSubmissionStatus,
+        reconcilingRecordIds: options?.reconcilingRecordIds
+      });
 
-      if (parsed.mappedSubmissionStatus === 'ACCEPTED') {
+      // Derivar estado global efectivo de la FiscalSubmission a partir de los resultados individuales
+      // (especialmente cuando registros de un SENDING huérfano se reconcilian vía RegistroDuplicado Correcta)
+      let effectiveSubmissionStatus = parsed.mappedSubmissionStatus;
+      if (resultadosIndividuales.length > 0 && options?.reconcilingRecordIds && options.reconcilingRecordIds.length > 0) {
+        const allCorrect = resultadosIndividuales.every(r => r.estado === 'ACCEPTED');
+        const allAcceptedOrWarn = resultadosIndividuales.every(
+          r => r.estado === 'ACCEPTED' || r.estado === 'ACCEPTED_WITH_ERRORS'
+        );
+        const anyAcceptedOrWarn = resultadosIndividuales.some(
+          r => r.estado === 'ACCEPTED' || r.estado === 'ACCEPTED_WITH_ERRORS'
+        );
+        const anyRejected = resultadosIndividuales.some(r => r.estado === 'REJECTED');
+
+        if (allCorrect) {
+          effectiveSubmissionStatus = 'ACCEPTED';
+        } else if (allAcceptedOrWarn) {
+          effectiveSubmissionStatus = 'ACCEPTED_WITH_ERRORS';
+        } else if (anyAcceptedOrWarn && anyRejected) {
+          effectiveSubmissionStatus = 'PARTIALLY_ACCEPTED';
+        } else if (anyRejected) {
+          effectiveSubmissionStatus = 'REJECTED';
+        }
+      }
+
+      if (effectiveSubmissionStatus === 'ACCEPTED') {
+        const effectiveCsv = parsed.csv || resultadosIndividuales[0]?.csv;
         const acceptedSub = transitionSubmissionStatus(sendingSubmission, 'ACCEPTED', {
           httpStatus,
-          csv: parsed.csv,
+          csv: effectiveCsv,
           estadoEnvioAeat: parsed.estadoEnvio,
           resultadosIndividuales,
           codigoAeat: '0',
@@ -1092,10 +1125,10 @@ export async function executeAeatSubmission(params: {
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
           descripcion: records.length > 1
-            ? `Lote de ${records.length} registros aceptado formalmente por AEAT. CSV: ${parsed.csv || 'N/A'}`
-            : `Factura ${fiscalRecord.factura.numeroFactura} aceptada formalmente por AEAT. CSV: ${parsed.csv || 'N/A'}`,
+            ? `Lote de ${records.length} registros aceptado formalmente por AEAT. CSV: ${effectiveCsv || 'N/A'}`
+            : `Factura ${fiscalRecord.factura.numeroFactura} aceptada formalmente por AEAT. CSV: ${effectiveCsv || 'N/A'}`,
           datos: {
-            csv: parsed.csv,
+            csv: effectiveCsv,
             tiempoRespuestaMs: durationMs,
             tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
             esBatch: records.length > 1,
@@ -1115,10 +1148,11 @@ export async function executeAeatSubmission(params: {
         };
       }
 
-      if (parsed.mappedSubmissionStatus === 'ACCEPTED_WITH_ERRORS') {
+      if (effectiveSubmissionStatus === 'ACCEPTED_WITH_ERRORS') {
+        const effectiveCsv = parsed.csv || resultadosIndividuales[0]?.csv;
         const warningSub = transitionSubmissionStatus(sendingSubmission, 'ACCEPTED_WITH_ERRORS', {
           httpStatus,
-          csv: parsed.csv,
+          csv: effectiveCsv,
           estadoEnvioAeat: parsed.estadoEnvio,
           resultadosIndividuales,
           codigoAeat: parsed.avisos[0]?.codigo || 'AVISO_AEAT',
@@ -1159,7 +1193,7 @@ export async function executeAeatSubmission(params: {
         };
       }
 
-      if (parsed.mappedSubmissionStatus === 'PARTIALLY_ACCEPTED') {
+      if (effectiveSubmissionStatus === 'PARTIALLY_ACCEPTED') {
         const acceptedCount = resultadosIndividuales.filter(
           r => r.estado === 'ACCEPTED' || r.estado === 'ACCEPTED_WITH_ERRORS'
         ).length;

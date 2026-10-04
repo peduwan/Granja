@@ -391,6 +391,16 @@ export class AeatResponseCorrelationError extends Error {
   }
 }
 
+export interface AeatCorrelationOptions {
+  readonly submissionStatus?: FiscalSubmissionStatus;
+  /**
+   * Conjunto de fiscalRecordIds que están siendo reconciliados tras un estado SENDING huérfano
+   * con resultado AEAT desconocido. Si la AEAT responde con código 3000 (RegistroDuplicado) y
+   * EstadoRegistroDuplicado = 'Correcta' o 'AceptadaConErrores', se reconcilian como aceptados.
+   */
+  readonly reconcilingRecordIds?: ReadonlySet<string> | ReadonlyArray<string>;
+}
+
 /**
  * Correlaciona cada FiscalRecord de un envío (1..1000) con su correspondiente <sfR:RespuestaLinea>
  * devuelta por la AEAT, produciendo el resultado individual determinista de cada registro.
@@ -402,7 +412,7 @@ export class AeatResponseCorrelationError extends Error {
 export function correlateAeatResponseWithRecords(
   firstArg: ReadonlyArray<FiscalRecord> | AeatParsedResponse | undefined,
   secondArg: AeatParsedResponse | ReadonlyArray<FiscalRecord> | undefined,
-  submissionStatusParam?: FiscalSubmissionStatus
+  submissionStatusOrOptions?: FiscalSubmissionStatus | AeatCorrelationOptions
 ): FiscalRecordSubmissionResult[] {
   const isFirstArray = Array.isArray(firstArg);
   const records: ReadonlyArray<FiscalRecord> = isFirstArray
@@ -411,8 +421,22 @@ export function correlateAeatResponseWithRecords(
   const parsedResponse: AeatParsedResponse | undefined = isFirstArray
     ? (secondArg as AeatParsedResponse | undefined)
     : (firstArg as AeatParsedResponse | undefined);
+
+  const correlationOptions: AeatCorrelationOptions =
+    typeof submissionStatusOrOptions === 'string'
+      ? { submissionStatus: submissionStatusOrOptions }
+      : (submissionStatusOrOptions || {});
+
   const submissionStatus: FiscalSubmissionStatus =
-    submissionStatusParam || parsedResponse?.mappedSubmissionStatus || 'FAILED_TECHNICAL';
+    correlationOptions.submissionStatus || parsedResponse?.mappedSubmissionStatus || 'FAILED_TECHNICAL';
+
+  const reconcilingSet: Set<string> = new Set(
+    Array.isArray(correlationOptions.reconcilingRecordIds)
+      ? correlationOptions.reconcilingRecordIds
+      : correlationOptions.reconcilingRecordIds instanceof Set
+        ? Array.from(correlationOptions.reconcilingRecordIds)
+        : []
+  );
 
   if (!records || records.length === 0) return [];
 
@@ -535,6 +559,27 @@ export function correlateAeatResponseWithRecords(
     } else if (matchedLine.estadoRegistro === 'AceptadoConErrores') {
       individualStatus = 'ACCEPTED_WITH_ERRORS';
       recordCsv = parsedResponse.csv;
+    } else if (
+      reconcilingSet.has(rec.id) &&
+      matchedLine.codigoErrorRegistro === '3000' &&
+      matchedLine.registroDuplicado
+    ) {
+      const dupEstado = String(matchedLine.registroDuplicado.estadoRegistroDuplicado || '').trim();
+      const dupIdPeticion = matchedLine.registroDuplicado.idPeticionRegistroDuplicado;
+      if (dupEstado === 'Correcta' || dupEstado === 'Correcto') {
+        individualStatus = 'ACCEPTED';
+        esReintentable = false;
+        requiereSubsanacion = false;
+        recordCsv = parsedResponse.csv || dupIdPeticion || 'CSV-RECONCILIADO-AEAT';
+      } else if (dupEstado === 'AceptadaConErrores' || dupEstado === 'AceptadoConErrores') {
+        individualStatus = 'ACCEPTED_WITH_ERRORS';
+        esReintentable = false;
+        requiereSubsanacion = false;
+        recordCsv = parsedResponse.csv || dupIdPeticion || 'CSV-RECONCILIADO-AEAT';
+      } else {
+        individualStatus = 'REJECTED';
+        requiereSubsanacion = true;
+      }
     } else {
       individualStatus = 'REJECTED';
       requiereSubsanacion = true;

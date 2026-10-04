@@ -30,6 +30,8 @@ import {
   partitionRecordsIntoBatches,
   resolveRecordOutboxState,
   RecordAuthoritativeOutboxState,
+  ResolveOutboxStateOptions,
+  transitionSubmissionStatus,
   submissionContainsRecord,
   MAX_RECORDS_PER_AEAT_SUBMISSION
 } from './submissionService';
@@ -72,6 +74,8 @@ export interface AuthoritativeSubmitRequest {
     readonly mockScenario?: MockScenario;
     readonly mockTiempoEsperaEnvio?: number;
     readonly mockLineOverrides?: Record<string, Partial<MockRecordLineSpec>>;
+    readonly staleSendingThresholdMs?: number;
+    readonly nowMs?: number;
   };
 }
 
@@ -85,6 +89,8 @@ export interface AuthoritativeSubmitResponse extends Omit<Partial<AeatTransportR
   readonly cantidadRegistros?: number;
   readonly cantidadLotes?: number;
   readonly authoritativePendingCountBeforeSend?: number;
+  readonly reconciledOrphanedSubmissionIds?: ReadonlyArray<string>;
+  readonly reconciledRecordIds?: ReadonlyArray<string>;
   readonly esBatch?: boolean;
   readonly isTechnicalError: boolean;
   readonly idempotentReplay?: boolean;
@@ -148,7 +154,8 @@ export function buildServerAuthoritativeFiscalConfig(record: FiscalRecord): Fisc
  */
 export async function collectEligibleOutboxRecordsForObligado(
   obligadoTributarioId: string,
-  maxRecords?: number
+  maxRecords?: number,
+  options?: ResolveOutboxStateOptions
 ): Promise<{
   eligibleRecords: FiscalRecord[];
   allEligibleRecords: FiscalRecord[];
@@ -214,7 +221,7 @@ export async function collectEligibleOutboxRecordsForObligado(
       subsForRec = Array.from(mergedMap.values());
     }
 
-    const state = resolveRecordOutboxState(rec.id, subsForRec);
+    const state = resolveRecordOutboxState(rec.id, subsForRec, options);
     statesByRecordId.set(rec.id, state);
 
     if (
@@ -222,7 +229,7 @@ export async function collectEligibleOutboxRecordsForObligado(
       !state.isAccepted &&
       !state.isSending &&
       !state.isRejected &&
-      state.totalAttempts < MAX_RETRY_ATTEMPTS
+      (state.totalAttempts < MAX_RETRY_ATTEMPTS || state.isOrphanedSending)
     ) {
       allEligibleRecords.push(rec);
     }
@@ -253,11 +260,12 @@ export async function collectEligibleOutboxRecordsForObligado(
 /**
  * Ejecuta de forma autoritativa y transaccional la remisión AEAT:
  * - Unitaria (1 registro)
- * - Lote explícito (1..1.000 registros o particionado automático si >1.000)
+ * - Lote explícito (1..1.000 registros o particionado automático si >1.000, reordenado según cadena fiscal)
  * - Drenado automático del Outbox (`batchFromOutbox: true`), dividiendo >1.000 pendientes en múltiples
  *   peticiones SOAP consecutivas de hasta 1.000 registros mediante `partitionRecordsIntoBatches`
  *   (ej. 2.501 pendientes -> SOAP #1: 1.000, SOAP #2: 1.000, SOAP #3: 501) y activando el disparador
  *   autoritativo de >=1.000 pendientes frente a <TiempoEsperaEnvio>.
+ * - Reconciliación controlada de envíos SENDING huérfanos tras caída de instancia o expiración de lease.
  */
 export async function executeAuthoritativeOutboxSubmission(
   request: AuthoritativeSubmitRequest
@@ -363,7 +371,7 @@ export async function executeAuthoritativeOutboxSubmission(
     }
   }
 
-  // 3. Si es explícito por IDs, recuperar y verificar criptográficamente cada FiscalRecord antes de bloquear
+  // 3. Si es explícito por IDs, recuperar, verificar criptográficamente y REORDENAR según la cadena fiscal antes de bloquear
   let recordsToSubmit: FiscalRecord[] = [];
   let targetObligado: string = obligadoTributarioId ? obligadoTributarioId.trim() : '';
 
@@ -414,6 +422,13 @@ export async function executeAuthoritativeOutboxSubmission(
         );
       }
     }
+
+    // Reordenar autoritativamente el batch explícito según la cadena criptográfica fiscal (orderRecordsByFiscalChain).
+    // Prohibido respetar un orden arbitrario (ej. [R3, R1, R2]) suministrado por el cliente.
+    if (recordsToSubmit.length > 1) {
+      recordsToSubmit = BackendFiscalCustody.orderRecordsByFiscalChain(recordsToSubmit);
+      targetRecordIds = recordsToSubmit.map(r => r.id);
+    }
   }
 
   // 4. ADQUISICIÓN ATÓMICA DEL CERROJO DISTRIBUIDO CON HEARTBEAT (Elimina carrera TOCTOU)
@@ -427,10 +442,16 @@ export async function executeAuthoritativeOutboxSubmission(
   }
 
   try {
+    const resolveOptions: ResolveOutboxStateOptions = {
+      nowMs: internalTestOptions?.nowMs,
+      staleSendingThresholdMs: internalTestOptions?.staleSendingThresholdMs
+    };
+
     // 5. Consultar el estado autoritativo completo del Outbox para este obligado DENTRO del cerrojo exclusivo
-    let authoritativeOutboxSnapshot = await collectEligibleOutboxRecordsForObligado(
+    const authoritativeOutboxSnapshot = await collectEligibleOutboxRecordsForObligado(
       targetObligado,
-      batchFromOutbox ? maxBatchSize : undefined
+      batchFromOutbox ? maxBatchSize : undefined,
+      resolveOptions
     );
 
     if (batchFromOutbox) {
@@ -471,7 +492,7 @@ export async function executeAuthoritativeOutboxSubmission(
       let state = authoritativeOutboxSnapshot.statesByRecordId.get(rec.id);
       if (!state || recordsToSubmit.length <= 25) {
         const subs = await BackendFiscalCustody.getFiscalSubmissionsForRecordAsync(rec.id);
-        state = resolveRecordOutboxState(rec.id, subs);
+        state = resolveRecordOutboxState(rec.id, subs, resolveOptions);
       }
       states.push(state);
       statesMap.set(rec.id, state);
@@ -516,7 +537,8 @@ export async function executeAuthoritativeOutboxSubmission(
       );
     }
 
-    // 6.c Autoridad adicional sobre estado SENDING (Opción C)
+    // 6.c Autoridad sobre estado SENDING legítimamente activo (dentro de su ventana de lease):
+    // Bloquea con 409 CONCURRENT_SUBMISSION_IN_FLIGHT.
     const sendingStates = states.filter(s => s.isSending);
     if (sendingStates.length > 0) {
       const firstSending = sendingStates[0];
@@ -526,6 +548,57 @@ export async function executeAuthoritativeOutboxSubmission(
         `Remisión en vuelo detectada: El registro '${firstSending.fiscalRecordId}' ya tiene un envío activo en estado 'SENDING' (${firstSending.activeSendingSubmission?.id}). Prohibido duplicar envíos concurrentes.`,
         { sendingRecordIds: sendingStates.map(s => s.fiscalRecordId) }
       );
+    }
+
+    // 6.c.2 Reconciliación explícita de envíos SENDING huérfanos (abandonados tras caída de Cloud Run o expiración de lease):
+    // No se hace un simple cambio ciego a RETRY_PENDING: se registra explícitamente la condición de
+    // "resultado AEAT desconocido" (ORPHANED_SENDING_UNKNOWN_OUTCOME) en la FiscalSubmission huérfana y en el
+    // libro de auditoría FiscalEvent, y se marcan los registros afectados como `reconcilingRecordIds` para que,
+    // si el SOAP anterior sí había llegado a AEAT y esta responde con código 3000 + <sfR:RegistroDuplicado>,
+    // se reconcilie formalmente el estado real en AEAT (Correcta / AceptadaConErrores) sin causar duplicidad ni bloqueo perpetuo.
+    const orphanedStates = states.filter(s => s.isOrphanedSending || s.resultadoAeatDesconocido);
+    const reconciledOrphanedSubmissionIds: string[] = [];
+    const reconciledRecordIds: string[] = orphanedStates.map(s => s.fiscalRecordId);
+
+    if (orphanedStates.length > 0) {
+      const uniqueOrphanSubs = new Map<string, FiscalSubmission>();
+      for (const st of orphanedStates) {
+        if (st.orphanedSendingSubmission && st.orphanedSendingSubmission.estado === 'SENDING') {
+          uniqueOrphanSubs.set(st.orphanedSendingSubmission.id, st.orphanedSendingSubmission);
+        }
+      }
+
+      for (const orphanSub of uniqueOrphanSubs.values()) {
+        const failedOrphan = transitionSubmissionStatus(orphanSub, 'FAILED_TECHNICAL', {
+          codigoAeat: 'ORPHANED_SENDING_UNKNOWN_OUTCOME',
+          descripcion: `Envío SENDING huérfano detectado tras expiración de lease distribuido (instancia previa caída o timeout sin cierre). Resultado en AEAT desconocido; se inicia reconciliación controlada.`
+        });
+        const retryPendingOrphan = transitionSubmissionStatus(failedOrphan, 'RETRY_PENDING', {
+          codigoAeat: 'ORPHANED_SENDING_UNKNOWN_OUTCOME',
+          descripcion: failedOrphan.descripcion,
+          proximoReintento: new Date().toISOString()
+        });
+        await BackendFiscalCustody.saveFiscalSubmission(retryPendingOrphan);
+
+        const orphanActor: FiscalActor = actor || { tipo: 'SYSTEM', nombre: 'OutboxOrphanReconciler' };
+        const orphanEvent: FiscalEvent = Object.freeze({
+          id: `fevt-orphan-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          obligadoTributarioId: targetObligado,
+          tipo: 'ENVIO_AEAT_ERROR_TECNICO',
+          fechaHora: new Date().toISOString(),
+          actor: orphanActor,
+          fiscalRecordId: orphanSub.fiscalRecordId,
+          numeroFactura: orphanSub.numeroFactura,
+          descripcion: `Reconciliación de FiscalSubmission SENDING huérfana (${orphanSub.id}): resultado AEAT desconocido tras expiración de lease. Se habilita consulta/reconciliación controlada ante AEAT (con soporte de RegistroDuplicado 3000).`,
+          datos: {
+            orphanedSubmissionId: orphanSub.id,
+            fiscalRecordIds: orphanSub.fiscalRecordIds || [orphanSub.fiscalRecordId],
+            resultadoAeatDesconocido: true
+          }
+        });
+        await BackendFiscalCustody.saveFiscalEvent(orphanEvent);
+        reconciledOrphanedSubmissionIds.push(orphanSub.id);
+      }
     }
 
     // 6.d Prohibir reenvío ciego de registros rechazados funcionalmente (REJECTED o Incorrecto dentro de PARTIALLY_ACCEPTED)
@@ -542,9 +615,9 @@ export async function executeAuthoritativeOutboxSubmission(
       );
     }
 
-    // 6.e Límite máximo de reintentos técnicos
+    // 6.e Límite máximo de reintentos técnicos (excluyendo reconciliaciones de SENDING huérfano con resultado desconocido)
     const exhaustedStates = states.filter(
-      s => s.totalAttempts >= MAX_RETRY_ATTEMPTS && s.status === 'FAILED_TECHNICAL'
+      s => s.totalAttempts >= MAX_RETRY_ATTEMPTS && s.status === 'FAILED_TECHNICAL' && !s.isOrphanedSending && !s.resultadoAeatDesconocido
     );
     if (exhaustedStates.length > 0) {
       const firstExh = exhaustedStates[0];
@@ -608,6 +681,9 @@ export async function executeAuthoritativeOutboxSubmission(
       const batchStates = batchRecords.map(r => statesMap.get(r.id)).filter(Boolean) as RecordAuthoritativeOutboxState[];
       const maxPreviousAttempts = batchStates.reduce((max, s) => Math.max(max, s.totalAttempts), 0);
       const nextAttemptNumber = maxPreviousAttempts + 1;
+      const batchReconcilingRecordIds = batchStates
+        .filter(s => s.isOrphanedSending || s.resultadoAeatDesconocido)
+        .map(s => s.fiscalRecordId);
 
       const serverSubmission = createFiscalSubmission(
         batchRecords.length === 1 && !isExplicitBatchRequest && batches.length === 1
@@ -626,6 +702,7 @@ export async function executeAuthoritativeOutboxSubmission(
           mockScenario: internalTestOptions?.mockScenario,
           mockTiempoEsperaEnvio: internalTestOptions?.mockTiempoEsperaEnvio,
           mockLineOverrides: internalTestOptions?.mockLineOverrides,
+          reconcilingRecordIds: batchReconcilingRecordIds,
           acquireLock: false,
           actor: actor || {
             tipo: 'SYSTEM',
@@ -671,6 +748,8 @@ export async function executeAuthoritativeOutboxSubmission(
       cantidadRegistros: allResultadosIndividuales.length,
       cantidadLotes: batchSubmissions.length,
       authoritativePendingCountBeforeSend: authoritativePendingCount,
+      reconciledOrphanedSubmissionIds: reconciledOrphanedSubmissionIds.length > 0 ? reconciledOrphanedSubmissionIds : undefined,
+      reconciledRecordIds: reconciledRecordIds.length > 0 ? reconciledRecordIds : undefined,
       esBatch: recordsToSubmit.length > 1 || batchSubmissions.length > 1,
       isTechnicalError: anyTechnicalError
     };
