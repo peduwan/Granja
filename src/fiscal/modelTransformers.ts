@@ -36,6 +36,20 @@ import { getAeatSoapEndpoint } from './aeatEndpoints';
  * - LocalStorage es únicamente una memoria caché local del navegador del cliente y NO constituye por sí mismo
  *   un mecanismo suficiente de seguridad o custodia legal fiscal.
  */
+export function resolveInvoiceTipoFactura(invoice: Factura): TipoFacturaAEAT {
+  const raw = invoice.tipoFactura;
+  if (invoice.esRectificativa) {
+    if (raw && ['R1', 'R2', 'R3', 'R4', 'R5'].includes(raw)) {
+      return raw;
+    }
+    if (raw === 'F2') {
+      return 'R5';
+    }
+    return 'R1';
+  }
+  return raw || 'F1';
+}
+
 export function createFiscalRecordFromInvoice(
   invoice: Factura,
   config: FiscalConfiguration,
@@ -68,7 +82,7 @@ export function createFiscalRecordFromInvoice(
       const tipoIva = (linea as any).tipoIva ?? invoice.totales?.porcentajeIva ?? 4.0;
       const subtotal = linea.subtotal ?? 0;
       const recargoPct = invoice.totales?.aplicaRecargo
-        ? ((linea as any).tipoRecargo ?? (tipoIva === 4 ? 0.5 : 1.4))
+        ? ((linea as any).tipoRecargo ?? invoice.totales?.porcentajeRecargo ?? (tipoIva === 4 ? 0.5 : 1.4))
         : 0;
       const cuotaIva = Number(((subtotal * tipoIva) / 100).toFixed(2));
       const cuotaRecargo = recargoPct > 0 ? Number(((subtotal * recargoPct) / 100).toFixed(2)) : 0;
@@ -79,13 +93,26 @@ export function createFiscalRecordFromInvoice(
       current.cuotaRecargo = Number((current.cuotaRecargo + cuotaRecargo).toFixed(2));
       desgloseMap.set(tipoIva, current);
     }
+
+    // Si hay un único tipo impositivo y coincide con invoice.totales, alinear con totales de cabecera para evitar diferencias de céntimo por redondeo línea a línea
+    if (desgloseMap.size === 1 && invoice.totales) {
+      const [singleTipo, singleVal] = Array.from(desgloseMap.entries())[0];
+      if (Math.abs(singleVal.base - (invoice.totales.baseImponible ?? 0)) <= 0.05) {
+        singleVal.base = invoice.totales.baseImponible ?? singleVal.base;
+        singleVal.cuotaIva = invoice.totales.cuotaIva ?? singleVal.cuotaIva;
+        singleVal.cuotaRecargo = invoice.totales.aplicaRecargo ? (invoice.totales.cuotaRecargo ?? singleVal.cuotaRecargo) : 0;
+        desgloseMap.set(singleTipo, singleVal);
+      }
+    }
   } else {
     // Si no hay líneas detalladas, usar los totales globales de la factura
     const base = invoice.totales?.baseImponible ?? 0;
     const tipo = invoice.totales?.porcentajeIva ?? 4.0;
     const cuota = invoice.totales?.cuotaIva ?? Number(((base * tipo) / 100).toFixed(2));
     const recargo = invoice.totales?.cuotaRecargo ?? 0;
-    const recargoPct = invoice.totales?.porcentajeRecargo ?? 0;
+    const recargoPct = invoice.totales?.aplicaRecargo
+      ? (invoice.totales?.porcentajeRecargo || (tipo === 4 ? 0.5 : 1.4))
+      : 0;
     desgloseMap.set(tipo, { base, cuotaIva: cuota, cuotaRecargo: recargo, recargoPct });
   }
 
@@ -94,10 +121,10 @@ export function createFiscalRecordFromInvoice(
     baseImponible: val.base,
     cuotaRepercutida: val.cuotaIva,
     tipoRecargoEquivalencia: val.recargoPct > 0 ? val.recargoPct : undefined,
-    cuotaRecargoEquivalencia: val.cuotaRecargo > 0 ? val.cuotaRecargo : undefined
+    cuotaRecargoEquivalencia: val.recargoPct > 0 || val.cuotaRecargo !== 0 ? val.cuotaRecargo : undefined
   }));
 
-  const tipoFactura: TipoFacturaAEAT = invoice.tipoFactura || (invoice.esRectificativa ? 'R1' : 'F1');
+  const tipoFactura: TipoFacturaAEAT = resolveInvoiceTipoFactura(invoice);
 
   // 2. Encadenamiento criptográfico con el registro anterior
   // FASE 1.3: El encadenamiento proviene ESTRICTAMENTE del dominio FiscalRecord / FiscalRecordRef
@@ -165,10 +192,17 @@ export function createFiscalRecordFromInvoice(
 
   const resolvedFacturasRectificadas =
     invoice.facturasRectificadas && invoice.facturasRectificadas.length > 0
-      ? invoice.facturasRectificadas
+      ? invoice.facturasRectificadas.map(fr => ({
+          ...(fr.idFactura ? { idFactura: fr.idFactura } : {}),
+          idEmisorFactura: fr.idEmisorFactura || config.nifEmisor,
+          numeroFactura: fr.numeroFactura,
+          fechaExpedicion: fr.fechaExpedicion
+        }))
       : invoice.facturaRectificadaNumero
         ? [
             {
+              ...(invoice.facturaRectificadaId ? { idFactura: invoice.facturaRectificadaId } : {}),
+              idEmisorFactura: config.nifEmisor,
               numeroFactura: invoice.facturaRectificadaNumero,
               fechaExpedicion: invoice.facturaRectificadaFecha || invoice.fecha
             }
@@ -215,12 +249,20 @@ export function createFiscalRecordFromInvoice(
       numeroFactura: invoice.numeroFactura,
       fechaExpedicion: invoice.fecha,
       horaExpedicion,
+      fechaOperacion: invoice.fechaOperacion,
       tipoFactura,
-      descripcionOperacion: invoice.descripcionOperacion || 'Venta y distribución de huevos de granja',
+      descripcionOperacion:
+        invoice.descripcionOperacion ||
+        (isRectificativa && invoice.motivoRectificativa
+          ? `Rectificación factura ${invoice.facturaRectificadaNumero || ''}: ${invoice.motivoRectificativa}`.trim()
+          : 'Venta y distribución de huevos de granja'),
+      refExterna: invoice.refExterna,
+      subsanacion: invoice.subsanacion,
+      rechazoPrevio: invoice.rechazoPrevio,
       facturaSimplificadaArt7273: isSimplifiedWithoutRecipient ? 'S' : 'N',
       facturaSinIdentifDestinatarioArt61d:
         isSimplifiedWithoutRecipient || (!invoice.clienteCif && !invoice.clienteIdOtro) ? 'S' : 'N',
-      macrodato: 'N',
+      macrodato: Math.abs(importeTotalCalculado) >= 100000000 ? 'S' : 'N',
       emitidaPorTerceroODestinatario: undefined,
       facturasSustituidas: invoice.facturasSustituidas
         ? invoice.facturasSustituidas.map(fs => ({ ...fs }))

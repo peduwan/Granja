@@ -10,9 +10,10 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase1.test.ts && tsx tests/fase2_1.test.ts && tsx tests/fase2_2.test.ts && tsx tests/fase2_3.test.ts && tsx tests/fase3_1.test.ts && tsx tests/fase3_1_1.test.ts && tsx tests/fase3_1_2.test.ts && tsx tests/fase3_1_3.test.ts && tsx tests/fase3_1_4.test.ts && tsx tests/auditoria_seguridad_exhaustiva.test.ts && tsx tests/fase3_1_5_cloud_resilience.test.ts && tsx tests/fase3_1_6_autoridad_y_resiliencia.test.ts && tsx tests/auditoria_forense_adversarial.test.ts && tsx tests/fase4_1.test.ts && tsx tests/fase4_2.test.ts",
+    "test": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase1.test.ts && tsx tests/fase2_1.test.ts && tsx tests/fase2_2.test.ts && tsx tests/fase2_3.test.ts && tsx tests/fase3_1.test.ts && tsx tests/fase3_1_1.test.ts && tsx tests/fase3_1_2.test.ts && tsx tests/fase3_1_3.test.ts && tsx tests/fase3_1_4.test.ts && tsx tests/auditoria_seguridad_exhaustiva.test.ts && tsx tests/fase3_1_5_cloud_resilience.test.ts && tsx tests/fase3_1_6_autoridad_y_resiliencia.test.ts && tsx tests/auditoria_forense_adversarial.test.ts && tsx tests/fase4_1.test.ts && tsx tests/fase4_2.test.ts && tsx tests/rectificativas_e2e.test.ts",
     "test:fase4_1": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase4_1.test.ts",
-    "test:fase4_2": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase4_2.test.ts"
+    "test:fase4_2": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase4_2.test.ts",
+    "test:rectificativas": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/rectificativas_e2e.test.ts"
   },
   "dependencies": {
     "@google-cloud/firestore": "^9.3.0",

@@ -33,7 +33,8 @@ import {
 import {
   createFiscalRecordFromInvoice,
   createFiscalRecordRef,
-  createFiscalAnulacionRecord
+  createFiscalAnulacionRecord,
+  resolveInvoiceTipoFactura
 } from './modelTransformers';
 import {
   calculateAltaHash,
@@ -241,7 +242,7 @@ async function executeEmitFiscalInvoice(
   // 3. Comprobación estricta de requisitos del registro anterior (Orden HAC/1177/2024)
   await validatePreviousRecordRequirement(fechaHoraHusoGenRegistro, obligadoTributarioId, previousRecord);
 
-  const tipoFactura = invoiceDraft.tipoFactura || (invoiceDraft.esRectificativa ? 'R1' : 'F1');
+  const tipoFactura = resolveInvoiceTipoFactura(invoiceDraft);
   const nifEmisor = fiscalConfig.nifEmisor;
   if (!nifEmisor || nifEmisor === 'ES_UNKNOWN' || nifEmisor.trim() === '') {
     throw new Error('emitFiscalInvoice: NIF del emisor es obligatorio y no puede ser ES_UNKNOWN ni estar vacío.');

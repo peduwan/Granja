@@ -271,11 +271,13 @@ export interface Factura {
   facturaRectificadaNumero?: string;
   facturaRectificadaFecha?: string;
   facturasRectificadas?: ReadonlyArray<{
+    readonly idFactura?: string;
     readonly idEmisorFactura?: string;
     readonly numeroFactura: string;
     readonly fechaExpedicion: string;
   }>;
   facturasSustituidas?: ReadonlyArray<{
+    readonly idFactura?: string;
     readonly idEmisorFactura?: string;
     readonly numeroFactura: string;
     readonly fechaExpedicion: string;
@@ -292,6 +294,10 @@ export interface Factura {
   motivoRectificativa?: string;
   codigoMotivoRectificativa?: '01' | '02' | '03' | '04' | '05';
   descripcionOperacion?: string;
+  fechaOperacion?: string;
+  refExterna?: string;
+  subsanacion?: 'S' | 'N';
+  rechazoPrevio?: 'S' | 'N' | 'X';
   clienteIdOtro?: {
     readonly codigoPais?: string;
     readonly idType: '02' | '03' | '04' | '05' | '06' | '07';

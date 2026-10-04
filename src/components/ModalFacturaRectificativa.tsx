@@ -1,368 +1,549 @@
-import React, { useState } from 'react';
-import { ShieldAlert, AlertTriangle, FileText, Check, ArrowRight, RotateCcw, X, Info } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
 import {
   Factura,
   LineaDocumentoVenta,
   TipoRectificativa,
   ConfiguracionEmpresa,
-  FiscalRecord,
   FiscalRecordRef,
   FiscalConfiguration
 } from '../types';
-import { padNumero, formatearFechaES, calcularTotales, getDefaultFiscalConfig } from '../utils/storage';
+import { AlertTriangle, X, Check, FileWarning, RotateCcw, Calculator, Plus, Trash2 } from 'lucide-react';
+import {
+  ModoRectificacionUI,
+  ClaveTipoFacturaRectificativaAEAT,
+  CodigoMotivoRectificativaUI,
+  MOTIVOS_RECTIFICATIVA_AEAT,
+  CLAVES_FACTURA_RECTIFICATIVA_AEAT,
+  inferDefaultClaveRectificativa,
+  computeInitialRectificativaLines,
+  calculateRectificativaTotales,
+  computeDefaultImporteRectificacion,
+  buildRectificativaFacturaFromUiState
+} from '../fiscal/rectificativaUiBuilder';
 import { emitFiscalInvoiceViaBackend } from '../fiscal/fiscalApiClient';
+import { createDefaultFiscalConfiguration } from '../fiscal/modelTransformers';
+import { padNumero } from '../utils/storage';
 
 interface ModalFacturaRectificativaProps {
-  facturaOriginal: Factura | null;
+  isOpen?: boolean;
   onClose: () => void;
-  onEmitirRectificativa: (nuevaRectificativa: Factura, reingresarStock: boolean, nuevoFiscalRecordRef: FiscalRecordRef) => Promise<void> | void;
-  contadorRectificativa: number;
-  config: ConfiguracionEmpresa;
-  ultimoHash?: string;
+  facturaOriginal: Factura | null;
+  facturas?: Factura[];
+  contadorRectificativa?: number;
+  config?: ConfiguracionEmpresa;
   fiscalRecordRefs?: FiscalRecordRef[];
   fiscalConfig?: FiscalConfiguration;
+  onEmitirRectificativa: (
+    nuevaFactura: Factura,
+    reingresarStock: boolean,
+    fiscalRecordRef: FiscalRecordRef
+  ) => Promise<void> | void;
 }
 
 export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps> = ({
-  facturaOriginal,
+  isOpen = true,
   onClose,
-  onEmitirRectificativa,
+  facturaOriginal,
+  facturas = [],
   contadorRectificativa,
   config,
-  ultimoHash,
   fiscalRecordRefs,
-  fiscalConfig
+  fiscalConfig,
+  onEmitirRectificativa
 }) => {
-  if (!facturaOriginal) return null;
+  const [modo, setModo] = useState<ModoRectificacionUI>('anulacion_total');
+  const [tipoRectificativa, setTipoRectificativa] = useState<TipoRectificativa>('por_diferencias');
+  const [claveTipoFactura, setClaveTipoFactura] = useState<ClaveTipoFacturaRectificativaAEAT>('R1');
+  const [codigoMotivo, setCodigoMotivo] = useState<CodigoMotivoRectificativaUI>('01');
+  const [motivoTexto, setMotivoTexto] = useState<string>('');
+  const [fecha, setFecha] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [reingresarStock, setReingresarStock] = useState<boolean>(false);
+  const [lineasRectificativa, setLineasRectificativa] = useState<LineaDocumentoVenta[]>([]);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
-  const anioActual = new Date().getFullYear();
-  const numeroSiguiente = `R-${anioActual}-${padNumero(contadorRectificativa, 4)}`;
-  const hoy = new Date().toISOString().split('T')[0];
+  useEffect(() => {
+    if (facturaOriginal) {
+      const initialModo: ModoRectificacionUI = 'anulacion_total';
+      const initialTipoRect: TipoRectificativa = 'por_diferencias';
+      const defaultClave = inferDefaultClaveRectificativa(facturaOriginal);
 
-  const [tipoRectificativa, setTipoRectificativa] = useState<TipoRectificativa>('por_sustitucion');
-  const [codigoMotivo, setCodigoMotivo] = useState<'01' | '02' | '03' | '04'>('01');
-  const [motivoTexto, setMotivoTexto] = useState('');
-  const [reingresarStock, setReingresarStock] = useState(true);
-  const [guardando, setGuardando] = useState(false);
-
-  // Líneas modificadas para 'por_diferencias' o importes negativos
-  const [lineasRectificadas, setLineasRectificadas] = useState<LineaDocumentoVenta[]>(() => {
-    // Por defecto para sustitución/anulación total, genera importes en negativo
-    return facturaOriginal.lineas.map(l => ({
-      ...l,
-      id: `rect_${l.id}_${Date.now()}`,
-      cantidadEstuches: -l.cantidadEstuches,
-      subtotal: Number((-l.subtotal).toFixed(2))
-    }));
-  });
-
-  const cambiarModo = (modo: TipoRectificativa) => {
-    setTipoRectificativa(modo);
-    if (modo === 'por_sustitucion') {
-      // Anulación / sustitución total: importes compensatorios negativos
-      setLineasRectificadas(
-        facturaOriginal.lineas.map(l => ({
-          ...l,
-          id: `rect_${l.id}_${Date.now()}`,
-          cantidadEstuches: -Math.abs(l.cantidadEstuches),
-          subtotal: Number((-Math.abs(l.subtotal)).toFixed(2))
-        }))
+      setModo(initialModo);
+      setTipoRectificativa(initialTipoRect);
+      setClaveTipoFactura(defaultClave);
+      setCodigoMotivo('01');
+      setMotivoTexto('Error en la emisión original de la factura');
+      setFecha(new Date().toISOString().split('T')[0]);
+      setValidationError(null);
+      setLineasRectificativa(
+        computeInitialRectificativaLines(facturaOriginal, initialModo, initialTipoRect)
       );
-    } else {
-      // Por diferencias: inicia en 0 para que el usuario indique la diferencia
-      setLineasRectificadas(
-        facturaOriginal.lineas.map(l => ({
-          ...l,
-          id: `rect_${l.id}_${Date.now()}`,
-          cantidadEstuches: 0,
-          subtotal: 0
-        }))
-      );
+    }
+  }, [facturaOriginal, isOpen]);
+
+  if (!isOpen || !facturaOriginal) return null;
+
+  const handleModoChange = (nuevoModo: ModoRectificacionUI) => {
+    setModo(nuevoModo);
+    setValidationError(null);
+    setLineasRectificativa(
+      computeInitialRectificativaLines(facturaOriginal, nuevoModo, tipoRectificativa)
+    );
+  };
+
+  const handleTipoRectificativaChange = (nuevoTipo: TipoRectificativa) => {
+    setTipoRectificativa(nuevoTipo);
+    setValidationError(null);
+    setLineasRectificativa(
+      computeInitialRectificativaLines(facturaOriginal, modo, nuevoTipo)
+    );
+  };
+
+  const handleCodigoMotivoChange = (nuevoCodigo: CodigoMotivoRectificativaUI) => {
+    setCodigoMotivo(nuevoCodigo);
+    setValidationError(null);
+    if (claveTipoFactura !== 'R5') {
+      const found = MOTIVOS_RECTIFICATIVA_AEAT.find(m => m.codigo === nuevoCodigo);
+      if (found) {
+        setClaveTipoFactura(found.claveFacturaSugerida);
+      }
     }
   };
 
-  const actualizarCantidadDiferencia = (idx: number, cantidad: number) => {
-    setLineasRectificadas(prev => {
-      const copy = [...prev];
-      const precio = copy[idx].precioUnitario;
-      copy[idx] = {
-        ...copy[idx],
-        cantidadEstuches: cantidad,
-        subtotal: Number((cantidad * precio).toFixed(2))
-      };
-      return copy;
-    });
+  const handleUpdateLinea = (index: number, field: keyof LineaDocumentoVenta, value: any) => {
+    setValidationError(null);
+    const nuevas = [...lineasRectificativa];
+    const linea = { ...nuevas[index], [field]: value };
+
+    if (field === 'cantidadEstuches' || field === 'precioUnitario') {
+      const cant = Number(linea.cantidadEstuches) || 0;
+      const precio = Number(linea.precioUnitario) || 0;
+      linea.subtotal = Number((cant * precio).toFixed(2));
+    }
+
+    nuevas[index] = linea;
+    setLineasRectificativa(nuevas);
   };
 
-  const totales = calcularTotales(lineasRectificadas, facturaOriginal.clienteRecargoEquivalencia);
+  const handleRemoveLinea = (index: number) => {
+    if (lineasRectificativa.length <= 1) {
+      setValidationError('La factura rectificativa debe tener al menos una línea.');
+      return;
+    }
+    setValidationError(null);
+    setLineasRectificativa(lineasRectificativa.filter((_, i) => i !== index));
+  };
+
+  const handleAddLineaLibre = () => {
+    setValidationError(null);
+    const defaultCant = tipoRectificativa === 'por_diferencias' ? -1 : 1;
+    setLineasRectificativa([
+      ...lineasRectificativa,
+      {
+        id: `rect-lin-${Date.now()}`,
+        loteEnvasadoId: 'N/A',
+        codigoLoteEnvasado: 'AJUSTE',
+        formatoId: 'FMT-AJUSTE',
+        nombreFormato: 'Ajuste / Rectificación sobre factura ' + facturaOriginal.numeroFactura,
+        cantidadEstuches: defaultCant,
+        precioUnitario: 0,
+        subtotal: 0,
+        fechaConsumoPreferente: fecha,
+        trazabilidadPuesta: []
+      }
+    ]);
+  };
+
+  const totales = calculateRectificativaTotales(facturaOriginal, lineasRectificativa);
+  const defaultImporteRectificacion = computeDefaultImporteRectificacion(facturaOriginal);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!motivoTexto.trim()) {
-      alert('Por favor, describe el motivo de la rectificación según exige la normativa.');
-      return;
-    }
+    setValidationError(null);
 
-    setGuardando(true);
     try {
-      const tipoDocAEAT = 'R1'; // R1: Rectificativa estándar por error / devolución
+      const anio = fecha.split('-')[0] || String(new Date().getFullYear());
+      const numeroFacturaOverride =
+        typeof contadorRectificativa === 'number'
+          ? `R-${anio}-${padNumero(contadorRectificativa, 4)}`
+          : undefined;
 
-      // FASE 1.3: Emisión fiscal centralizada. El registro anterior se resuelve unívocamente dentro de la sección serializada.
-      const invoiceDraft: Factura = {
-        id: `fac_rect_${Date.now()}`,
-        numeroFactura: numeroSiguiente,
-        fecha: hoy,
-        clienteId: facturaOriginal.clienteId,
-        clienteNombre: facturaOriginal.clienteNombre,
-        clienteCif: facturaOriginal.clienteCif,
-        clienteDireccion: facturaOriginal.clienteDireccion,
-        clienteRecargoEquivalencia: facturaOriginal.clienteRecargoEquivalencia,
-        albaranesAsociados: [],
-        lineas: lineasRectificadas,
-        totales,
-        estadoPago: 'pagada', // compensada
-        formaPago: facturaOriginal.formaPago,
-        esVentaDirecta: true,
-        notas: `Factura Rectificativa de la factura ${facturaOriginal.numeroFactura}. Motivo: ${motivoTexto}`,
-        creadoEn: hoy,
-        tipoFactura: tipoDocAEAT,
-        esRectificativa: true,
-        facturaRectificadaId: facturaOriginal.id,
-        facturaRectificadaNumero: facturaOriginal.numeroFactura,
-        facturaRectificadaFecha: facturaOriginal.fecha,
+      const effectiveFiscalConfig: FiscalConfiguration =
+        fiscalConfig ||
+        createDefaultFiscalConfiguration({
+          nif: config?.cifEmpresa || 'B12345678',
+          nombreRazon: config?.nombreEmpresa || 'Granja Avícola S.L.'
+        });
+
+      const borradorFactura = buildRectificativaFacturaFromUiState({
+        facturaOriginal,
+        existingInvoices: facturas,
+        numeroFacturaOverride,
+        fecha,
+        modo,
         tipoRectificativa,
-        motivoRectificativa: motivoTexto,
-        codigoMotivoRectificativa: codigoMotivo
-      };
-
-      const effectiveFiscalConfig: FiscalConfiguration = fiscalConfig || getDefaultFiscalConfig(config.cifEmpresa, config.nombreEmpresa);
-
-      const { invoice: nuevaFacturaRectificativa, fiscalRecordRef } = await emitFiscalInvoiceViaBackend({
-        invoiceDraft,
-        fiscalConfig: effectiveFiscalConfig
+        claveTipoFactura,
+        codigoMotivo,
+        motivoTexto,
+        lineasEditadas: lineasRectificativa,
+        nifEmisor: effectiveFiscalConfig.nifEmisor
       });
 
-      await onEmitirRectificativa(nuevaFacturaRectificativa, reingresarStock, fiscalRecordRef);
+      setIsSubmitting(true);
+      const emitted = await emitFiscalInvoiceViaBackend({
+        invoiceDraft: borradorFactura,
+        fiscalConfig: effectiveFiscalConfig
+      });
+      await onEmitirRectificativa(emitted.invoice, reingresarStock, emitted.fiscalRecordRef);
       onClose();
     } catch (err: any) {
-      console.error('Error emitiendo factura rectificativa:', err);
-      alert('Error al emitir factura rectificativa: ' + (err.message || 'Error desconocido'));
+      setValidationError(err?.message || 'Error al construir o emitir la factura rectificativa.');
     } finally {
-      setGuardando(false);
+      setIsSubmitting(false);
     }
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
-      <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-5 border border-stone-200 my-auto animate-in fade-in zoom-in-95">
-        <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-          <div className="flex items-center gap-2.5">
-            <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-800 flex items-center justify-center">
-              <ShieldAlert className="w-5 h-5 text-amber-700" />
+    <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-2xl border border-stone-200 max-w-4xl w-full overflow-hidden my-8">
+        {/* Header */}
+        <div className="bg-amber-950 text-white px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-amber-800/60 rounded-lg">
+              <FileWarning className="w-6 h-6 text-amber-300" />
             </div>
             <div>
-              <h3 className="font-bold text-stone-900 text-base">
-                Emitir Factura Rectificativa
-              </h3>
-              <p className="text-xs text-stone-500">
-                Normativa Ley Antifraude / Veri*Factu (RD 1007/2023)
+              <h2 className="text-lg font-bold tracking-tight">Emitir Factura Rectificativa (Veri*Factu)</h2>
+              <p className="text-xs text-amber-200/80">
+                Rectificando Factura Original: <span className="font-mono font-bold text-white">{facturaOriginal.numeroFactura}</span> ({facturaOriginal.fecha}) - Cliente: {facturaOriginal.clienteNombre}
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-stone-400 hover:text-stone-700 text-lg font-bold px-2 cursor-pointer"
-          >
-            ✕
+          <button onClick={onClose} className="text-amber-200 hover:text-white p-1 rounded-lg transition-colors">
+            <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Banner Legal */}
-        <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
-          <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-          <div>
-            <strong className="block font-semibold">Inmutabilidad de la Factura Original</strong>
-            <span>
-              La factura original <strong>{facturaOriginal.numeroFactura}</strong> quedará conservada de forma inmutable. Se expedirá un nuevo documento con serie rectificativa <strong>{numeroSiguiente}</strong> encadenado a la huella criptográfica SHA-256.
-            </span>
+        <form onSubmit={handleSubmit} className="p-6 space-y-6 max-h-[80vh] overflow-y-auto">
+          {/* Aviso Legal VeriFactu */}
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="text-xs text-amber-900 space-y-1">
+              <p className="font-bold">Normativa Antifraude (RD 1007/2023 - Orden HAC/1177/2024):</p>
+              <p>
+                Las facturas emitidas son inalterables y no pueden borrarse ni editarse. Este proceso generará un nuevo registro de facturación rectificativo (serie <strong>R-AAAA-XXXX</strong>) encadenado criptográficamente con huella SHA-256 al libro registro del obligado tributario.
+              </p>
+            </div>
           </div>
-        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4 text-xs">
-          {/* Datos Identificativos */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3.5 bg-stone-50 rounded-xl border border-stone-200">
+          {validationError && (
+            <div className="bg-red-50 border border-red-200 text-red-800 rounded-lg p-3 text-xs font-medium flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+              <span>{validationError}</span>
+            </div>
+          )}
+
+          {/* Selección de Modo */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <button
+              type="button"
+              onClick={() => handleModoChange('anulacion_total')}
+              className={`p-4 rounded-xl border-2 text-left transition-all flex items-start gap-3 ${
+                modo === 'anulacion_total'
+                  ? 'border-red-600 bg-red-50/50 ring-2 ring-red-600/20'
+                  : 'border-stone-200 hover:border-stone-300 bg-white'
+              }`}
+            >
+              <div className={`p-2 rounded-lg ${modo === 'anulacion_total' ? 'bg-red-600 text-white' : 'bg-stone-100 text-stone-600'}`}>
+                <RotateCcw className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="font-bold text-stone-900 text-sm">Anulación Económica Total</div>
+                <p className="text-xs text-stone-600 mt-1">
+                  {tipoRectificativa === 'por_diferencias'
+                    ? 'Genera una factura rectificativa por el 100% en signo negativo para dejar el saldo neto de la operación en 0,00 €.'
+                    : 'Sustituye la factura original por un nuevo importe definitivo de 0,00 €, informando la base y cuota rectificadas.'}
+                </p>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleModoChange('rectificacion_parcial')}
+              className={`p-4 rounded-xl border-2 text-left transition-all flex items-start gap-3 ${
+                modo === 'rectificacion_parcial'
+                  ? 'border-amber-600 bg-amber-50/50 ring-2 ring-amber-600/20'
+                  : 'border-stone-200 hover:border-stone-300 bg-white'
+              }`}
+            >
+              <div className={`p-2 rounded-lg ${modo === 'rectificacion_parcial' ? 'bg-amber-600 text-white' : 'bg-stone-100 text-stone-600'}`}>
+                <Calculator className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="font-bold text-stone-900 text-sm">Rectificación Parcial / Ajuste de Líneas</div>
+                <p className="text-xs text-stone-600 mt-1">
+                  Permite modificar unidades o precios unitarios para abonar devoluciones parciales, roturas o errores de tarifa.
+                </p>
+              </div>
+            </button>
+          </div>
+
+          {/* Parámetros Fiscales AEAT */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 bg-stone-50 p-4 rounded-lg border border-stone-200">
             <div>
-              <span className="text-[10px] uppercase font-bold text-stone-400 block">Factura Rectificada:</span>
-              <strong className="text-sm font-mono text-stone-900 block">{facturaOriginal.numeroFactura}</strong>
-              <span className="text-stone-500 block">Fecha: {formatearFechaES(facturaOriginal.fecha)}</span>
-              <span className="text-stone-600 block truncate">{facturaOriginal.clienteNombre}</span>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">Fecha de Expedición</label>
+              <input
+                type="date"
+                value={fecha}
+                onChange={(e) => setFecha(e.target.value)}
+                required
+                className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
+              />
             </div>
+
             <div>
-              <span className="text-[10px] uppercase font-bold text-stone-400 block">Nueva Serie / Número:</span>
-              <strong className="text-sm font-mono text-amber-900 block">{numeroSiguiente}</strong>
-              <span className="text-stone-500 block">Fecha de expedición: {formatearFechaES(hoy)}</span>
-              <span className="text-[11px] text-stone-600 block">Hash encadenado a última factura</span>
-            </div>
-          </div>
-
-          {/* Método de Rectificación */}
-          <div className="space-y-1.5">
-            <label className="font-bold text-stone-700 block">Método de Rectificación Legal:</label>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => cambiarModo('por_sustitucion')}
-                className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                  tipoRectificativa === 'por_sustitucion'
-                    ? 'border-amber-500 bg-amber-50/80 ring-1 ring-amber-500'
-                    : 'border-stone-200 bg-white hover:bg-stone-50'
-                }`}
-              >
-                <strong className="block text-stone-900 text-xs">Por Sustitución / Anulación Total</strong>
-                <span className="text-[11px] text-stone-500 block mt-0.5">
-                  Anula completamente el importe de la factura original para cancelar la operación.
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => cambiarModo('por_diferencias')}
-                className={`p-3 rounded-xl border text-left cursor-pointer transition-all ${
-                  tipoRectificativa === 'por_diferencias'
-                    ? 'border-amber-500 bg-amber-50/80 ring-1 ring-amber-500'
-                    : 'border-stone-200 bg-white hover:bg-stone-50'
-                }`}
-              >
-                <strong className="block text-stone-900 text-xs">Por Diferencias</strong>
-                <span className="text-[11px] text-stone-500 block mt-0.5">
-                  Corrige sólo la diferencia en unidades, precios o descuentos aplicados.
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Motivo según AEAT */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="font-bold text-stone-700 block">Causa de Rectificación (Clave AEAT):</label>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">Clave TipoFactura AEAT</label>
               <select
-                value={codigoMotivo}
-                onChange={e => setCodigoMotivo(e.target.value as any)}
-                className="w-full bg-white border border-stone-200 rounded-xl px-3 py-2 text-stone-800 text-xs font-medium focus:ring-1 focus:ring-amber-500"
+                value={claveTipoFactura}
+                onChange={(e) => setClaveTipoFactura(e.target.value as ClaveTipoFacturaRectificativaAEAT)}
+                className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
               >
-                <option value="01">01 - Error fundado en derecho / Art. 80.Uno LIVA</option>
-                <option value="02">02 - Devolución de mercancías o envases</option>
-                <option value="03">03 - Descuentos o bonificaciones posteriores</option>
-                <option value="04">04 - Resto de causas / Anulación por emisión errónea</option>
+                {CLAVES_FACTURA_RECTIFICATIVA_AEAT.map((c) => (
+                  <option key={c.clave} value={c.clave}>
+                    {c.label}
+                  </option>
+                ))}
               </select>
             </div>
 
-            <div className="space-y-1">
-              <label className="font-bold text-stone-700 block">Devolución a Stock de Almacén:</label>
-              <label className="flex items-center gap-2 p-2 bg-stone-50 border border-stone-200 rounded-xl cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={reingresarStock}
-                  onChange={e => setReingresarStock(e.target.checked)}
-                  className="rounded border-stone-300 text-amber-600 focus:ring-amber-500"
-                />
-                <span className="text-stone-700 text-xs">
-                  Reincorporar estuches rectificados al inventario disponible
-                </span>
-              </label>
+            <div>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">Mecanismo (TipoRectificativa)</label>
+              <select
+                value={tipoRectificativa}
+                onChange={(e) => handleTipoRectificativaChange(e.target.value as TipoRectificativa)}
+                className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
+              >
+                <option value="por_diferencias">Por Diferencias (Clave AEAT &apos;I&apos;)</option>
+                <option value="por_sustitucion">Por Sustitución (Clave AEAT &apos;S&apos;)</option>
+              </select>
             </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">Causa Reglamentaria (Art. 80 LIVA)</label>
+              <select
+                value={codigoMotivo}
+                onChange={(e) => handleCodigoMotivoChange(e.target.value as CodigoMotivoRectificativaUI)}
+                className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
+              >
+                {MOTIVOS_RECTIFICATIVA_AEAT.map((m) => (
+                  <option key={m.codigo} value={m.codigo}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="md:col-span-4">
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
+                Descripción detallada del motivo de rectificación (Obligatorio en XML y PDF)
+              </label>
+              <input
+                type="text"
+                value={motivoTexto}
+                onChange={(e) => setMotivoTexto(e.target.value)}
+                placeholder="Ej: Error en precio unitario aplicado en docenas XL o devolución de 2 cajas rotas..."
+                required
+                className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
+              />
+            </div>
+
+            {tipoRectificativa === 'por_sustitucion' && (
+              <div className="md:col-span-4 bg-amber-100/60 border border-amber-300 rounded-lg p-3 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="font-bold">Desglose de ImporteRectificacion (Obligatorio en Clave &apos;S&apos;):</span>{' '}
+                  Se informará en el XML AEAT la base y cuota originales sustituidas de la factura {facturaOriginal.numeroFactura}.
+                </div>
+                <div className="font-mono font-semibold flex items-center gap-4">
+                  <span>BaseRectificada: {defaultImporteRectificacion.baseRectificada.toFixed(2)} €</span>
+                  <span>CuotaRectificada: {defaultImporteRectificacion.cuotaRectificada.toFixed(2)} €</span>
+                  {defaultImporteRectificacion.cuotaRecargoRectificado !== undefined && (
+                    <span>CuotaRecargoRectificado: {defaultImporteRectificacion.cuotaRecargoRectificado.toFixed(2)} €</span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Explicación Detallada Obligatoria */}
-          <div className="space-y-1">
-            <label className="font-bold text-stone-700 block">
-              Descripción del Motivo de la Rectificación <span className="text-red-500">*</span>:
-            </label>
-            <input
-              type="text"
-              required
-              value={motivoTexto}
-              onChange={e => setMotivoTexto(e.target.value)}
-              placeholder="Ej: Anulación por error en los datos de facturación del cliente..."
-              className="w-full bg-white border border-stone-200 rounded-xl px-3 py-2 text-stone-800 text-xs focus:ring-1 focus:ring-amber-500"
-            />
-          </div>
+          {/* Líneas de la Rectificativa */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-bold text-stone-800">
+                Líneas del Documento Rectificativo{' '}
+                {modo === 'anulacion_total'
+                  ? tipoRectificativa === 'por_diferencias'
+                    ? '(Abono 100% por diferencias - Bloqueado)'
+                    : '(Sustitución a 0,00 € - Bloqueado)'
+                  : tipoRectificativa === 'por_diferencias'
+                  ? '(Indique las diferencias en negativo o positivo)'
+                  : '(Indique los nuevos importes finales que sustituyen a la factura original)'}
+              </h3>
+              {modo === 'rectificacion_parcial' && (
+                <button
+                  type="button"
+                  onClick={handleAddLineaLibre}
+                  className="text-xs flex items-center gap-1 bg-stone-100 hover:bg-stone-200 text-stone-700 px-2.5 py-1.5 rounded-lg font-medium transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Añadir línea de ajuste
+                </button>
+              )}
+            </div>
 
-          {/* Partidas / Importes Rectificados */}
-          <div className="space-y-1.5">
-            <span className="font-bold text-stone-700 block">Desglose de Partidas a Rectificar:</span>
-            <div className="border border-stone-200 rounded-xl overflow-hidden divide-y divide-stone-100 max-h-48 overflow-y-auto">
-              {lineasRectificadas.map((linea, idx) => (
-                <div key={linea.id} className="p-2.5 flex items-center justify-between gap-3 text-xs bg-stone-50/50">
-                  <div className="min-w-0">
-                    <strong className="text-stone-900 block truncate">{linea.nombreFormato}</strong>
-                    <span className="text-[11px] text-stone-500 font-mono">
-                      Lote Puesta: {linea.codigoLotePuesta || 'N/A'} • {linea.precioUnitario.toFixed(2)} €/est.
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-3 shrink-0">
-                    {tipoRectificativa === 'por_diferencias' ? (
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-stone-500">Dif. Estuches:</span>
+            <div className="border border-stone-200 rounded-lg overflow-hidden">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-stone-100 border-b border-stone-200 text-[11px] font-bold text-stone-600 uppercase">
+                    <th className="py-2.5 px-3">Concepto / Descripción</th>
+                    <th className="py-2.5 px-3 w-24">Cat.</th>
+                    <th className="py-2.5 px-3 w-32 text-right">Cantidad</th>
+                    <th className="py-2.5 px-3 w-32 text-right">Precio Unit. (€)</th>
+                    <th className="py-2.5 px-3 w-32 text-right">Subtotal (€)</th>
+                    {modo === 'rectificacion_parcial' && <th className="py-2.5 px-2 w-10"></th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-200 text-sm">
+                  {lineasRectificativa.map((linea, idx) => (
+                    <tr key={linea.id} className="hover:bg-stone-50/80">
+                      <td className="p-2">
+                        <input
+                          type="text"
+                          value={linea.nombreFormato}
+                          disabled={modo === 'anulacion_total'}
+                          onChange={(e) => handleUpdateLinea(idx, 'nombreFormato', e.target.value)}
+                          className="w-full px-2 py-1 border border-stone-200 rounded text-xs disabled:bg-stone-100"
+                        />
+                      </td>
+                      <td className="p-2 text-xs font-medium text-stone-600">
+                        {linea.codigoLoteEnvasado}
+                      </td>
+                      <td className="p-2">
                         <input
                           type="number"
-                          step="1"
+                          step="any"
                           value={linea.cantidadEstuches}
-                          onChange={e => actualizarCantidadDiferencia(idx, parseInt(e.target.value) || 0)}
-                          className="w-18 bg-white border border-stone-300 rounded px-1.5 py-1 text-right font-mono font-bold"
+                          disabled={modo === 'anulacion_total'}
+                          onChange={(e) => handleUpdateLinea(idx, 'cantidadEstuches', parseFloat(e.target.value))}
+                          className={`w-full px-2 py-1 border border-stone-200 rounded text-xs text-right font-mono font-bold disabled:bg-stone-100 ${
+                            linea.cantidadEstuches < 0 ? 'text-red-600' : 'text-stone-800'
+                          }`}
                         />
-                      </div>
-                    ) : (
-                      <span className="font-bold font-mono text-stone-700 bg-stone-100 px-2 py-0.5 rounded">
-                        {linea.cantidadEstuches} est.
-                      </span>
-                    )}
-
-                    <span className={`font-mono font-black text-xs px-2 py-1 rounded ${
-                      linea.subtotal < 0 ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-stone-100 text-stone-800'
-                    }`}>
-                      {linea.subtotal.toFixed(2)} €
-                    </span>
-                  </div>
-                </div>
-              ))}
+                      </td>
+                      <td className="p-2">
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={linea.precioUnitario}
+                          disabled={modo === 'anulacion_total'}
+                          onChange={(e) => handleUpdateLinea(idx, 'precioUnitario', parseFloat(e.target.value))}
+                          className="w-full px-2 py-1 border border-stone-200 rounded text-xs text-right font-mono disabled:bg-stone-100"
+                        />
+                      </td>
+                      <td className={`p-2 text-right font-mono font-bold text-xs ${linea.subtotal < 0 ? 'text-red-600' : 'text-stone-900'}`}>
+                        {linea.subtotal.toFixed(2)} €
+                      </td>
+                      {modo === 'rectificacion_parcial' && (
+                        <td className="p-2 text-center">
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveLinea(idx)}
+                            className="text-stone-400 hover:text-red-600 p-1"
+                            title="Eliminar línea"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
 
-          {/* Totales Rectificativa */}
-          <div className="flex justify-between items-center bg-stone-100 p-3 rounded-xl border border-stone-200">
-            <span className="text-xs text-stone-600 font-semibold">Total Documento Rectificativo:</span>
-            <span className={`text-base font-black font-mono ${
-              totales.totalDocumento < 0 ? 'text-red-700' : 'text-stone-900'
-            }`}>
-              {totales.totalDocumento.toFixed(2)} €
-            </span>
+          {/* Comparativa de Totales */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-stone-900 text-white p-4 rounded-xl">
+            <div className="space-y-1 border-r border-stone-700 pr-4">
+              <div className="text-xs text-stone-400 uppercase font-semibold">Factura Original ({facturaOriginal.numeroFactura})</div>
+              <div className="flex justify-between text-xs text-stone-300">
+                <span>Base Imponible Original:</span>
+                <span className="font-mono">{facturaOriginal.totales.baseImponible.toFixed(2)} €</span>
+              </div>
+              <div className="flex justify-between text-xs text-stone-300">
+                <span>IVA ({facturaOriginal.totales.porcentajeIva}%):</span>
+                <span className="font-mono">{facturaOriginal.totales.cuotaIva.toFixed(2)} €</span>
+              </div>
+              {facturaOriginal.totales.aplicaRecargo && (
+                <div className="flex justify-between text-xs text-stone-300">
+                  <span>Recargo Eq. ({facturaOriginal.totales.porcentajeRecargo}%):</span>
+                  <span className="font-mono">{facturaOriginal.totales.cuotaRecargo.toFixed(2)} €</span>
+                </div>
+              )}
+              <div className="flex justify-between text-sm font-bold text-white pt-1 border-t border-stone-700">
+                <span>Total Original:</span>
+                <span className="font-mono">{facturaOriginal.totales.totalDocumento.toFixed(2)} €</span>
+              </div>
+            </div>
+
+            <div className="space-y-1 pl-2">
+              <div className="text-xs text-amber-400 uppercase font-semibold">
+                Nueva Factura Rectificativa ({claveTipoFactura} · {tipoRectificativa === 'por_diferencias' ? 'Diferencias [I]' : 'Sustitución [S]'})
+              </div>
+              <div className="flex justify-between text-xs text-stone-300">
+                <span>Base Imponible Rectificativa:</span>
+                <span className="font-mono">{totales.baseImponible.toFixed(2)} €</span>
+              </div>
+              <div className="flex justify-between text-xs text-stone-300">
+                <span>Cuota IVA ({totales.porcentajeIva}%):</span>
+                <span className="font-mono">{totales.cuotaIva.toFixed(2)} €</span>
+              </div>
+              {totales.aplicaRecargo && (
+                <div className="flex justify-between text-xs text-stone-300">
+                  <span>Cuota Recargo ({totales.porcentajeRecargo}%):</span>
+                  <span className="font-mono">{totales.cuotaRecargo.toFixed(2)} €</span>
+                </div>
+              )}
+              <div className="flex justify-between text-base font-bold text-amber-300 pt-1 border-t border-stone-700">
+                <span>Total Documento Rectificativo:</span>
+                <span className="font-mono">{totales.totalDocumento.toFixed(2)} €</span>
+              </div>
+              <div className="flex justify-between text-xs text-emerald-400 pt-1">
+                <span>Saldo Neto Resultante de la Operación:</span>
+                <span className="font-mono font-bold">
+                  {tipoRectificativa === 'por_diferencias'
+                    ? (facturaOriginal.totales.totalDocumento + totales.totalDocumento).toFixed(2)
+                    : totales.totalDocumento.toFixed(2)}{' '}
+                  €
+                </span>
+              </div>
+            </div>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2 border-t border-stone-200">
+          {/* Botones de Acción */}
+          <div className="flex items-center justify-end gap-3 pt-2 border-t border-stone-200">
             <button
               type="button"
               onClick={onClose}
-              disabled={guardando}
-              className="px-4 py-2 text-xs font-semibold text-stone-600 hover:bg-stone-100 rounded-xl cursor-pointer"
+              disabled={isSubmitting}
+              className="px-4 py-2 rounded-lg border border-stone-300 text-stone-700 hover:bg-stone-100 text-sm font-medium transition-colors"
             >
               Cancelar
             </button>
             <button
               type="submit"
-              disabled={guardando}
-              className="px-5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs cursor-pointer flex items-center gap-1.5"
+              disabled={isSubmitting}
+              className="px-5 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
             >
-              {guardando ? (
-                <span>Sellando Criptográficamente...</span>
-              ) : (
-                <>
-                  <ShieldAlert className="w-4 h-4" />
-                  <span>Emitir Factura Rectificativa</span>
-                </>
-              )}
+              <Check className="w-4 h-4" />
+              {isSubmitting ? 'Sellando y Emitiendo...' : 'Firmar y Emitir Factura Rectificativa'}
             </button>
           </div>
         </form>
