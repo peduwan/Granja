@@ -371,6 +371,20 @@ export interface EmitFiscalAnulacionParams {
     numeroFactura: string;
     fechaExpedicion: string; // YYYY-MM-DD o DD-MM-YYYY
     motivoAnulacion: string;
+    refExterna?: string;
+    sinRegistroPrevio?: 'S' | 'N';
+    rechazoPrevio?: 'S' | 'N';
+    generadoPor?: 'E' | 'D' | 'T';
+    generador?: {
+      nombreRazon: string;
+      nif?: string;
+      codigoPais?: string;
+      idOtro?: {
+        codigoPais?: string;
+        idType: '02' | '03' | '04' | '05' | '06' | '07';
+        id: string;
+      };
+    };
   };
   existingRecordRefs?: FiscalRecordRef[];
   previousRecordRef?: FiscalRecordRef | FiscalRecord | null;

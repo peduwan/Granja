@@ -270,9 +270,33 @@ export interface Factura {
   facturaRectificadaId?: string;
   facturaRectificadaNumero?: string;
   facturaRectificadaFecha?: string;
-  tipoRectificativa?: TipoRectificativa;
+  facturasRectificadas?: ReadonlyArray<{
+    readonly idEmisorFactura?: string;
+    readonly numeroFactura: string;
+    readonly fechaExpedicion: string;
+  }>;
+  facturasSustituidas?: ReadonlyArray<{
+    readonly idEmisorFactura?: string;
+    readonly numeroFactura: string;
+    readonly fechaExpedicion: string;
+  }>;
+  tipoRectificativa?: TipoRectificativa | 'S' | 'I';
+  importeRectificacion?: {
+    readonly baseRectificada: number;
+    readonly cuotaRectificada: number;
+    readonly cuotaRecargoRectificado?: number;
+  };
+  baseRectificada?: number;
+  cuotaRectificada?: number;
+  cuotaRecargoRectificado?: number;
   motivoRectificativa?: string;
-  codigoMotivoRectificativa?: '01' | '02' | '03' | '04';
+  codigoMotivoRectificativa?: '01' | '02' | '03' | '04' | '05';
+  descripcionOperacion?: string;
+  clienteIdOtro?: {
+    readonly codigoPais?: string;
+    readonly idType: '02' | '03' | '04' | '05' | '06' | '07';
+    readonly id: string;
+  };
 
   // --- Estado de la Factura Original si ha sido rectificada ---
   rectificadaPorFacturaId?: string;

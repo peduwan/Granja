@@ -91,6 +91,11 @@ function createSampleFiscalRecord(overrides?: any): FiscalRecord {
       nif: 'B12345678',
       nombreRazon: 'Granja Avícola El Valle S.L.'
     },
+    destinatario: {
+      nif: 'B99887766',
+      nombreRazon: 'Supermercados Delicias S.A.',
+      codigoPais: 'ES'
+    },
     factura: {
       numeroFactura: 'FAC-2026/0123',
       fechaExpedicion: '2026-10-15',

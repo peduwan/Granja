@@ -12,16 +12,30 @@
 
 export type FiscalMode = 'VERI_FACTU' | 'NO_VERI_FACTU';
 export type TipoRegistroFiscal = 'alta' | 'anulacion';
-export type TipoFacturaAEAT = 'F1' | 'F2' | 'R1' | 'R2' | 'R3' | 'R4';
+export type TipoFacturaAEAT = 'F1' | 'F2' | 'F3' | 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
 export type TipoRectificativa = 'por_diferencias' | 'por_sustitucion' | 'sustitucion' | 'diferencias';
+
+export interface PersonaFisicaJuridicaIdOtroFiscal {
+  readonly codigoPais?: string;
+  readonly idType: '02' | '03' | '04' | '05' | '06' | '07';
+  readonly id: string;
+}
+
+export interface PersonaFisicaJuridicaFiscal {
+  readonly nombreRazon: string;
+  readonly nif?: string;
+  readonly codigoPais?: string;
+  readonly idOtro?: PersonaFisicaJuridicaIdOtroFiscal;
+}
 
 /**
  * Desglose impositivo canónico según el esquema oficial AEAT (Orden HAC/1177/2024)
  */
 export interface DesgloseIvaFiscal {
-  readonly tipoImpositivo: number; // Ej: 4, 10, 21
+  readonly tipoImpositivo?: number; // Ej: 4, 10, 21 (opcional en exentas / no sujetas)
   readonly baseImponible: number;
-  readonly cuotaRepercutida: number;
+  readonly baseImponibleACoste?: number;
+  readonly cuotaRepercutida?: number;
   readonly tipoRecargoEquivalencia?: number; // Ej: 0.5, 1.4, 5.2
   readonly cuotaRecargoEquivalencia?: number;
   readonly impuesto?: '01' | '02' | '03' | '05'; // '01': IVA (default)
@@ -35,7 +49,8 @@ export interface DesgloseIvaFiscal {
  */
 export interface SistemaInformaticoFiscal {
   readonly nombreRazon: string; // Desarrollador / Fabricante
-  readonly nif: string; // NIF del desarrollador
+  readonly nif?: string; // NIF del desarrollador
+  readonly idOtro?: PersonaFisicaJuridicaIdOtroFiscal; // Identificación alternativa extranjera del desarrollador
   readonly nombreSistemaInformatico: string;
   readonly idSistemaInformatico: string; // Código asignado (AEAT max 2 caracteres, ej: '01')
   readonly version: string;
@@ -70,30 +85,48 @@ export interface FiscalRecord {
     readonly nombreRazon: string;
   };
 
-  // Destinatario fiscal (opcional en simplificadas / F2)
+  // Tercero que expide la factura y/o genera el registro de alta (opcional en XSD)
+  readonly tercero?: PersonaFisicaJuridicaFiscal;
+
+  // Destinatario fiscal (obligatorio en F1, F3, R1, R2, R3, R4; prohibido en F2 y R5)
   readonly destinatario?: {
     readonly nif?: string;
     readonly nombreRazon?: string;
     readonly codigoPais?: string;
     readonly idOtro?: {
-      readonly codigoPais: string;
+      readonly codigoPais?: string;
       readonly idType: '02' | '03' | '04' | '05' | '06' | '07';
       readonly id: string;
     };
   };
 
+  // Múltiples destinatarios (hasta 1000 según XSD IDDestinatario maxOccurs="1000")
+  readonly destinatarios?: ReadonlyArray<PersonaFisicaJuridicaFiscal>;
+
   // Datos fiscales canónicos de la factura
   readonly factura: {
     readonly numeroFactura: string;
     readonly serieFactura?: string;
-    readonly fechaExpedicion: string; // YYYY-MM-DD
+    readonly fechaExpedicion: string; // YYYY-MM-DD o DD-MM-YYYY
+    readonly fechaOperacion?: string; // YYYY-MM-DD o DD-MM-YYYY (opcional en XSD)
     readonly horaExpedicion: string; // HH:mm:ss
     readonly tipoFactura: TipoFacturaAEAT;
     readonly descripcionOperacion: string;
+    readonly refExterna?: string; // TextMax60Type
+    readonly subsanacion?: 'S' | 'N';
+    readonly rechazoPrevio?: 'N' | 'S' | 'X';
     readonly facturaSimplificadaArt7273: 'S' | 'N';
     readonly facturaSinIdentifDestinatarioArt61d: 'S' | 'N';
     readonly macrodato: 'S' | 'N';
     readonly emitidaPorTerceroODestinatario?: 'T' | 'D';
+    readonly cupon?: 'S' | 'N';
+    readonly numRegistroAcuerdoFacturacion?: string; // TextMax15Type
+    readonly idAcuerdoSistemaInformatico?: string; // TextMax16Type
+    readonly facturasSustituidas?: ReadonlyArray<{
+      readonly idEmisorFactura?: string;
+      readonly numeroFactura: string;
+      readonly fechaExpedicion: string;
+    }>;
   };
 
   // Desglose impositivo canónico
@@ -105,26 +138,33 @@ export interface FiscalRecord {
     readonly importeTotal: number;
   };
 
-  // Rectificativas
+  // Rectificativas (R1, R2, R3, R4, R5)
   readonly datosRectificativa?: {
-    readonly tipoRectificativa: 'S' | 'I'; // S: sustitución, I: diferencias
+    readonly tipoRectificativa: 'S' | 'I'; // S: sustitución, I: diferencias (incremental)
     readonly facturasRectificadas: ReadonlyArray<{
+      readonly idEmisorFactura?: string;
       readonly numeroFactura: string;
       readonly fechaExpedicion: string;
     }>;
     readonly importeRectificacion?: {
       readonly baseRectificada: number;
       readonly cuotaRectificada: number;
+      readonly cuotaRecargoRectificado?: number;
     };
     readonly motivoRectificacion?: string;
-    readonly codigoMotivoRectificacion?: '01' | '02' | '03' | '04';
+    readonly codigoMotivoRectificacion?: '01' | '02' | '03' | '04' | '05';
   };
 
-  // Anulaciones
+  // Anulaciones (RegistroAnulacion)
   readonly datosAnulacion?: {
     readonly motivoAnulacion: string;
     readonly numeroFacturaAnulada: string;
     readonly fechaExpedicionFacturaAnulada: string;
+    readonly refExterna?: string;
+    readonly sinRegistroPrevio?: 'S' | 'N';
+    readonly rechazoPrevio?: 'S' | 'N';
+    readonly generadoPor?: 'E' | 'D' | 'T';
+    readonly generador?: PersonaFisicaJuridicaFiscal;
   };
 
   // Encadenamiento criptográfico con el registro anterior (ÚNICA FUENTE DE ENCADENAMIENTO)

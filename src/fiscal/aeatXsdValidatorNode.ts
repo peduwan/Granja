@@ -1,75 +1,254 @@
 /**
- * VALIDADOR NORMATIVO XSD PARA ENTORNO NODE.JS / CLI
+ * VALIDADOR NORMATIVO XSD REAL PARA ENTORNO NODE.JS / BACKEND (FASE 4.1)
  *
- * Utiliza libxml2 (xmllint) para validar el XML contra los esquemas XSD oficiales
+ * Utiliza libxml2 real (libxml2-wasm / xmllint) para validar el XML contra los esquemas XSD oficiales
  * de la Agencia Estatal de Administración Tributaria (AEAT):
- * - SuministroLR.xsd
- * - SuministroInformacion.xsd
- * - xmldsig-core-schema.xsd
+ * - docs/fiscal/xsd/SuministroLR.xsd
+ * - docs/fiscal/xsd/SuministroInformacion.xsd
+ * - docs/fiscal/xsd/xmldsig-core-schema.xsd
  *
- * Este archivo está aislado exclusivamente para tests y backend Node.
- * NO debe ser importado en código cliente del navegador.
+ * POLÍTICA FAIL-CLOSED ESTRICTA:
+ * - Prohibido cualquier fallback silencioso a validadores sintácticos en memoria si el motor XSD
+ *   o los archivos .xsd oficiales no están disponibles o fallan.
+ * - Tras superar la validación formal W3C XSD 1.0 en libxml2, aplica además las restricciones
+ *   funcionales cruzadas de la Orden HAC/1177/2024 (coherencia TipoFactura <-> TipoRectificativa,
+ *   ImporteRectificacion, Destinatarios, FacturasSustituidas, Tercero y Generador).
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { execFileSync } from 'node:child_process';
-import { validateAeatVerifactuXml } from './aeatVerifactuXmlBuilder';
+import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
+import { XMLParser } from 'fast-xml-parser';
 
 export interface XmlValidationReport {
   valid: boolean;
   errors: string[];
+  engine?: string;
+}
+
+let xsdWorker: Worker | null = null;
+
+function getOrCreateXsdWorker(): Worker {
+  if (xsdWorker) {
+    return xsdWorker;
+  }
+  const workerPath = path.resolve(process.cwd(), 'src/fiscal/libxml2XsdWorker.mjs');
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(`No se encontró el worker de validación XSD libxml2 en '${workerPath}'.`);
+  }
+  const worker = new Worker(workerPath);
+  worker.unref();
+  worker.on('error', () => {
+    xsdWorker = null;
+  });
+  worker.on('exit', () => {
+    xsdWorker = null;
+  });
+  xsdWorker = worker;
+  return worker;
 }
 
 /**
- * Validador formal estricto contra los esquemas XSD oficiales de la AEAT
- * (SuministroLR.xsd y sus importaciones asociadas) utilizando el motor normativo xmllint (libxml2).
- * Si xmllint no está disponible en el entorno del sistema, delega en validateAeatVerifactuXml.
+ * Validaciones semánticas cruzadas exigidas por la Orden HAC/1177/2024 y el documento
+ * de validaciones AEAT VERI*FACTU que el estándar W3C XSD 1.0 no puede expresar por sí solo
+ * debido a que los elementos condicionales tienen minOccurs="0" en SuministroInformacion.xsd.
+ */
+function validateAeatCrossFieldRules(xmlString: string): string[] {
+  const errors: string[] = [];
+  try {
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      removeNSPrefix: false,
+      trimValues: true,
+      parseTagValue: false
+    });
+    const parsed = parser.parse(xmlString);
+    const root = parsed?.['sfLR:RegFactuSistemaFacturacion'];
+    if (!root) return errors;
+
+    let registros = root['sfLR:RegistroFactura'];
+    if (!registros) return errors;
+    if (!Array.isArray(registros)) {
+      registros = [registros];
+    }
+
+    for (let i = 0; i < registros.length; i++) {
+      const reg = registros[i];
+      const alta = reg?.['sf:RegistroAlta'];
+      const anulacion = reg?.['sf:RegistroAnulacion'];
+
+      if (alta) {
+        const tipoFactura = String(alta['sf:TipoFactura'] || '');
+        const isRectificativa = ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura);
+        const isSimplified = tipoFactura === 'F2' || tipoFactura === 'R5';
+        const tipoRect = alta['sf:TipoRectificativa'] ? String(alta['sf:TipoRectificativa']) : undefined;
+        const hasImporteRect = Boolean(alta['sf:ImporteRectificacion']);
+        const hasFacturasRect = Boolean(alta['sf:FacturasRectificadas']);
+        const hasFacturasSust = Boolean(alta['sf:FacturasSustituidas']);
+        const hasDestinatarios = Boolean(alta['sf:Destinatarios']);
+        const sinIdentifArt61d = String(alta['sf:FacturaSinIdentifDestinatarioArt61d'] || 'N');
+
+        if (isRectificativa) {
+          if (!tipoRect) {
+            errors.push(`RegistroAlta #${i + 1}: TipoFactura '${tipoFactura}' requiere obligatoriamente '<sf:TipoRectificativa>' ('S' o 'I').`);
+          } else if (tipoRect === 'S' && !hasImporteRect) {
+            errors.push(`RegistroAlta #${i + 1}: TipoFactura '${tipoFactura}' por sustitución (TipoRectificativa='S') requiere obligatoriamente '<sf:ImporteRectificacion>'.`);
+          } else if (tipoRect === 'I' && hasImporteRect) {
+            errors.push(`RegistroAlta #${i + 1}: TipoFactura '${tipoFactura}' por diferencias (TipoRectificativa='I') no permite incluir '<sf:ImporteRectificacion>'.`);
+          }
+        } else {
+          if (tipoRect || hasImporteRect || hasFacturasRect) {
+            errors.push(`RegistroAlta #${i + 1}: TipoFactura '${tipoFactura}' no es rectificativa y no puede incluir TipoRectificativa, FacturasRectificadas ni ImporteRectificacion.`);
+          }
+        }
+
+        if (hasFacturasSust && tipoFactura !== 'F3') {
+          errors.push(`RegistroAlta #${i + 1}: '<sf:FacturasSustituidas>' solo está permitido para TipoFactura 'F3' (actual: '${tipoFactura}').`);
+        }
+
+        if (isSimplified) {
+          if (hasDestinatarios) {
+            errors.push(`RegistroAlta #${i + 1}: Las facturas simplificadas ('${tipoFactura}') no permiten bloque '<sf:Destinatarios>'.`);
+          }
+        } else {
+          const allowNoRecipient = tipoFactura === 'F1' && sinIdentifArt61d === 'S';
+          if (!hasDestinatarios && !allowNoRecipient) {
+            errors.push(`RegistroAlta #${i + 1}: TipoFactura '${tipoFactura}' requiere obligatoriamente '<sf:Destinatarios>' con al menos un '<sf:IDDestinatario>'.`);
+          }
+        }
+
+        const emitidaPor = alta['sf:EmitidaPorTerceroODestinatario'];
+        if (emitidaPor === 'T' && !alta['sf:Tercero']) {
+          errors.push(`RegistroAlta #${i + 1}: Cuando EmitidaPorTerceroODestinatario es 'T', el bloque '<sf:Tercero>' es obligatorio.`);
+        }
+      }
+
+      if (anulacion) {
+        const genPor = anulacion['sf:GeneradoPor'];
+        if ((genPor === 'D' || genPor === 'T') && !anulacion['sf:Generador']) {
+          errors.push(`RegistroAnulacion #${i + 1}: Cuando GeneradoPor es '${genPor}', el bloque '<sf:Generador>' es obligatorio.`);
+        }
+      }
+    }
+  } catch (err: any) {
+    errors.push(`Error en validación cruzada AEAT: ${err?.message || String(err)}`);
+  }
+  return errors;
+}
+
+/**
+ * Valida un documento XML contra los esquemas XSD oficiales de la AEAT (SuministroLR.xsd,
+ * SuministroInformacion.xsd y xmldsig-core-schema.xsd) utilizando el motor real libxml2.
+ *
+ * FAIL-CLOSED: Si el archivo XSD no existe o el motor libxml2 falla, devuelve valid: false.
+ * Nunca degrada ni hace fallback a validadores simulados.
  */
 export function validateXmlAgainstOfficialXsd(
   xmlString: string,
   xsdFilePath?: string
 ): XmlValidationReport {
-  const schemaPath = xsdFilePath || path.resolve(process.cwd(), 'docs/fiscal/xsd/SuministroLR.xsd');
-  if (!fs.existsSync(schemaPath)) {
+  if (!xmlString || typeof xmlString !== 'string' || xmlString.trim() === '') {
     return {
       valid: false,
-      errors: [`No se encontró el archivo de esquema oficial XSD en '${schemaPath}'.`]
+      errors: ['El documento XML está vacío o no es una cadena válida.'],
+      engine: 'libxml2-wasm'
     };
   }
 
-  const tmpFile = path.join(os.tmpdir(), `aeat_xsd_val_${Date.now()}_${Math.random().toString(36).slice(2)}.xml`);
-  try {
-    fs.writeFileSync(tmpFile, xmlString, 'utf-8');
-    try {
-      execFileSync('xmllint', ['--schema', schemaPath, '--noout', tmpFile], {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-      return { valid: true, errors: [] };
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        // Si xmllint no está instalado en el sistema operativo, validar con el validador normativo interno
-        return validateAeatVerifactuXml(xmlString);
-      }
-      const output = (err.stderr || err.stdout || err.message || '').toString();
-      const rawLines = output
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l.includes('Schemas validity error') || l.includes('fails to validate') || l.includes('parser error'));
-      const errors = rawLines.length > 0 ? rawLines : [output.trim() || 'Error de validación XSD'];
-      return { valid: false, errors };
-    }
-  } finally {
-    if (fs.existsSync(tmpFile)) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {
-        // cleanup ignore
-      }
+  const schemaPath = xsdFilePath
+    ? path.resolve(xsdFilePath)
+    : path.resolve(process.cwd(), 'docs/fiscal/xsd/SuministroLR.xsd');
+
+  if (!fs.existsSync(schemaPath)) {
+    return {
+      valid: false,
+      errors: [`FAIL-CLOSED: No se encontró el archivo de esquema oficial XSD en '${schemaPath}'.`],
+      engine: 'libxml2-wasm'
+    };
+  }
+
+  const xsdDir = path.dirname(schemaPath);
+  const infoXsdPath = path.join(xsdDir, 'SuministroInformacion.xsd');
+  const dsigXsdPath = path.join(xsdDir, 'xmldsig-core-schema.xsd');
+  if (path.basename(schemaPath) === 'SuministroLR.xsd') {
+    if (!fs.existsSync(infoXsdPath) || !fs.existsSync(dsigXsdPath)) {
+      return {
+        valid: false,
+        errors: [
+          `FAIL-CLOSED: Faltan esquemas XSD importados requeridos ('SuministroInformacion.xsd' o 'xmldsig-core-schema.xsd') en '${xsdDir}'.`
+        ],
+        engine: 'libxml2-wasm'
+      };
     }
   }
+
+  let xsdReport: XmlValidationReport;
+  try {
+    const worker = getOrCreateXsdWorker();
+    const sharedBuf = new SharedArrayBuffer(4);
+    const signal = new Int32Array(sharedBuf);
+    const { port1, port2 } = new MessageChannel();
+
+    worker.postMessage(
+      {
+        xmlString,
+        schemaPath,
+        signal,
+        port: port2
+      },
+      [port2]
+    );
+
+    const waitResult = Atomics.wait(signal, 0, 0, 15000);
+    if (waitResult === 'timed-out') {
+      port1.close();
+      xsdWorker = null;
+      return {
+        valid: false,
+        errors: ['FAIL-CLOSED: Timeout ejecutando validación XSD oficial con motor libxml2.'],
+        engine: 'libxml2-wasm'
+      };
+    }
+
+    const msg = receiveMessageOnPort(port1);
+    port1.close();
+
+    if (!msg || !msg.message) {
+      return {
+        valid: false,
+        errors: ['FAIL-CLOSED: El motor libxml2 no devolvió respuesta de validación XSD.'],
+        engine: 'libxml2-wasm'
+      };
+    }
+
+    xsdReport = msg.message as XmlValidationReport;
+  } catch (err: any) {
+    return {
+      valid: false,
+      errors: [`FAIL-CLOSED: Error crítico invocando el motor XSD oficial libxml2: ${err?.message || String(err)}`],
+      engine: 'libxml2-wasm'
+    };
+  }
+
+  if (!xsdReport.valid) {
+    return xsdReport;
+  }
+
+  // Aplicar reglas semánticas cruzadas adicionales de VERI*FACTU sobre el XML ya validado por XSD
+  const crossFieldErrors = validateAeatCrossFieldRules(xmlString);
+  if (crossFieldErrors.length > 0) {
+    return {
+      valid: false,
+      errors: crossFieldErrors,
+      engine: xsdReport.engine || 'libxml2-wasm'
+    };
+  }
+
+  return {
+    valid: true,
+    errors: [],
+    engine: xsdReport.engine || 'libxml2-wasm'
+  };
 }
 
 export const validateAeatXmlAgainstXsd = validateXmlAgainstOfficialXsd;

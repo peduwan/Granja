@@ -152,6 +152,40 @@ export function createFiscalRecordFromInvoice(
     fechaHoraHusoGenRegistro: fechaHoraHuso
   });
 
+  const isRectificativa = Boolean(
+    invoice.esRectificativa || ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)
+  );
+  const isSimplifiedWithoutRecipient = tipoFactura === 'F2' || tipoFactura === 'R5';
+  const resolvedTipoRectificativa: 'S' | 'I' =
+    invoice.tipoRectificativa === 'por_diferencias' ||
+    invoice.tipoRectificativa === 'diferencias' ||
+    invoice.tipoRectificativa === 'I'
+      ? 'I'
+      : 'S';
+
+  const resolvedFacturasRectificadas =
+    invoice.facturasRectificadas && invoice.facturasRectificadas.length > 0
+      ? invoice.facturasRectificadas
+      : invoice.facturaRectificadaNumero
+        ? [
+            {
+              numeroFactura: invoice.facturaRectificadaNumero,
+              fechaExpedicion: invoice.facturaRectificadaFecha || invoice.fecha
+            }
+          ]
+        : [];
+
+  const resolvedImporteRectificacion =
+    resolvedTipoRectificativa === 'S'
+      ? invoice.importeRectificacion || {
+          baseRectificada: invoice.baseRectificada ?? 0,
+          cuotaRectificada: invoice.cuotaRectificada ?? 0,
+          ...(invoice.cuotaRecargoRectificado !== undefined
+            ? { cuotaRecargoRectificado: invoice.cuotaRecargoRectificado }
+            : {})
+        }
+      : undefined;
+
   // 4. Construcción del FiscalRecord inmutable con campos únicos
   const record: FiscalRecord = {
     id: `frec-${invoice.id || Date.now()}`,
@@ -167,22 +201,30 @@ export function createFiscalRecordFromInvoice(
       nombreRazon: config.nombreRazonEmisor
     },
 
-    destinatario: invoice.clienteCif ? {
-      nif: invoice.clienteCif,
-      nombreRazon: invoice.clienteNombre,
-      codigoPais: 'ES'
-    } : undefined,
+    destinatario:
+      !isSimplifiedWithoutRecipient && (invoice.clienteCif || invoice.clienteIdOtro)
+        ? {
+            nif: invoice.clienteCif || undefined,
+            nombreRazon: invoice.clienteNombre,
+            codigoPais: invoice.clienteIdOtro?.codigoPais || 'ES',
+            idOtro: invoice.clienteIdOtro ? { ...invoice.clienteIdOtro } : undefined
+          }
+        : undefined,
 
     factura: {
       numeroFactura: invoice.numeroFactura,
       fechaExpedicion: invoice.fecha,
       horaExpedicion,
       tipoFactura,
-      descripcionOperacion: 'Venta y distribución de huevos de granja',
-      facturaSimplificadaArt7273: tipoFactura === 'F2' ? 'S' : 'N',
-      facturaSinIdentifDestinatarioArt61d: !invoice.clienteCif ? 'S' : 'N',
+      descripcionOperacion: invoice.descripcionOperacion || 'Venta y distribución de huevos de granja',
+      facturaSimplificadaArt7273: isSimplifiedWithoutRecipient ? 'S' : 'N',
+      facturaSinIdentifDestinatarioArt61d:
+        isSimplifiedWithoutRecipient || (!invoice.clienteCif && !invoice.clienteIdOtro) ? 'S' : 'N',
       macrodato: 'N',
-      emitidaPorTerceroODestinatario: undefined
+      emitidaPorTerceroODestinatario: undefined,
+      facturasSustituidas: invoice.facturasSustituidas
+        ? invoice.facturasSustituidas.map(fs => ({ ...fs }))
+        : undefined
     },
 
     desgloseTributario: {
@@ -193,15 +235,17 @@ export function createFiscalRecordFromInvoice(
       importeTotal: invoice.totales?.totalDocumento ?? 0
     },
 
-    datosRectificativa: invoice.esRectificativa ? {
-      tipoRectificativa: invoice.tipoRectificativa === 'por_diferencias' ? 'I' : 'S',
-      facturasRectificadas: invoice.facturaRectificadaNumero ? [{
-        numeroFactura: invoice.facturaRectificadaNumero,
-        fechaExpedicion: invoice.facturaRectificadaFecha || invoice.fecha
-      }] : [],
-      motivoRectificacion: invoice.motivoRectificativa,
-      codigoMotivoRectificacion: invoice.codigoMotivoRectificativa || '01'
-    } : undefined,
+    datosRectificativa: isRectificativa
+      ? {
+          tipoRectificativa: resolvedTipoRectificativa,
+          facturasRectificadas: resolvedFacturasRectificadas.map(fr => ({ ...fr })),
+          importeRectificacion: resolvedImporteRectificacion
+            ? { ...resolvedImporteRectificacion }
+            : undefined,
+          motivoRectificacion: invoice.motivoRectificativa,
+          codigoMotivoRectificacion: invoice.codigoMotivoRectificativa || '01'
+        }
+      : undefined,
 
     // ÚNICA representación del encadenamiento
     encadenamiento: {
@@ -269,6 +313,20 @@ export interface CreateFiscalAnulacionParams {
     numeroFactura: string;
     fechaExpedicion: string; // YYYY-MM-DD o DD-MM-YYYY
     motivoAnulacion: string;
+    refExterna?: string;
+    sinRegistroPrevio?: 'S' | 'N';
+    rechazoPrevio?: 'S' | 'N';
+    generadoPor?: 'E' | 'D' | 'T';
+    generador?: {
+      nombreRazon: string;
+      nif?: string;
+      codigoPais?: string;
+      idOtro?: {
+        codigoPais?: string;
+        idType: '02' | '03' | '04' | '05' | '06' | '07';
+        id: string;
+      };
+    };
   };
   previousRecord?: FiscalRecord | FiscalRecordRef | null;
   options?: {
@@ -369,7 +427,12 @@ export function createFiscalAnulacionRecord(
     datosAnulacion: {
       motivoAnulacion: facturaAnulada.motivoAnulacion,
       numeroFacturaAnulada: facturaAnulada.numeroFactura,
-      fechaExpedicionFacturaAnulada: facturaAnulada.fechaExpedicion
+      fechaExpedicionFacturaAnulada: facturaAnulada.fechaExpedicion,
+      refExterna: facturaAnulada.refExterna,
+      sinRegistroPrevio: facturaAnulada.sinRegistroPrevio,
+      rechazoPrevio: facturaAnulada.rechazoPrevio,
+      generadoPor: facturaAnulada.generadoPor,
+      generador: facturaAnulada.generador ? { ...facturaAnulada.generador } : undefined
     },
 
     encadenamiento: {

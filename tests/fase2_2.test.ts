@@ -9,6 +9,10 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+
+if (!process.env.FISCAL_COORDINATOR_MODE) {
+  process.env.FISCAL_COORDINATOR_MODE = 'simulator';
+}
 import {
   buildAeatVerifactuXml,
   buildRegistroAltaXml,
@@ -532,6 +536,10 @@ async function main() {
       emisor: {
         nif: 'ES_UNKNOWN', // Artificial!
         nombreRazon: 'Test'
+      },
+      destinatario: {
+        nif: 'B12345678',
+        nombreRazon: 'Cliente Test'
       },
       factura: {
         numeroFactura: 'F-1',

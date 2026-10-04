@@ -92,17 +92,21 @@ export function createFiscalSubmission(
   const intento = options?.numeroIntento ?? 1;
   let xmlEnviado = options?.xmlEnviado || fiscalRecord.xmlOficial;
 
+  let buildErrorMsg = '';
   if (!xmlEnviado) {
     try {
       xmlEnviado = buildAeatVerifactuXml(fiscalRecord);
-    } catch {
+    } catch (err: any) {
+      buildErrorMsg = err?.message || String(err);
       xmlEnviado = undefined;
     }
   }
 
   // REGLA FASE 1.2: Prohibido <pending_xml/>. No crear sumisión sin XML oficial válido.
   if (!xmlEnviado || xmlEnviado === '<pending_xml/>' || xmlEnviado.trim() === '') {
-    throw new Error('createFiscalSubmission: No se puede crear una FiscalSubmission sin XML oficial válido. No se permite <pending_xml/>.');
+    throw new Error(
+      `createFiscalSubmission: No se puede crear una FiscalSubmission sin XML oficial válido. No se permite <pending_xml/>.${buildErrorMsg ? ` Causa: ${buildErrorMsg}` : ''}`
+    );
   }
 
   const endpoint = options?.endpoint || config.transporte?.endpointUrl || getAeatSoapEndpoint(config.entornoAeat);
