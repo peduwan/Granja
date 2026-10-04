@@ -3,13 +3,15 @@
  *
  * Utiliza libxml2 real (libxml2-wasm / xmllint) para validar el XML contra los esquemas XSD oficiales
  * de la Agencia Estatal de Administración Tributaria (AEAT):
- * - docs/fiscal/xsd/SuministroLR.xsd
- * - docs/fiscal/xsd/SuministroInformacion.xsd
- * - docs/fiscal/xsd/xmldsig-core-schema.xsd
+ * - SuministroLR.xsd
+ * - SuministroInformacion.xsd
+ * - xmldsig-core-schema.xsd
  *
  * POLÍTICA FAIL-CLOSED ESTRICTA:
  * - Prohibido cualquier fallback silencioso a validadores sintácticos en memoria si el motor XSD
  *   o los archivos .xsd oficiales no están disponibles o fallan.
+ * - Resolución determinista tanto en desarrollo (src/ y docs/) como en artefactos empaquetados
+ *   de producción (dist/fiscal/libxml2XsdWorker.mjs y dist/fiscal/xsd/*.xsd).
  * - Tras superar la validación formal W3C XSD 1.0 en libxml2, aplica además las restricciones
  *   funcionales cruzadas de la Orden HAC/1177/2024 (coherencia TipoFactura <-> TipoRectificativa,
  *   ImporteRectificacion, Destinatarios, FacturasSustituidas, Tercero y Generador).
@@ -17,6 +19,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
 import { XMLParser } from 'fast-xml-parser';
 
@@ -26,25 +29,82 @@ export interface XmlValidationReport {
   engine?: string;
 }
 
+function getModuleDir(): string {
+  try {
+    if (typeof __dirname === 'string' && __dirname) {
+      return __dirname;
+    }
+  } catch {}
+  try {
+    return path.dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return process.cwd();
+  }
+}
+
+/**
+ * Resuelve de forma determinista la ruta del worker libxml2 tanto en el build de producción
+ * (`dist/fiscal/libxml2XsdWorker.mjs`) como en desarrollo (`src/fiscal/libxml2XsdWorker.mjs`).
+ */
+export function resolveXsdWorkerPath(baseDir: string = process.cwd()): string {
+  const modDir = getModuleDir();
+  const candidates = [
+    path.resolve(baseDir, 'dist/fiscal/libxml2XsdWorker.mjs'),
+    path.resolve(modDir, 'fiscal/libxml2XsdWorker.mjs'),
+    path.resolve(modDir, 'libxml2XsdWorker.mjs'),
+    path.resolve(baseDir, 'src/fiscal/libxml2XsdWorker.mjs')
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[0];
+}
+
+/**
+ * Resuelve de forma determinista el esquema oficial SuministroLR.xsd tanto en el build de
+ * producción (`dist/fiscal/xsd/SuministroLR.xsd`) como en desarrollo (`docs/fiscal/xsd/SuministroLR.xsd`).
+ */
+export function resolveDefaultOfficialXsdPath(baseDir: string = process.cwd()): string {
+  const modDir = getModuleDir();
+  const candidates = [
+    path.resolve(baseDir, 'dist/fiscal/xsd/SuministroLR.xsd'),
+    path.resolve(modDir, 'fiscal/xsd/SuministroLR.xsd'),
+    path.resolve(modDir, 'xsd/SuministroLR.xsd'),
+    path.resolve(baseDir, 'docs/fiscal/xsd/SuministroLR.xsd')
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[0];
+}
+
 let xsdWorker: Worker | null = null;
+let xsdWorkerResolvedPath: string | null = null;
 
 function getOrCreateXsdWorker(): Worker {
-  if (xsdWorker) {
-    return xsdWorker;
-  }
-  const workerPath = path.resolve(process.cwd(), 'src/fiscal/libxml2XsdWorker.mjs');
+  const workerPath = resolveXsdWorkerPath();
   if (!fs.existsSync(workerPath)) {
     throw new Error(`No se encontró el worker de validación XSD libxml2 en '${workerPath}'.`);
+  }
+  if (xsdWorker && xsdWorkerResolvedPath === workerPath) {
+    return xsdWorker;
   }
   const worker = new Worker(workerPath);
   worker.unref();
   worker.on('error', () => {
     xsdWorker = null;
+    xsdWorkerResolvedPath = null;
   });
   worker.on('exit', () => {
     xsdWorker = null;
+    xsdWorkerResolvedPath = null;
   });
   xsdWorker = worker;
+  xsdWorkerResolvedPath = workerPath;
   return worker;
 }
 
@@ -157,7 +217,7 @@ export function validateXmlAgainstOfficialXsd(
 
   const schemaPath = xsdFilePath
     ? path.resolve(xsdFilePath)
-    : path.resolve(process.cwd(), 'docs/fiscal/xsd/SuministroLR.xsd');
+    : resolveDefaultOfficialXsdPath();
 
   if (!fs.existsSync(schemaPath)) {
     return {
@@ -203,6 +263,7 @@ export function validateXmlAgainstOfficialXsd(
     if (waitResult === 'timed-out') {
       port1.close();
       xsdWorker = null;
+      xsdWorkerResolvedPath = null;
       return {
         valid: false,
         errors: ['FAIL-CLOSED: Timeout ejecutando validación XSD oficial con motor libxml2.'],

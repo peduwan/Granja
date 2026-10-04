@@ -21,11 +21,18 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import {
   buildAeatVerifactuXml,
   validateAeatVerifactuXml
 } from '../src/fiscal/aeatVerifactuXmlBuilder';
-import { validateXmlAgainstOfficialXsd } from '../src/fiscal/aeatXsdValidatorNode';
+import {
+  validateXmlAgainstOfficialXsd,
+  resolveXsdWorkerPath,
+  resolveDefaultOfficialXsdPath
+} from '../src/fiscal/aeatXsdValidatorNode';
 import {
   createFiscalRecordFromInvoice,
   createFiscalAnulacionRecord,
@@ -132,6 +139,38 @@ async function main() {
     assert.ok(missingXsdReport.errors[0].includes('FAIL-CLOSED'));
   });
 
+  await runTest('1.2: Resolución determinista de dist/fiscal/libxml2XsdWorker.mjs y dist/fiscal/xsd/*.xsd sin depender de src/ ni docs/', async () => {
+    const tmpProdDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verifactu_prod_dist_'));
+    try {
+      const distXsdDir = path.join(tmpProdDir, 'dist', 'fiscal', 'xsd');
+      fs.mkdirSync(distXsdDir, { recursive: true });
+
+      const srcWorker = path.resolve(process.cwd(), 'src/fiscal/libxml2XsdWorker.mjs');
+      const distWorker = path.join(tmpProdDir, 'dist', 'fiscal', 'libxml2XsdWorker.mjs');
+      fs.copyFileSync(srcWorker, distWorker);
+
+      const srcXsdDir = path.resolve(process.cwd(), 'docs/fiscal/xsd');
+      for (const file of fs.readdirSync(srcXsdDir)) {
+        if (file.endsWith('.xsd')) {
+          fs.copyFileSync(path.join(srcXsdDir, file), path.join(distXsdDir, file));
+        }
+      }
+
+      const resolvedWorker = resolveXsdWorkerPath(tmpProdDir);
+      const resolvedXsd = resolveDefaultOfficialXsdPath(tmpProdDir);
+
+      assert.strictEqual(resolvedWorker, distWorker, 'Debe resolver el worker desde dist/fiscal/libxml2XsdWorker.mjs');
+      assert.strictEqual(resolvedXsd, path.join(distXsdDir, 'SuministroLR.xsd'), 'Debe resolver SuministroLR.xsd desde dist/fiscal/xsd/');
+
+      const rec = await buildSealedAltaRecord(createBaseInvoice());
+      const xml = buildAeatVerifactuXml(rec);
+      const report = validateXmlAgainstOfficialXsd(xml, resolvedXsd);
+      assert.strictEqual(report.valid, true, `Validación contra dist/fiscal/xsd falló: ${report.errors.join('; ')}`);
+    } finally {
+      fs.rmSync(tmpProdDir, { recursive: true, force: true });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // 2. CONFORMIDAD REAL DE F1, F2 Y F3 FRENTE A SUMINISTROLR.XSD / SUMINISTROINFORMACION.XSD
   // ---------------------------------------------------------------------------
@@ -225,7 +264,7 @@ async function main() {
         tipoRectificativa: 'por_diferencias',
         facturaRectificadaNumero: 'FAC-2026/0001',
         facturaRectificadaFecha: '2026-10-15',
-        motivoRectificacion: `Rectificación ${rType} por diferencias`,
+        motivoRectificativa: `Rectificación ${rType} por diferencias`,
         totales: {
           baseImponible: -200,
           porcentajeIva: 4,
@@ -261,7 +300,7 @@ async function main() {
         tipoRectificativa: 'por_sustitucion',
         facturaRectificadaNumero: 'FAC-2026/0001',
         facturaRectificadaFecha: '2026-10-15',
-        motivoRectificacion: `Rectificación ${rType} por sustitución`,
+        motivoRectificativa: `Rectificación ${rType} por sustitución`,
         importeRectificacion: {
           baseRectificada: 1000,
           cuotaRectificada: 40,
@@ -464,7 +503,8 @@ async function main() {
     const mutated: FiscalRecord = {
       ...rec,
       datosRectificativa: {
-        tipoRectificativa: 'S'
+        tipoRectificativa: 'S',
+        facturasRectificadas: []
       }
     };
     assert.throws(

@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && mkdir -p dist/fiscal/xsd && cp src/fiscal/libxml2XsdWorker.mjs dist/fiscal/libxml2XsdWorker.mjs && cp docs/fiscal/xsd/*.xsd dist/fiscal/xsd/",
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase1.test.ts && tsx tests/fase2_1.test.ts && tsx tests/fase2_2.test.ts && tsx tests/fase2_3.test.ts && tsx tests/fase3_1.test.ts && tsx tests/fase3_1_1.test.ts && tsx tests/fase3_1_2.test.ts && tsx tests/fase3_1_3.test.ts && tsx tests/fase3_1_4.test.ts && tsx tests/auditoria_seguridad_exhaustiva.test.ts && tsx tests/fase3_1_5_cloud_resilience.test.ts && tsx tests/fase3_1_6_autoridad_y_resiliencia.test.ts && tsx tests/auditoria_forense_adversarial.test.ts"
+    "test": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase1.test.ts && tsx tests/fase2_1.test.ts && tsx tests/fase2_2.test.ts && tsx tests/fase2_3.test.ts && tsx tests/fase3_1.test.ts && tsx tests/fase3_1_1.test.ts && tsx tests/fase3_1_2.test.ts && tsx tests/fase3_1_3.test.ts && tsx tests/fase3_1_4.test.ts && tsx tests/auditoria_seguridad_exhaustiva.test.ts && tsx tests/fase3_1_5_cloud_resilience.test.ts && tsx tests/fase3_1_6_autoridad_y_resiliencia.test.ts && tsx tests/auditoria_forense_adversarial.test.ts && tsx tests/fase4_1.test.ts"
   },
   "dependencies": {
     "@google-cloud/firestore": "^9.3.0",

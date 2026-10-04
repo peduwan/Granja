@@ -1,9 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parentPort } from 'node:worker_threads';
 import { XmlDocument, XsdValidator, xmlRegisterInputProvider } from 'libxml2-wasm';
 
-let currentXsdDir = path.resolve(process.cwd(), 'docs/fiscal/xsd');
+const workerDir = path.dirname(fileURLToPath(import.meta.url));
+
+function resolveDefaultXsdDir() {
+  const candidates = [
+    path.resolve(workerDir, 'xsd'),
+    path.resolve(process.cwd(), 'dist/fiscal/xsd'),
+    path.resolve(process.cwd(), 'docs/fiscal/xsd')
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'SuministroLR.xsd'))) {
+      return dir;
+    }
+  }
+  return candidates[0];
+}
+
+let currentXsdDir = resolveDefaultXsdDir();
 const openBuffers = new Map();
 let nextFd = 1;
 
