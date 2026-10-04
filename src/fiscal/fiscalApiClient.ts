@@ -131,3 +131,84 @@ export async function submitFiscalRecordViaBackend(fiscalRecordId: string): Prom
 
   return await res.json();
 }
+
+/**
+ * Remite un lote de 1 a 1.000 registros fiscales existentes a la AEAT en una única petición SOAP a través del backend.
+ */
+export async function submitFiscalBatchViaBackend(fiscalRecordIds: ReadonlyArray<string>): Promise<{
+  submission: FiscalSubmission;
+  fiscalEvent: any;
+  resultadosIndividuales?: any[];
+  cantidadRegistros?: number;
+  esBatch?: boolean;
+  isTechnicalError?: boolean;
+  idempotentReplay?: boolean;
+}> {
+  let authHeaders: Record<string, string> = {};
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    if (token) {
+      authHeaders['Authorization'] = `Bearer ${token}`;
+    }
+  } catch {}
+
+  const res = await fetch('/api/fiscal/submit/batch', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders
+    },
+    body: JSON.stringify({ fiscalRecordIds })
+  });
+
+  if (!res.ok) {
+    const errJson = await res.json().catch(() => ({}));
+    throw new Error(errJson.error || `Error en la remisión por lote AEAT del backend (HTTP ${res.status})`);
+  }
+
+  return await res.json();
+}
+
+/**
+ * Procesa y remite un lote de hasta 1.000 registros pendientes desde el Outbox del obligado tributario.
+ */
+export async function submitOutboxBatchViaBackend(params: {
+  obligadoTributarioId: string;
+  maxBatchSize?: number;
+}): Promise<{
+  submission?: FiscalSubmission;
+  fiscalEvent?: any;
+  resultadosIndividuales?: any[];
+  cantidadRegistros?: number;
+  esBatch?: boolean;
+  emptyOutbox?: boolean;
+  isTechnicalError?: boolean;
+}> {
+  let authHeaders: Record<string, string> = {};
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    if (token) {
+      authHeaders['Authorization'] = `Bearer ${token}`;
+    }
+  } catch {}
+
+  const res = await fetch('/api/fiscal/submit/batch', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders
+    },
+    body: JSON.stringify({
+      batchFromOutbox: true,
+      obligadoTributarioId: params.obligadoTributarioId,
+      maxBatchSize: params.maxBatchSize
+    })
+  });
+
+  if (!res.ok) {
+    const errJson = await res.json().catch(() => ({}));
+    throw new Error(errJson.error || `Error en el procesado de lote Outbox AEAT (HTTP ${res.status})`);
+  }
+
+  return await res.json();
+}

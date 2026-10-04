@@ -233,16 +233,52 @@ export type FiscalSubmissionStatus =
   | 'SENDING'
   | 'ACCEPTED'
   | 'ACCEPTED_WITH_ERRORS'
+  | 'PARTIALLY_ACCEPTED'
   | 'REJECTED'
   | 'RETRY_PENDING'
   | 'FAILED_TECHNICAL';
 
+export type FiscalRecordSubmissionStatus =
+  | 'PENDING'
+  | 'SENDING'
+  | 'ACCEPTED'
+  | 'ACCEPTED_WITH_ERRORS'
+  | 'REJECTED'
+  | 'RETRY_PENDING'
+  | 'FAILED_TECHNICAL';
+
+/**
+ * Resultado individual de la remisión de un FiscalRecord dentro de una FiscalSubmission (1..1000).
+ * Preserva el estado tributario individual de cada registro sin mutar el FiscalRecord sellado.
+ */
+export interface FiscalRecordSubmissionResult {
+  readonly fiscalRecordId: string;
+  readonly numeroFactura: string;
+  readonly fechaExpedicion: string;
+  readonly tipoRegistro: TipoRegistroFiscal;
+  readonly estado: FiscalRecordSubmissionStatus;
+  readonly estadoRegistroAeat?: 'Correcto' | 'AceptadoConErrores' | 'Incorrecto' | string;
+  readonly codigoErrorRegistro?: string;
+  readonly descripcionErrorRegistro?: string;
+  readonly csv?: string;
+  readonly refExterna?: string;
+  readonly registroDuplicado?: any;
+  readonly esReintentable: boolean;
+  readonly requiereSubsanacion: boolean;
+}
+
 export interface FiscalSubmission {
   readonly id: string;
   readonly obligadoTributarioId: string;
-  readonly fiscalRecordId: string;
-  readonly numeroFactura: string;
+  readonly fiscalRecordId: string; // Primer o único registro (retrocompatibilidad 1:1)
+  readonly numeroFactura: string; // Primera o única factura (retrocompatibilidad 1:1)
+  readonly fiscalRecordIds?: ReadonlyArray<string>; // Identificadores ordenados de los 1..1000 registros del batch
+  readonly numerosFactura?: ReadonlyArray<string>; // Números de factura ordenados de los 1..1000 registros del batch
+  readonly cantidadRegistros?: number; // Cantidad total de registros en el envío (1..1000)
+  readonly esBatch?: boolean; // true cuando la remisión agrupa múltiples registros
   readonly estado: FiscalSubmissionStatus;
+  readonly estadoEnvioAeat?: 'Correcto' | 'ParcialmenteCorrecto' | 'Incorrecto' | string;
+  readonly resultadosIndividuales?: ReadonlyArray<FiscalRecordSubmissionResult>;
   readonly fechaCreacion: string; // ISO 8601
   readonly fechaIntento: string; // ISO 8601
   readonly fechaEnvio?: string;
@@ -254,8 +290,18 @@ export interface FiscalSubmission {
   readonly httpStatus?: number;
   readonly codigoAeat?: string;
   readonly descripcion?: string;
-  readonly avisos?: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
-  readonly errores?: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
+  readonly avisos?: ReadonlyArray<{
+    readonly codigo: string;
+    readonly descripcion: string;
+    readonly numSerieFactura?: string;
+    readonly fiscalRecordId?: string;
+  }>;
+  readonly errores?: ReadonlyArray<{
+    readonly codigo: string;
+    readonly descripcion: string;
+    readonly numSerieFactura?: string;
+    readonly fiscalRecordId?: string;
+  }>;
   readonly csv?: string; // Código Seguro de Verificación emitido por AEAT
   readonly tiempoEsperaEnvio?: number; // Tiempo de espera en segundos indicado por la AEAT para control de flujo
   readonly tiempoRespuestaMs?: number;
@@ -290,6 +336,7 @@ export type TipoFiscalEvent =
   | 'ENVIO_AEAT_INICIADO'
   | 'ENVIO_AEAT_ACEPTADO'
   | 'ENVIO_AEAT_ACEPTADO_CON_ERRORES'
+  | 'ENVIO_AEAT_PARCIALMENTE_ACEPTADO'
   | 'ENVIO_AEAT_RECHAZADO'
   | 'ENVIO_AEAT_ERROR_TECNICO'
   | 'REINTENTO_PROGRAMADO'

@@ -12,6 +12,12 @@
  */
 
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import {
+  FiscalRecord,
+  FiscalSubmissionStatus,
+  FiscalRecordSubmissionResult,
+  FiscalRecordSubmissionStatus
+} from './types';
 
 export interface AeatResponseLine {
   readonly idFactura: {
@@ -20,6 +26,12 @@ export interface AeatResponseLine {
     readonly fechaExpedicionFactura: string;
   };
   readonly operacion?: string;
+  readonly operacionDetalle?: {
+    readonly tipoOperacion: string;
+    readonly subsanacion?: string;
+    readonly rechazoPrevio?: string;
+    readonly sinRegistroPrevio?: string;
+  };
   readonly refExterna?: string;
   readonly estadoRegistro: 'Correcto' | 'AceptadoConErrores' | 'Incorrecto' | string;
   readonly codigoErrorRegistro?: string;
@@ -53,13 +65,26 @@ export interface AeatParsedResponse {
   /**
    * Mapeo reglamentario al estado interno de FiscalSubmission
    */
-  readonly mappedSubmissionStatus: 'ACCEPTED' | 'ACCEPTED_WITH_ERRORS' | 'REJECTED' | 'FAILED_TECHNICAL';
+  readonly mappedSubmissionStatus:
+    | 'ACCEPTED'
+    | 'ACCEPTED_WITH_ERRORS'
+    | 'PARTIALLY_ACCEPTED'
+    | 'REJECTED'
+    | 'FAILED_TECHNICAL';
   /**
    * Indica si el error o estado admite reintento técnico automático según las reglas de la AEAT.
    */
   readonly isRetryable: boolean;
-  readonly avisos: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
-  readonly errores: ReadonlyArray<{ readonly codigo: string; readonly descripcion: string }>;
+  readonly avisos: ReadonlyArray<{
+    readonly codigo: string;
+    readonly descripcion: string;
+    readonly numSerieFactura?: string;
+  }>;
+  readonly errores: ReadonlyArray<{
+    readonly codigo: string;
+    readonly descripcion: string;
+    readonly numSerieFactura?: string;
+  }>;
 }
 
 /**
@@ -197,46 +222,87 @@ export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
   }
 
   const lineas: AeatResponseLine[] = [];
-  const avisos: Array<{ codigo: string; descripcion: string }> = [];
-  const errores: Array<{ codigo: string; descripcion: string }> = [];
+  const avisos: Array<{ codigo: string; descripcion: string; numSerieFactura?: string }> = [];
+  const errores: Array<{ codigo: string; descripcion: string; numSerieFactura?: string }> = [];
 
   for (const item of rawLineas) {
     const idFacturaNode = item.IDFactura || {};
     const idFactura = {
-      idEmisorFactura: String(idFacturaNode.IDEmisorFactura || ''),
-      numSerieFactura: String(idFacturaNode.NumSerieFactura || ''),
-      fechaExpedicionFactura: String(idFacturaNode.FechaExpedicionFactura || '')
+      idEmisorFactura: String(idFacturaNode.IDEmisorFactura || idFacturaNode.IDEmisorFacturaAnulada || ''),
+      numSerieFactura: String(idFacturaNode.NumSerieFactura || idFacturaNode.NumSerieFacturaAnulada || ''),
+      fechaExpedicionFactura: String(
+        idFacturaNode.FechaExpedicionFactura || idFacturaNode.FechaExpedicionFacturaAnulada || ''
+      )
     };
+
+    let operacionStr: string | undefined;
+    let operacionDetalle: AeatResponseLine['operacionDetalle'] | undefined;
+    if (item.Operacion !== undefined && item.Operacion !== null) {
+      if (typeof item.Operacion === 'object') {
+        operacionStr = String(item.Operacion.TipoOperacion || 'Alta');
+        operacionDetalle = {
+          tipoOperacion: operacionStr,
+          subsanacion: item.Operacion.Subsanacion ? String(item.Operacion.Subsanacion) : undefined,
+          rechazoPrevio: item.Operacion.RechazoPrevio ? String(item.Operacion.RechazoPrevio) : undefined,
+          sinRegistroPrevio: item.Operacion.SinRegistroPrevio ? String(item.Operacion.SinRegistroPrevio) : undefined
+        };
+      } else {
+        operacionStr = String(item.Operacion);
+      }
+    }
 
     const estadoRegistro = String(item.EstadoRegistro || 'Incorrecto');
     const codigoError = item.CodigoErrorRegistro ? String(item.CodigoErrorRegistro) : undefined;
     const descripcionError = item.DescripcionErrorRegistro ? String(item.DescripcionErrorRegistro) : undefined;
+    const rawDup = item.RegistroDuplicado;
+    const registroDuplicado = rawDup && typeof rawDup === 'object' ? {
+      idPeticionRegistroDuplicado: rawDup.IdPeticionRegistroDuplicado || rawDup.idPeticionRegistroDuplicado
+        ? String(rawDup.IdPeticionRegistroDuplicado || rawDup.idPeticionRegistroDuplicado)
+        : undefined,
+      estadoRegistroDuplicado: rawDup.EstadoRegistroDuplicado || rawDup.estadoRegistroDuplicado
+        ? String(rawDup.EstadoRegistroDuplicado || rawDup.estadoRegistroDuplicado)
+        : undefined,
+      codigoErrorRegistro: rawDup.CodigoErrorRegistro || rawDup.codigoErrorRegistro
+        ? String(rawDup.CodigoErrorRegistro || rawDup.codigoErrorRegistro)
+        : undefined,
+      descripcionErrorRegistro: rawDup.DescripcionErrorRegistro || rawDup.descripcionErrorRegistro
+        ? String(rawDup.DescripcionErrorRegistro || rawDup.descripcionErrorRegistro)
+        : undefined
+    } : undefined;
 
     lineas.push({
       idFactura,
-      operacion: item.Operacion ? String(item.Operacion) : undefined,
+      operacion: operacionStr,
+      operacionDetalle,
       refExterna: item.RefExterna ? String(item.RefExterna) : undefined,
       estadoRegistro,
       codigoErrorRegistro: codigoError,
       descripcionErrorRegistro: descripcionError,
-      registroDuplicado: item.RegistroDuplicado
+      registroDuplicado
     });
 
     if (estadoRegistro === 'AceptadoConErrores' && codigoError) {
       avisos.push({
         codigo: codigoError,
-        descripcion: descripcionError || 'Aviso AEAT'
+        descripcion: descripcionError || 'Aviso AEAT',
+        numSerieFactura: idFactura.numSerieFactura || undefined
       });
     } else if (estadoRegistro === 'Incorrecto' && codigoError) {
       errores.push({
         codigo: codigoError,
-        descripcion: descripcionError || 'Error de rechazo AEAT'
+        descripcion: descripcionError || 'Error de rechazo AEAT',
+        numSerieFactura: idFactura.numSerieFactura || undefined
       });
     }
   }
 
-  // 7. Determinar el estado interno para FiscalSubmission
-  let mappedStatus: 'ACCEPTED' | 'ACCEPTED_WITH_ERRORS' | 'REJECTED' | 'FAILED_TECHNICAL' = 'ACCEPTED';
+  // 7. Determinar el estado interno para FiscalSubmission (1..1000 registros)
+  let mappedStatus:
+    | 'ACCEPTED'
+    | 'ACCEPTED_WITH_ERRORS'
+    | 'PARTIALLY_ACCEPTED'
+    | 'REJECTED'
+    | 'FAILED_TECHNICAL' = 'ACCEPTED';
 
   if (lineas.length === 0) {
     if (estadoEnvio === 'Correcto') {
@@ -247,10 +313,15 @@ export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
       mappedStatus = 'FAILED_TECHNICAL';
     }
   } else {
-    const anyIncorrect = lineas.some(l => l.estadoRegistro === 'Incorrecto');
+    const anyCorrect = lineas.some(l => l.estadoRegistro === 'Correcto');
     const anyAcceptedWithErrors = lineas.some(l => l.estadoRegistro === 'AceptadoConErrores');
+    const anyAccepted = anyCorrect || anyAcceptedWithErrors;
+    const anyIncorrect = lineas.some(l => l.estadoRegistro === 'Incorrecto');
 
-    if (anyIncorrect || estadoEnvio === 'Incorrecto') {
+    if (anyIncorrect && anyAccepted) {
+      // Batch parcial: al menos un registro aceptado (Correcto / AceptadoConErrores) y al menos uno rechazado (Incorrecto)
+      mappedStatus = 'PARTIALLY_ACCEPTED';
+    } else if (anyIncorrect || estadoEnvio === 'Incorrecto') {
       mappedStatus = 'REJECTED';
     } else if (anyAcceptedWithErrors || estadoEnvio === 'ParcialmenteCorrecto') {
       mappedStatus = 'ACCEPTED_WITH_ERRORS';
@@ -269,8 +340,197 @@ export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
     estadoEnvio,
     lineas,
     mappedSubmissionStatus: mappedStatus,
-    isRetryable: false, // Las respuestas fiscales formales (Correcto, AceptadoConErrores, Incorrecto) no se reintentan a ciegas
+    isRetryable: false, // Las respuestas fiscales formales (Correcto, AceptadoConErrores, Incorrecto, ParcialmenteCorrecto) no se reintentan a ciegas
     avisos,
     errores
   };
+}
+
+/**
+ * Normaliza una fecha YYYY-MM-DD o DD-MM-YYYY al formato oficial AEAT DD-MM-YYYY para correlación.
+ */
+export function normalizeDateForAeatCorrelation(dateStr: string): string {
+  const clean = (dateStr || '').trim();
+  const isoMatch = clean.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    return `${isoMatch[3]}-${isoMatch[2]}-${isoMatch[1]}`;
+  }
+  return clean;
+}
+
+/**
+ * Extrae el número de serie+factura canónico de un FiscalRecord (alta o anulación).
+ */
+export function getRecordCanonicalNumSerie(record: FiscalRecord): string {
+  if (record.tipoRegistro === 'anulacion' && record.datosAnulacion?.numeroFacturaAnulada) {
+    return record.datosAnulacion.numeroFacturaAnulada.trim();
+  }
+  const serie = (record.factura.serieFactura || '').trim();
+  const num = (record.factura.numeroFactura || '').trim();
+  if (serie && !num.startsWith(serie)) {
+    return `${serie}${num}`;
+  }
+  return num;
+}
+
+/**
+ * Extrae la fecha de expedición canónica en formato DD-MM-YYYY de un FiscalRecord.
+ */
+export function getRecordCanonicalFechaExpedicion(record: FiscalRecord): string {
+  if (record.tipoRegistro === 'anulacion' && record.datosAnulacion?.fechaExpedicionFacturaAnulada) {
+    return normalizeDateForAeatCorrelation(record.datosAnulacion.fechaExpedicionFacturaAnulada);
+  }
+  return normalizeDateForAeatCorrelation(record.factura.fechaExpedicion);
+}
+
+/**
+ * Correlaciona cada FiscalRecord de un envío (1..1000) con su correspondiente <sfR:RespuestaLinea>
+ * devuelta por la AEAT, produciendo el resultado individual determinista de cada registro.
+ */
+export function correlateAeatResponseWithRecords(
+  firstArg: ReadonlyArray<FiscalRecord> | AeatParsedResponse | undefined,
+  secondArg: AeatParsedResponse | ReadonlyArray<FiscalRecord> | undefined,
+  submissionStatusParam?: FiscalSubmissionStatus
+): FiscalRecordSubmissionResult[] {
+  const isFirstArray = Array.isArray(firstArg);
+  const records: ReadonlyArray<FiscalRecord> = isFirstArray
+    ? (firstArg as ReadonlyArray<FiscalRecord>)
+    : (Array.isArray(secondArg) ? (secondArg as ReadonlyArray<FiscalRecord>) : []);
+  const parsedResponse: AeatParsedResponse | undefined = isFirstArray
+    ? (secondArg as AeatParsedResponse | undefined)
+    : (firstArg as AeatParsedResponse | undefined);
+  const submissionStatus: FiscalSubmissionStatus =
+    submissionStatusParam || parsedResponse?.mappedSubmissionStatus || 'FAILED_TECHNICAL';
+
+  if (!records || records.length === 0) return [];
+
+  // Si hubo fallo técnico global (timeout, HTTP 5xx, SOAP Fault, XML corrupto)
+  if (!parsedResponse || parsedResponse.isSoapFault || submissionStatus === 'FAILED_TECHNICAL') {
+    const isRetryable = parsedResponse ? parsedResponse.isRetryable : true;
+    const errCode = parsedResponse?.fault?.faultcode || parsedResponse?.errores[0]?.codigo;
+    const errDesc = parsedResponse?.fault?.faultstring || parsedResponse?.errores[0]?.descripcion;
+
+    return records.map(rec => ({
+      fiscalRecordId: rec.id,
+      numeroFactura: getRecordCanonicalNumSerie(rec),
+      fechaExpedicion: getRecordCanonicalFechaExpedicion(rec),
+      tipoRegistro: rec.tipoRegistro,
+      estado: 'FAILED_TECHNICAL',
+      codigoErrorRegistro: errCode,
+      descripcionErrorRegistro: errDesc,
+      esReintentable: isRetryable,
+      requiereSubsanacion: false
+    }));
+  }
+
+  const usedLineIndices = new Set<number>();
+  const lines = parsedResponse.lineas || [];
+
+  return records.map((rec, idx) => {
+    const recNif = (rec.emisor?.nif || rec.obligadoTributarioId || '').trim().toUpperCase();
+    const recNum = getRecordCanonicalNumSerie(rec);
+    const recRawNum = (rec.factura.numeroFactura || '').trim();
+    const recFecha = getRecordCanonicalFechaExpedicion(rec);
+    const recRefExterna = (rec.tipoRegistro === 'anulacion' ? rec.datosAnulacion?.refExterna : rec.factura.refExterna)?.trim();
+
+    // 1. Búsqueda exacta por clave compuesta (IDEmisorFactura + NumSerieFactura + FechaExpedicionFactura)
+    let matchedIndex = lines.findIndex((line, lineIdx) => {
+      if (usedLineIndices.has(lineIdx)) return false;
+      const lineNif = (line.idFactura.idEmisorFactura || '').trim().toUpperCase();
+      const lineNum = (line.idFactura.numSerieFactura || '').trim();
+      const lineFecha = normalizeDateForAeatCorrelation(line.idFactura.fechaExpedicionFactura);
+      const nifMatches = !lineNif || lineNif === recNif;
+      const numMatches = lineNum === recNum || lineNum === recRawNum;
+      const fechaMatches = !lineFecha || lineFecha === recFecha;
+      return nifMatches && numMatches && fechaMatches;
+    });
+
+    // 2. Búsqueda por NumSerieFactura (si la fecha tenía variación de formato)
+    if (matchedIndex === -1) {
+      matchedIndex = lines.findIndex((line, lineIdx) => {
+        if (usedLineIndices.has(lineIdx)) return false;
+        const lineNum = (line.idFactura.numSerieFactura || '').trim();
+        return lineNum === recNum || lineNum === recRawNum;
+      });
+    }
+
+    // 3. Búsqueda por RefExterna si se informó
+    if (matchedIndex === -1 && recRefExterna) {
+      matchedIndex = lines.findIndex((line, lineIdx) => {
+        if (usedLineIndices.has(lineIdx)) return false;
+        return line.refExterna === recRefExterna;
+      });
+    }
+
+    // 4. Fallback posicional determinista cuando AEAT devuelve exactamente N líneas en el mismo orden
+    if (matchedIndex === -1 && idx < lines.length && !usedLineIndices.has(idx)) {
+      matchedIndex = idx;
+    }
+
+    const matchedLine = matchedIndex !== -1 ? lines[matchedIndex] : undefined;
+    if (matchedIndex !== -1) {
+      usedLineIndices.add(matchedIndex);
+    }
+
+    if (!matchedLine) {
+      // Si no hay línea específica pero el estado global es Correcto / Incorrecto
+      if (parsedResponse.estadoEnvio === 'Correcto' || submissionStatus === 'ACCEPTED') {
+        return {
+          fiscalRecordId: rec.id,
+          numeroFactura: recNum,
+          fechaExpedicion: recFecha,
+          tipoRegistro: rec.tipoRegistro,
+          estado: 'ACCEPTED',
+          estadoRegistroAeat: 'Correcto',
+          csv: parsedResponse.csv,
+          esReintentable: false,
+          requiereSubsanacion: false
+        };
+      }
+      return {
+        fiscalRecordId: rec.id,
+        numeroFactura: recNum,
+        fechaExpedicion: recFecha,
+        tipoRegistro: rec.tipoRegistro,
+        estado: 'REJECTED',
+        estadoRegistroAeat: 'Incorrecto',
+        codigoErrorRegistro: parsedResponse.errores[0]?.codigo || '1100',
+        descripcionErrorRegistro: parsedResponse.errores[0]?.descripcion || 'Sin línea de respuesta en AEAT',
+        esReintentable: false,
+        requiereSubsanacion: true
+      };
+    }
+
+    let individualStatus: FiscalRecordSubmissionStatus = 'REJECTED';
+    let esReintentable = false;
+    let requiereSubsanacion = false;
+    let recordCsv: string | undefined = undefined;
+
+    if (matchedLine.estadoRegistro === 'Correcto') {
+      individualStatus = 'ACCEPTED';
+      recordCsv = parsedResponse.csv;
+    } else if (matchedLine.estadoRegistro === 'AceptadoConErrores') {
+      individualStatus = 'ACCEPTED_WITH_ERRORS';
+      recordCsv = parsedResponse.csv;
+    } else {
+      individualStatus = 'REJECTED';
+      requiereSubsanacion = true;
+    }
+
+    return {
+      fiscalRecordId: rec.id,
+      numeroFactura: recNum,
+      fechaExpedicion: recFecha,
+      tipoRegistro: rec.tipoRegistro,
+      estado: individualStatus,
+      estadoRegistroAeat: matchedLine.estadoRegistro,
+      codigoErrorRegistro: matchedLine.codigoErrorRegistro,
+      descripcionErrorRegistro: matchedLine.descripcionErrorRegistro,
+      csv: recordCsv,
+      refExterna: matchedLine.refExterna || recRefExterna,
+      registroDuplicado: matchedLine.registroDuplicado,
+      esReintentable,
+      requiereSubsanacion
+    };
+  });
 }

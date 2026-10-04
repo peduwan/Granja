@@ -27,13 +27,19 @@ import path from 'node:path';
 import {
   FiscalRecord,
   FiscalSubmission,
+  FiscalRecordSubmissionResult,
   FiscalConfiguration,
   FiscalEvent,
   FiscalActor
 } from './types';
 import { transitionSubmissionStatus, createFiscalSubmission } from './submissionService';
-import { parseAeatXmlResponse, AeatParsedResponse } from './aeatResponseParser';
-import { MockAeatTransport, MockScenario } from './mockAeatTransport';
+import {
+  parseAeatXmlResponse,
+  correlateAeatResponseWithRecords,
+  getRecordCanonicalNumSerie,
+  AeatParsedResponse
+} from './aeatResponseParser';
+import { MockAeatTransport, MockScenario, MockRecordLineSpec } from './mockAeatTransport';
 import { AeatCertificateProvider } from './aeatCertificateProvider';
 import { validateAeatXmlAgainstXsd } from './aeatXsdValidatorNode';
 import {
@@ -506,6 +512,7 @@ export interface AeatTransportOptions {
   readonly transportMode?: 'mock' | 'real';
   readonly mockScenario?: MockScenario;
   readonly mockTiempoEsperaEnvio?: number;
+  readonly mockLineOverrides?: Record<string, Partial<MockRecordLineSpec>>;
   readonly actor?: FiscalActor;
   readonly timeoutMs?: number;
   readonly endpointOverride?: string;
@@ -541,6 +548,7 @@ export async function executeWithAeatLock<T>(
 export interface AeatTransportResult {
   readonly submission: FiscalSubmission;
   readonly fiscalEvent: FiscalEvent;
+  readonly resultadosIndividuales?: ReadonlyArray<FiscalRecordSubmissionResult>;
   readonly isTechnicalError: boolean;
   readonly parsedResponse?: AeatParsedResponse;
   readonly httpStatus?: number;
@@ -603,20 +611,39 @@ function createTransportFiscalEvent(params: {
 }
 
 /**
- * Ejecuta la remisión oficial a los servicios web de la AEAT manteniendo intacto el FiscalRecord.
+ * Ejecuta la remisión oficial a los servicios web de la AEAT para 1 a 1000 registros fiscales,
+ * manteniendo intactos todos los FiscalRecord.
  *
  * Ciclo de vida estricto:
- * PENDING -> SENDING -> (ACCEPTED | ACCEPTED_WITH_ERRORS | REJECTED | FAILED_TECHNICAL)
+ * PENDING -> SENDING -> (ACCEPTED | ACCEPTED_WITH_ERRORS | PARTIALLY_ACCEPTED | REJECTED | FAILED_TECHNICAL)
  */
 export async function executeAeatSubmission(params: {
   submission: FiscalSubmission;
-  fiscalRecord: FiscalRecord;
+  fiscalRecord?: FiscalRecord | ReadonlyArray<FiscalRecord>;
+  fiscalRecords?: ReadonlyArray<FiscalRecord>;
   config: FiscalConfiguration;
   options?: AeatTransportOptions;
 }): Promise<AeatTransportResult> {
-  const { submission, fiscalRecord, config, options } = params;
+  const { submission, config, options } = params;
+  const records: ReadonlyArray<FiscalRecord> = Array.isArray(params.fiscalRecords)
+    ? params.fiscalRecords
+    : Array.isArray(params.fiscalRecord)
+      ? params.fiscalRecord
+      : params.fiscalRecord && typeof params.fiscalRecord === 'object'
+        ? [params.fiscalRecord as FiscalRecord]
+        : [];
 
   // 1. Verificación previa de inmutabilidad e integridad
+  if (records.length === 0) {
+    throw new Error('executeAeatSubmission: Se requiere un FiscalRecord válido o un lote de FiscalRecords (1 a 1000).');
+  }
+  if (records.length > MAX_AEAT_RECORDS_PER_SUBMISSION) {
+    throw new Error(
+      `executeAeatSubmission: El lote excede el máximo normativo AEAT de ${MAX_AEAT_RECORDS_PER_SUBMISSION} registros por petición SOAP (recibidos: ${records.length}).`
+    );
+  }
+
+  const fiscalRecord = records[0];
   if (!fiscalRecord || typeof fiscalRecord !== 'object') {
     throw new Error('executeAeatSubmission: Se requiere un FiscalRecord válido.');
   }
@@ -626,6 +653,29 @@ export async function executeAeatSubmission(params: {
   if (fiscalRecord.id !== submission.fiscalRecordId) {
     throw new Error(`executeAeatSubmission: Incoherencia crítica. La submission (${submission.fiscalRecordId}) no coincide con el FiscalRecord (${fiscalRecord.id}).`);
   }
+
+  if (Array.isArray(submission.fiscalRecordIds) && submission.fiscalRecordIds.length > 0) {
+    if (submission.fiscalRecordIds.length !== records.length) {
+      throw new Error(
+        `executeAeatSubmission: Incoherencia de lote. La submission contiene ${submission.fiscalRecordIds.length} registros pero se proporcionaron ${records.length} FiscalRecords.`
+      );
+    }
+    for (let i = 0; i < records.length; i++) {
+      if (records[i].id !== submission.fiscalRecordIds[i]) {
+        throw new Error(
+          `executeAeatSubmission: Incoherencia de orden en lote en índice ${i}. Esperado '${submission.fiscalRecordIds[i]}', recibido '${records[i].id}'.`
+        );
+      }
+      if (records[i].obligadoTributarioId !== fiscalRecord.obligadoTributarioId) {
+        throw new Error(
+          `executeAeatSubmission: Prohibido mezclar obligados tributarios en un mismo lote ('${fiscalRecord.obligadoTributarioId}' vs '${records[i].obligadoTributarioId}').`
+        );
+      }
+    }
+  }
+
+  const allRecordIds = records.map(r => r.id);
+  const allInvoiceNumbers = records.map(r => getRecordCanonicalNumSerie(r));
 
   // Validación temprana de seguridad de destino: prohibido desviar tráfico hacia hosts ajenos a AEAT
   if (options?.endpointOverride) {
@@ -644,12 +694,12 @@ export async function executeAeatSubmission(params: {
   }
 
   // Comprobación de XML oficial: no enviar sin XML oficial sellado
-  const xmlParaEnvio = submission.xmlEnviado || fiscalRecord.xmlOficial;
+  const xmlParaEnvio = submission.xmlEnviado || (records.length === 1 ? fiscalRecord.xmlOficial : undefined);
   if (!xmlParaEnvio || xmlParaEnvio === '<pending_xml/>' || xmlParaEnvio.trim() === '') {
     throw new Error('executeAeatSubmission: No se permite enviar un registro sin XML oficial sellado.');
   }
 
-  // Validación reglamentaria XSD previa al envío a AEAT (Fase 3.1.4)
+  // Validación reglamentaria XSD previa al envío a AEAT (Fase 3.1.4 / 4.1)
   const xsdReport = validateAeatXmlAgainstXsd(xmlParaEnvio);
   if (!xsdReport.valid) {
     createTransportFiscalEvent({
@@ -659,7 +709,7 @@ export async function executeAeatSubmission(params: {
       numeroFactura: fiscalRecord.factura.numeroFactura,
       actor: options?.actor || { tipo: 'SYSTEM', nombre: 'AeatTransportService' },
       descripcion: `Validación formal XSD previa al envío fallida: ${xsdReport.errors.join('; ')}`,
-      datos: { errors: xsdReport.errors }
+      datos: { errors: xsdReport.errors, fiscalRecordIds: allRecordIds, cantidadRegistros: records.length }
     });
     throw new Error(`executeAeatSubmission: Validación formal XSD fallida previa al envío a AEAT: ${xsdReport.errors.join('; ')}`);
   }
@@ -713,11 +763,17 @@ export async function executeAeatSubmission(params: {
       fiscalRecordId: fiscalRecord.id,
       numeroFactura: fiscalRecord.factura.numeroFactura,
       actor,
-      descripcion: `Inicio de remisión intento #${submission.numeroIntento} a la sede electrónica de la AEAT`,
+      descripcion: records.length > 1
+        ? `Inicio de remisión de lote (${records.length} registros) intento #${submission.numeroIntento} a la sede electrónica de la AEAT`
+        : `Inicio de remisión intento #${submission.numeroIntento} a la sede electrónica de la AEAT`,
       datos: {
         submissionId: submission.id,
         numeroIntento: submission.numeroIntento,
-        endpoint: submission.endpoint
+        endpoint: submission.endpoint,
+        esBatch: records.length > 1,
+        cantidadRegistros: records.length,
+        fiscalRecordIds: allRecordIds,
+        numerosFactura: allInvoiceNumbers
       }
     });
 
@@ -750,12 +806,30 @@ export async function executeAeatSubmission(params: {
       let responseText = '';
 
       if (isMock) {
-        // Ejecución mediante Mock oficial de transporte
+        const mockRecords: MockRecordLineSpec[] = records.map(r => {
+          const numSerie = getRecordCanonicalNumSerie(r);
+          const override = options?.mockLineOverrides?.[r.id] || options?.mockLineOverrides?.[numSerie] || {};
+          return {
+            nifEmisor: r.emisor.nif,
+            numSerie,
+            fechaExpedicion: r.tipoRegistro === 'anulacion' && r.datosAnulacion
+              ? r.datosAnulacion.fechaExpedicionFacturaAnulada
+              : r.factura.fechaExpedicion,
+            operacion: r.tipoRegistro === 'anulacion' ? 'Anulacion' : 'Alta',
+            ...override
+          };
+        });
+
+        // Ejecución mediante Mock oficial de transporte (soporta 1..1000 registros)
         const mockResult = await MockAeatTransport.execute(options?.mockScenario, {
           nifEmisor: fiscalRecord.emisor.nif,
-          numSerie: fiscalRecord.factura.numeroFactura,
-          fechaExpedicion: fiscalRecord.factura.fechaExpedicion,
-          tiempoEsperaEnvio: options?.mockTiempoEsperaEnvio
+          numSerie: getRecordCanonicalNumSerie(fiscalRecord),
+          fechaExpedicion: fiscalRecord.tipoRegistro === 'anulacion' && fiscalRecord.datosAnulacion
+            ? fiscalRecord.datosAnulacion.fechaExpedicionFacturaAnulada
+            : fiscalRecord.factura.fechaExpedicion,
+          operacion: fiscalRecord.tipoRegistro === 'anulacion' ? 'Anulacion' : 'Alta',
+          tiempoEsperaEnvio: options?.mockTiempoEsperaEnvio,
+          records: mockRecords
         });
         httpStatus = mockResult.status;
         responseText = mockResult.text;
@@ -879,12 +953,19 @@ export async function executeAeatSubmission(params: {
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
           descripcion: `Fallo técnico en remisión AEAT (HTTP ${httpStatus}): ${descripcionError}`,
-          datos: { httpStatus, codigo: soapFaultCode, tiempoRespuestaMs: durationMs }
+          datos: {
+            httpStatus,
+            codigo: soapFaultCode,
+            tiempoRespuestaMs: durationMs,
+            fiscalRecordIds: allRecordIds,
+            cantidadRegistros: records.length
+          }
         });
 
         return {
           submission: failedSub,
           fiscalEvent: failureEvent,
+          resultadosIndividuales: failedSub.resultadosIndividuales,
           isTechnicalError: true,
           parsedResponse: parsedFault,
           httpStatus,
@@ -917,12 +998,18 @@ export async function executeAeatSubmission(params: {
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
           descripcion: `Fallo técnico: La respuesta de la AEAT no tiene formato XML válido`,
-          datos: { error: parseErrorMsg, httpStatus }
+          datos: {
+            error: parseErrorMsg,
+            httpStatus,
+            fiscalRecordIds: allRecordIds,
+            cantidadRegistros: records.length
+          }
         });
 
         return {
           submission: failedSub,
           fiscalEvent: failureEvent,
+          resultadosIndividuales: failedSub.resultadosIndividuales,
           isTechnicalError: true,
           httpStatus,
           errorDetails: {
@@ -949,12 +1036,17 @@ export async function executeAeatSubmission(params: {
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
           descripcion: `SOAP Fault de infraestructura AEAT: ${parsed.fault.faultstring}`,
-          datos: { fault: parsed.fault }
+          datos: {
+            fault: parsed.fault,
+            fiscalRecordIds: allRecordIds,
+            cantidadRegistros: records.length
+          }
         });
 
         return {
           submission: failedSub,
           fiscalEvent: faultEvent,
+          resultadosIndividuales: failedSub.resultadosIndividuales,
           isTechnicalError: true,
           parsedResponse: parsed,
           httpStatus,
@@ -975,12 +1067,19 @@ export async function executeAeatSubmission(params: {
         );
       }
 
+      // Correlacionar cada RespuestaLinea con el FiscalRecord individual correspondiente
+      const resultadosIndividuales = correlateAeatResponseWithRecords(parsed, records);
+
       if (parsed.mappedSubmissionStatus === 'ACCEPTED') {
         const acceptedSub = transitionSubmissionStatus(sendingSubmission, 'ACCEPTED', {
           httpStatus,
           csv: parsed.csv,
+          estadoEnvioAeat: parsed.estadoEnvio,
+          resultadosIndividuales,
           codigoAeat: '0',
-          descripcion: 'Aceptado por AEAT',
+          descripcion: records.length > 1
+            ? `Lote de ${records.length} registros aceptado íntegramente por AEAT`
+            : 'Aceptado por AEAT',
           tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
           xmlRespuesta: responseText,
           tiempoRespuestaMs: durationMs
@@ -992,13 +1091,24 @@ export async function executeAeatSubmission(params: {
           fiscalRecordId: fiscalRecord.id,
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
-          descripcion: `Factura ${fiscalRecord.factura.numeroFactura} aceptada formalmente por AEAT. CSV: ${parsed.csv || 'N/A'}`,
-          datos: { csv: parsed.csv, tiempoRespuestaMs: durationMs, tiempoEsperaEnvio: parsed.tiempoEsperaEnvio }
+          descripcion: records.length > 1
+            ? `Lote de ${records.length} registros aceptado formalmente por AEAT. CSV: ${parsed.csv || 'N/A'}`
+            : `Factura ${fiscalRecord.factura.numeroFactura} aceptada formalmente por AEAT. CSV: ${parsed.csv || 'N/A'}`,
+          datos: {
+            csv: parsed.csv,
+            tiempoRespuestaMs: durationMs,
+            tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
+            esBatch: records.length > 1,
+            cantidadRegistros: records.length,
+            fiscalRecordIds: allRecordIds,
+            resultadosIndividuales
+          }
         });
 
         return {
           submission: acceptedSub,
           fiscalEvent: event,
+          resultadosIndividuales,
           isTechnicalError: false,
           parsedResponse: parsed,
           httpStatus
@@ -1009,6 +1119,8 @@ export async function executeAeatSubmission(params: {
         const warningSub = transitionSubmissionStatus(sendingSubmission, 'ACCEPTED_WITH_ERRORS', {
           httpStatus,
           csv: parsed.csv,
+          estadoEnvioAeat: parsed.estadoEnvio,
+          resultadosIndividuales,
           codigoAeat: parsed.avisos[0]?.codigo || 'AVISO_AEAT',
           descripcion: parsed.avisos[0]?.descripcion || 'Aceptado con advertencias no bloqueantes',
           avisos: parsed.avisos,
@@ -1023,25 +1135,91 @@ export async function executeAeatSubmission(params: {
           fiscalRecordId: fiscalRecord.id,
           numeroFactura: fiscalRecord.factura.numeroFactura,
           actor,
-          descripcion: `Factura ${fiscalRecord.factura.numeroFactura} aceptada con advertencias por AEAT. CSV: ${parsed.csv || 'N/A'}`,
-          datos: { csv: parsed.csv, avisos: parsed.avisos, tiempoEsperaEnvio: parsed.tiempoEsperaEnvio }
+          descripcion: records.length > 1
+            ? `Lote de ${records.length} registros aceptado con advertencias por AEAT. CSV: ${parsed.csv || 'N/A'}`
+            : `Factura ${fiscalRecord.factura.numeroFactura} aceptada con advertencias por AEAT. CSV: ${parsed.csv || 'N/A'}`,
+          datos: {
+            csv: parsed.csv,
+            avisos: parsed.avisos,
+            tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
+            esBatch: records.length > 1,
+            cantidadRegistros: records.length,
+            fiscalRecordIds: allRecordIds,
+            resultadosIndividuales
+          }
         });
 
         return {
           submission: warningSub,
           fiscalEvent: event,
+          resultadosIndividuales,
           isTechnicalError: false,
           parsedResponse: parsed,
           httpStatus
         };
       }
 
-      // Caso REJECTED (Rechazo funcional)
+      if (parsed.mappedSubmissionStatus === 'PARTIALLY_ACCEPTED') {
+        const acceptedCount = resultadosIndividuales.filter(
+          r => r.estado === 'ACCEPTED' || r.estado === 'ACCEPTED_WITH_ERRORS'
+        ).length;
+        const rejectedCount = resultadosIndividuales.filter(r => r.estado === 'REJECTED').length;
+        const errCode = parsed.errores[0]?.codigo || 'PARCIALMENTE_CORRECTO';
+        const errDesc = `Lote parcialmente aceptado por AEAT (${acceptedCount} aceptados, ${rejectedCount} rechazados de ${records.length})`;
+
+        const partialSub = transitionSubmissionStatus(sendingSubmission, 'PARTIALLY_ACCEPTED', {
+          httpStatus,
+          csv: parsed.csv,
+          estadoEnvioAeat: parsed.estadoEnvio,
+          resultadosIndividuales,
+          codigoAeat: errCode,
+          descripcion: errDesc,
+          avisos: parsed.avisos,
+          errores: parsed.errores,
+          tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
+          xmlRespuesta: responseText,
+          tiempoRespuestaMs: durationMs
+        });
+
+        const partialEvent = createTransportFiscalEvent({
+          obligadoTributarioId: fiscalRecord.obligadoTributarioId,
+          tipo: 'ENVIO_AEAT_PARCIALMENTE_ACEPTADO',
+          fiscalRecordId: fiscalRecord.id,
+          numeroFactura: fiscalRecord.factura.numeroFactura,
+          actor,
+          descripcion: `${errDesc}. CSV: ${parsed.csv || 'N/A'}`,
+          datos: {
+            csv: parsed.csv,
+            acceptedCount,
+            rejectedCount,
+            avisos: parsed.avisos,
+            errores: parsed.errores,
+            tiempoEsperaEnvio: parsed.tiempoEsperaEnvio,
+            esBatch: records.length > 1,
+            cantidadRegistros: records.length,
+            fiscalRecordIds: allRecordIds,
+            resultadosIndividuales
+          }
+        });
+
+        return {
+          submission: partialSub,
+          fiscalEvent: partialEvent,
+          resultadosIndividuales,
+          isTechnicalError: false,
+          parsedResponse: parsed,
+          httpStatus
+        };
+      }
+
+      // Caso REJECTED (Rechazo funcional íntegro)
       const errCode = parsed.errores[0]?.codigo || '1100';
       const errDesc = parsed.errores[0]?.descripcion || 'Rechazo funcional por la AEAT';
 
       const rejectedSub = transitionSubmissionStatus(sendingSubmission, 'REJECTED', {
         httpStatus,
+        estadoEnvioAeat: parsed.estadoEnvio,
+        resultadosIndividuales,
         codigoAeat: errCode,
         descripcion: errDesc,
         errores: parsed.errores,
@@ -1056,13 +1234,23 @@ export async function executeAeatSubmission(params: {
         fiscalRecordId: fiscalRecord.id,
         numeroFactura: fiscalRecord.factura.numeroFactura,
         actor,
-        descripcion: `Factura ${fiscalRecord.factura.numeroFactura} rechazada por la AEAT: [${errCode}] ${errDesc}`,
-        datos: { codigo: errCode, errores: parsed.errores }
+        descripcion: records.length > 1
+          ? `Lote de ${records.length} registros rechazado funcionalmente por la AEAT: [${errCode}] ${errDesc}`
+          : `Factura ${fiscalRecord.factura.numeroFactura} rechazada por la AEAT: [${errCode}] ${errDesc}`,
+        datos: {
+          codigo: errCode,
+          errores: parsed.errores,
+          esBatch: records.length > 1,
+          cantidadRegistros: records.length,
+          fiscalRecordIds: allRecordIds,
+          resultadosIndividuales
+        }
       });
 
       return {
         submission: rejectedSub,
         fiscalEvent: rejectEvent,
+        resultadosIndividuales,
         isTechnicalError: false,
         parsedResponse: parsed,
         httpStatus,
@@ -1091,12 +1279,20 @@ export async function executeAeatSubmission(params: {
         numeroFactura: fiscalRecord.factura.numeroFactura,
         actor,
         descripcion: `Fallo técnico de conexión con AEAT: ${errorMessage}`,
-        datos: { code: errorCode, message: errorMessage, durationMs }
+        datos: {
+          code: errorCode,
+          message: errorMessage,
+          durationMs,
+          esBatch: records.length > 1,
+          cantidadRegistros: records.length,
+          fiscalRecordIds: allRecordIds
+        }
       });
 
       return {
         submission: failedSub,
         fiscalEvent: errorEvent,
+        resultadosIndividuales: failedSub.resultadosIndividuales,
         isTechnicalError: true,
         errorDetails: {
           code: errorCode,
@@ -1118,8 +1314,12 @@ export function isRetryableSubmission(
   submission: FiscalSubmission,
   parsedResponse?: AeatParsedResponse
 ): boolean {
-  if (submission.estado === 'ACCEPTED' || submission.estado === 'ACCEPTED_WITH_ERRORS') {
-    return false; // Ya admitido por la AEAT
+  if (
+    submission.estado === 'ACCEPTED' ||
+    submission.estado === 'ACCEPTED_WITH_ERRORS' ||
+    submission.estado === 'PARTIALLY_ACCEPTED'
+  ) {
+    return false; // Ya admitido total o parcialmente por la AEAT (los registros aceptados no deben reenviarse)
   }
   if (submission.estado === 'REJECTED') {
     return false; // Rechazo funcional por la AEAT: requiere subsanación, nunca reintento ciego
@@ -1193,18 +1393,28 @@ export function scheduleSubmissionRetry(
 
 /**
  * Crea una nueva sumisión (intento independiente en el Outbox) tras un error técnico,
- * incrementando el número de intento y dejando el FiscalRecord sellado 100% inalterado.
+ * incrementando el número de intento y dejando los FiscalRecord sellados 100% inalterados.
  */
 export function createRetrySubmission(params: {
   previousSubmission: FiscalSubmission;
-  fiscalRecord: FiscalRecord;
+  fiscalRecord?: FiscalRecord | ReadonlyArray<FiscalRecord>;
+  fiscalRecords?: ReadonlyArray<FiscalRecord>;
   config: FiscalConfiguration;
   parsedResponse?: AeatParsedResponse;
 }): FiscalSubmission {
-  const { previousSubmission, fiscalRecord, config, parsedResponse } = params;
+  const { previousSubmission, config, parsedResponse } = params;
+  const targetRecords = params.fiscalRecords || params.fiscalRecord;
 
-  if (previousSubmission.estado === 'ACCEPTED' || previousSubmission.estado === 'ACCEPTED_WITH_ERRORS') {
-    throw new Error('createRetrySubmission: No se puede reintentar una sumisión ya aceptada por la AEAT.');
+  if (!targetRecords) {
+    throw new Error('createRetrySubmission: Se requiere fiscalRecord o fiscalRecords.');
+  }
+
+  if (
+    previousSubmission.estado === 'ACCEPTED' ||
+    previousSubmission.estado === 'ACCEPTED_WITH_ERRORS' ||
+    previousSubmission.estado === 'PARTIALLY_ACCEPTED'
+  ) {
+    throw new Error('createRetrySubmission: No se puede reintentar una sumisión ya aceptada total o parcialmente por la AEAT.');
   }
 
   if (previousSubmission.estado === 'REJECTED') {
@@ -1219,7 +1429,7 @@ export function createRetrySubmission(params: {
     throw new Error(`createRetrySubmission: La sumisión previa no es reintentable (${previousSubmission.codigoAeat || 'Error no reintentable'}).`);
   }
 
-  return createFiscalSubmission(fiscalRecord, config, {
+  return createFiscalSubmission(targetRecords, config, {
     numeroIntento: previousSubmission.numeroIntento + 1,
     xmlEnviado: previousSubmission.xmlEnviado,
     endpoint: previousSubmission.endpoint

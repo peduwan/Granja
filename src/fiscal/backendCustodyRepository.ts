@@ -587,12 +587,17 @@ export class BackendFiscalCustody {
 
   /**
    * Obtiene las sumisiones registradas en el backend.
+   * Soporta búsqueda tanto por fiscalRecordId principal como por inclusión en lotes (fiscalRecordIds / resultadosIndividuales).
    */
   public static getFiscalSubmissions(fiscalRecordId?: string): FiscalSubmission[] {
     this.init();
     loadFromDisk();
     if (fiscalRecordId) {
-      return submissionsCache.filter(s => s.fiscalRecordId === fiscalRecordId);
+      return submissionsCache.filter(s =>
+        s.fiscalRecordId === fiscalRecordId ||
+        (Array.isArray(s.fiscalRecordIds) && s.fiscalRecordIds.includes(fiscalRecordId)) ||
+        (Array.isArray(s.resultadosIndividuales) && s.resultadosIndividuales.some(r => r.fiscalRecordId === fiscalRecordId))
+      );
     }
     return [...submissionsCache];
   }
@@ -650,12 +655,16 @@ export class BackendFiscalCustody {
 
   /**
    * Obtiene los eventos de auditoría.
+   * Soporta búsqueda por fiscalRecordId directo o incluido dentro de datos.fiscalRecordIds (lotes).
    */
   public static getFiscalEvents(fiscalRecordId?: string): FiscalEvent[] {
     this.init();
     loadFromDisk();
     if (fiscalRecordId) {
-      return eventsCache.filter(e => e.fiscalRecordId === fiscalRecordId);
+      return eventsCache.filter(e =>
+        e.fiscalRecordId === fiscalRecordId ||
+        (Array.isArray(e.datos?.fiscalRecordIds) && e.datos.fiscalRecordIds.includes(fiscalRecordId))
+      );
     }
     return [...eventsCache];
   }
