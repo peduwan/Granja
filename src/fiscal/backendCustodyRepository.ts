@@ -857,6 +857,54 @@ export class BackendFiscalCustody {
   }
 
   /**
+   * Calcula de forma determinista y autoritativa el siguiente número de factura rectificativa
+   * (serie R-YYYY-NNN) a partir del conjunto autoritativo de registros custodiados del obligado.
+   */
+  public static computeNextRectificativaNumber(
+    records: ReadonlyArray<FiscalRecord>,
+    fechaExpedicion?: string
+  ): string {
+    let year = new Date().getFullYear();
+    if (fechaExpedicion) {
+      const isoMatch = fechaExpedicion.match(/^(\d{4})-\d{2}-\d{2}$/);
+      const ddmmyyyyMatch = fechaExpedicion.match(/^\d{2}-\d{2}-(\d{4})$/);
+      if (isoMatch) {
+        year = parseInt(isoMatch[1], 10);
+      } else if (ddmmyyyyMatch) {
+        year = parseInt(ddmmyyyyMatch[1], 10);
+      }
+    }
+
+    const prefix = `R-${year}-`;
+    let maxSeq = 0;
+
+    for (const r of records) {
+      const numSerie = r.factura?.numeroFactura || '';
+      if (r.tipoRegistro === 'alta' && numSerie.startsWith(prefix)) {
+        const suffix = numSerie.slice(prefix.length);
+        const num = parseInt(suffix, 10);
+        if (!isNaN(num) && num > maxSeq) {
+          maxSeq = num;
+        }
+      }
+    }
+
+    return `${prefix}${String(maxSeq + 1).padStart(4, '0')}`;
+  }
+
+  /**
+   * Obtiene el siguiente número de factura rectificativa consultando la autoridad (Firestore/Custodia).
+   */
+  public static async getNextRectificativaNumeroAsync(
+    obligadoTributarioId: string,
+    fechaExpedicion?: string
+  ): Promise<string> {
+    const cleanObligado = obligadoTributarioId.trim().toUpperCase();
+    const records = await this.getAllFiscalRecordsByObligadoAsync(cleanObligado);
+    return this.computeNextRectificativaNumber(records, fechaExpedicion);
+  }
+
+  /**
    * Reinicia la custodia en memoria y en disco (exclusivo para testing).
    */
   public static resetCustody(): void {

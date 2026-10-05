@@ -559,10 +559,28 @@ export function buildRegistroAltaXml(record: FiscalRecord): string {
       if (record.datosRectificativa.facturasRectificadas.length > 1000) {
         throw new Error('buildRegistroAltaXml: FacturasRectificadas supera el máximo de 1000 elementos.');
       }
+      const seenFrKeys = new Set<string>();
       lines.push('      <sf:FacturasRectificadas>');
       for (const fr of record.datosRectificativa.facturasRectificadas) {
         const frEmisor = fr.idEmisorFactura ? validateNif(fr.idEmisorFactura, 'FacturaRectificada.IDEmisorFactura') : emisorNif;
+        if (frEmisor.toUpperCase() !== emisorNif.toUpperCase()) {
+          throw new Error(
+            `buildRegistroAltaXml: FacturaRectificada.IDEmisorFactura ('${frEmisor}') debe coincidir con el NIF del obligado emisor ('${emisorNif}').`
+          );
+        }
         const frNum = validateRequiredString(fr.numeroFactura, 'FacturaRectificada.NumSerieFactura', 60);
+        if (record.factura.subsanacion !== 'S' && frNum.toUpperCase() === numeroFactura.toUpperCase()) {
+          throw new Error(
+            `buildRegistroAltaXml: La factura rectificativa ('${numeroFactura}') no puede rectificarse a sí misma en FacturasRectificadas.`
+          );
+        }
+        const frKey = `${frEmisor.toUpperCase()}::${frNum.toUpperCase()}`;
+        if (seenFrKeys.has(frKey)) {
+          throw new Error(
+            `buildRegistroAltaXml: Factura rectificada duplicada ('${frNum}') en el bloque <sf:FacturasRectificadas>.`
+          );
+        }
+        seenFrKeys.add(frKey);
         const frFecha = formatFechaExpedicionFiscal(fr.fechaExpedicion);
         lines.push('        <sf:IDFacturaRectificada>');
         lines.push(`          <sf:IDEmisorFactura>${escapeXml(frEmisor)}</sf:IDEmisorFactura>`);

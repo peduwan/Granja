@@ -391,20 +391,25 @@ export default function App() {
     });
   };
 
-  // Factura Rectificativa (FASE 1.3: Emisión fiscal centralizada)
+  // Factura Rectificativa (FASE 1.3: Emisión fiscal centralizada con numeración autoritativa de backend)
   const handleAddFacturaRectificativa = (
     nuevaRectificativa: Factura,
     reingresarStock: boolean,
     nuevoFiscalRecordRef: FiscalRecordRef
   ) => {
+    const facturaSellada: Factura = {
+      ...nuevaRectificativa,
+      numeroFactura: nuevoFiscalRecordRef.numeroFactura || nuevaRectificativa.numeroFactura,
+    };
+
     setData(prev => {
       // 1. Marcar la factura original como rectificada
       const updatedFacturas = prev.facturas.map(f => {
-        if (f.id === nuevaRectificativa.facturaRectificadaId) {
+        if (f.id === facturaSellada.facturaRectificadaId) {
           return {
             ...f,
             estadoRectificacion: 'rectificada_total' as const,
-            rectificadaPorNumero: nuevaRectificativa.numeroFactura
+            rectificadaPorNumero: facturaSellada.numeroFactura
           };
         }
         return f;
@@ -412,9 +417,9 @@ export default function App() {
 
       // 2. Si se solicitó reingresar estuches al almacén por devolución o anulación
       let updatedLotesEnvasados = prev.lotesEnvasados;
-      if (reingresarStock && nuevaRectificativa.lineas) {
+      if (reingresarStock && facturaSellada.lineas) {
         const restitucion: Record<string, number> = {};
-        nuevaRectificativa.lineas.forEach(l => {
+        facturaSellada.lineas.forEach(l => {
           if (l.loteEnvasadoId && l.cantidadEstuches) {
             restitucion[l.loteEnvasadoId] = (restitucion[l.loteEnvasadoId] || 0) + Math.abs(l.cantidadEstuches);
           }
@@ -435,7 +440,7 @@ export default function App() {
       return {
         ...prev,
         lotesEnvasados: updatedLotesEnvasados,
-        facturas: [nuevaRectificativa, ...updatedFacturas],
+        facturas: [facturaSellada, ...updatedFacturas],
         fiscalRecordRefs: [nuevoFiscalRecordRef, ...(prev.fiscalRecordRefs || [])],
         config: {
           ...prev.config,

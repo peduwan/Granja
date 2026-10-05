@@ -216,7 +216,9 @@ export function validateXmlAgainstOfficialXsd(
   }
 
   const schemaPath = xsdFilePath
-    ? path.resolve(xsdFilePath)
+    ? (xsdFilePath === 'RESPUESTA'
+        ? path.join(path.dirname(resolveDefaultOfficialXsdPath()), 'RespuestaSuministro.xsd')
+        : path.resolve(xsdFilePath))
     : resolveDefaultOfficialXsdPath();
 
   if (!fs.existsSync(schemaPath)) {
@@ -295,14 +297,16 @@ export function validateXmlAgainstOfficialXsd(
     return xsdReport;
   }
 
-  // Aplicar reglas semánticas cruzadas adicionales de VERI*FACTU sobre el XML ya validado por XSD
-  const crossFieldErrors = validateAeatCrossFieldRules(xmlString);
-  if (crossFieldErrors.length > 0) {
-    return {
-      valid: false,
-      errors: crossFieldErrors,
-      engine: xsdReport.engine || 'libxml2-wasm'
-    };
+  // Aplicar reglas semánticas cruzadas adicionales de VERI*FACTU sobre el XML de Suministro ya validado por XSD
+  if (path.basename(schemaPath) !== 'RespuestaSuministro.xsd') {
+    const crossFieldErrors = validateAeatCrossFieldRules(xmlString);
+    if (crossFieldErrors.length > 0) {
+      return {
+        valid: false,
+        errors: crossFieldErrors,
+        engine: xsdReport.engine || 'libxml2-wasm'
+      };
+    }
   }
 
   return {

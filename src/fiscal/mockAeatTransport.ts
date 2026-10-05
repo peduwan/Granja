@@ -79,6 +79,15 @@ export class MockAeatTransport {
     this.globalTiempoEsperaEnvio = 60;
   }
 
+  private static formatDateToAeatPattern(dateStr: string): string {
+    const trimmed = (dateStr || '').trim();
+    const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (isoMatch) {
+      return `${isoMatch[3]}-${isoMatch[2]}-${isoMatch[1]}`;
+    }
+    return trimmed;
+  }
+
   private static renderRespuestaLineaXml(line: {
     nifEmisor: string;
     numSerie: string;
@@ -92,6 +101,7 @@ export class MockAeatTransport {
       estadoRegistroDuplicado: 'Correcta' | 'AceptadaConErrores' | 'Anulada';
     };
   }): string {
+    const fechaResp = this.formatDateToAeatPattern(line.fechaExpedicion);
     const errorTags = line.codigoError
       ? `\n        <sfR:CodigoErrorRegistro>${line.codigoError}</sfR:CodigoErrorRegistro>\n        <sfR:DescripcionErrorRegistro>${line.descripcionError || 'Error en registro'}</sfR:DescripcionErrorRegistro>`
       : '';
@@ -103,9 +113,11 @@ export class MockAeatTransport {
         <sfR:IDFactura>
           <sf:IDEmisorFactura>${line.nifEmisor}</sf:IDEmisorFactura>
           <sf:NumSerieFactura>${line.numSerie}</sf:NumSerieFactura>
-          <sf:FechaExpedicionFactura>${line.fechaExpedicion}</sf:FechaExpedicionFactura>
+          <sf:FechaExpedicionFactura>${fechaResp}</sf:FechaExpedicionFactura>
         </sfR:IDFactura>
-        <sfR:Operacion>${line.operacion}</sfR:Operacion>
+        <sfR:Operacion>
+          <sf:TipoOperacion>${line.operacion}</sf:TipoOperacion>
+        </sfR:Operacion>
         <sfR:EstadoRegistro>${line.estadoRegistro}</sfR:EstadoRegistro>${errorTags}${dupTags}
       </sfR:RespuestaLinea>`;
   }
@@ -147,7 +159,7 @@ export class MockAeatTransport {
       <sfR:CSV>CSV-AEAT-1234567890ABCDEF</sfR:CSV>
       <sfR:DatosPresentacion>
         <sf:NIFPresentador>${nif}</sf:NIFPresentador>
-        <sf:TimestampPresentacion>${fecha} 10:00:00</sf:TimestampPresentacion>
+        <sf:TimestampPresentacion>2026-10-15T10:00:00+02:00</sf:TimestampPresentacion>
       </sfR:DatosPresentacion>
       <sfR:Cabecera>
         <sf:ObligadoEmision>

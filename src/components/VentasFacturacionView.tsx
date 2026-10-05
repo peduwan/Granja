@@ -1922,7 +1922,7 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
                     </div>
 
                     <p className="text-[10px] text-stone-600 leading-tight">
-                      Este documento ha sido generado por un Sistema Informático de Facturación certificado conforme a la Ley 11/2021 de medidas de prevención del fraude fiscal y la Orden Ministerial HAC/1177/2024.
+                      Este documento ha sido generado por un Sistema Informático de Facturación adaptado a las especificaciones técnicas del RD 1007/2023 (Ley 11/2021) y la Orden Ministerial HAC/1177/2024 (modalidad VERI*FACTU).
                     </p>
 
                     <div className="pt-1 text-[10px] font-mono space-y-0.5 text-stone-700 bg-white p-2 rounded border border-stone-200">

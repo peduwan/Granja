@@ -267,6 +267,7 @@ export interface Factura {
 
   // --- Facturas Rectificativas y Anulaciones Comerciales ---
   esRectificativa?: boolean;
+  numeracionAutoritativaBackend?: boolean;
   facturaRectificadaId?: string;
   facturaRectificadaNumero?: string;
   facturaRectificadaFecha?: string;
@@ -275,6 +276,7 @@ export interface Factura {
     readonly idEmisorFactura?: string;
     readonly numeroFactura: string;
     readonly fechaExpedicion: string;
+    readonly fechaOperacion?: string;
   }>;
   facturasSustituidas?: ReadonlyArray<{
     readonly idFactura?: string;
@@ -292,12 +294,13 @@ export interface Factura {
   cuotaRectificada?: number;
   cuotaRecargoRectificado?: number;
   motivoRectificativa?: string;
-  codigoMotivoRectificativa?: '01' | '02' | '03' | '04' | '05';
+  codigoMotivoRectificativa?: '01' | '02' | '03' | '04' | '05' | '06';
   descripcionOperacion?: string;
   fechaOperacion?: string;
   refExterna?: string;
   subsanacion?: 'S' | 'N';
   rechazoPrevio?: 'S' | 'N' | 'X';
+  facturaSinIdentifDestinatarioArt61d?: 'S' | 'N';
   clienteIdOtro?: {
     readonly codigoPais?: string;
     readonly idType: '02' | '03' | '04' | '05' | '06' | '07';

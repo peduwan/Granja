@@ -36,11 +36,13 @@ import {
   FiscalRecord
 } from '../src/fiscal/types';
 import {
-  createDefaultFiscalConfiguration
+  createDefaultFiscalConfiguration,
+  createFiscalRecordFromInvoice
 } from '../src/fiscal/modelTransformers';
 import {
   buildRectificativaFacturaFromUiState,
   inferDefaultClaveRectificativa,
+  DEFAULT_MOTIVO_BY_CLAVE,
   ClaveTipoFacturaRectificativaAEAT
 } from '../src/fiscal/rectificativaUiBuilder';
 import {
@@ -67,6 +69,8 @@ import { BackendFiscalCustody } from '../src/fiscal/backendCustodyRepository';
 import { CloudDistributedChainCoordinator } from '../src/fiscal/cloudDistributedChainCoordinator';
 import { resetFiscalOutbox } from '../src/fiscal/submissionService';
 import { AeatFlowControlManager } from '../src/fiscal/aeatTransport';
+import { MockAeatTransport } from '../src/fiscal/mockAeatTransport';
+import { AeatCertificateProvider } from '../src/fiscal/aeatCertificateProvider';
 
 console.log('========================================================================');
 console.log('  EJECUTANDO SUITE E2E: FACTURAS RECTIFICATIVAS Y ANULACIONES (AEAT)');
@@ -477,7 +481,7 @@ async function main() {
           modo: 'rectificacion_parcial',
           tipoRectificativa: mecanismo,
           claveTipoFactura: clave,
-          codigoMotivo: clave === 'R4' ? '05' : '04',
+          codigoMotivo: DEFAULT_MOTIVO_BY_CLAVE[clave],
           motivoTexto: `Rectificación reglamentaria ${clave} (${expectedCode})`,
           lineasEditadas: [
             {
@@ -947,6 +951,525 @@ async function main() {
     // Verificar que el Outbox ya no tiene registros pendientes (todos en estado terminal aceptado)
     const remainingOutbox = await collectEligibleOutboxRecordsForObligado(OBLIGADO_NIF);
     assert.strictEqual(remainingOutbox.totalPendingCount, 0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 9. P1: FECHAOPERACION REGLAMENTARIA EN RECTIFICATIVA SIMPLE Y MÚLTIPLE
+  // ---------------------------------------------------------------------------
+  await runTest("9: [P1] FechaOperacion reglamentaria en rectificativas (única factura con fecha operación distinta y múltiples facturas escogiendo la más reciente)", async () => {
+    await resetTestEnvironment();
+
+    // 9.A: Única factura con fecha expedición 20/10/2026 y fecha operación 05/10/2026
+    const origSingle = createOriginalF1Invoice({
+      id: 'inv-fop-single',
+      numeroFactura: 'FAC-2026-0901',
+      fecha: '2026-10-20',
+      fechaOperacion: '2026-10-05'
+    });
+    const emittedSingleOrig = await emitFiscalInvoice({ invoiceDraft: origSingle, fiscalConfig });
+    assert.strictEqual(emittedSingleOrig.fiscalRecord.factura.fechaOperacion, '2026-10-05');
+
+    // Emitir rectificativa R1 en fecha 25/10/2026 -> FechaOperacion debe ser 05/10/2026
+    const rectSingleDraft = buildRectificativaFacturaFromUiState({
+      facturaOriginal: emittedSingleOrig.invoice,
+      numeroFacturaOverride: 'R-FOP-2026-001',
+      fecha: '2026-10-25',
+      modo: 'anulacion_total',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '01',
+      motivoTexto: 'Rectificación verificando FechaOperacion de factura original (05/10/2026)'
+    });
+    assert.strictEqual(
+      rectSingleDraft.fechaOperacion,
+      '2026-10-05',
+      'La Factura rectificativa debe conservar la FechaOperacion de la operación original (2026-10-05)'
+    );
+
+    const emittedRectSingle = await emitFiscalInvoice({ invoiceDraft: rectSingleDraft, fiscalConfig });
+    assert.strictEqual(emittedRectSingle.fiscalRecord.factura.fechaOperacion, '2026-10-05');
+
+    const xmlSingle = buildAeatVerifactuXml(emittedRectSingle.fiscalRecord);
+    assert.ok(
+      xmlSingle.includes('<sf:FechaOperacion>05-10-2026</sf:FechaOperacion>'),
+      'El XML de la rectificativa debe incluir <sf:FechaOperacion>05-10-2026</sf:FechaOperacion>'
+    );
+    const xsdSingle = validateXmlAgainstOfficialXsd(xmlSingle);
+    assert.strictEqual(xsdSingle.valid, true, `XSD inválido en rectificativa con FechaOperacion: ${xsdSingle.errors.join('; ')}`);
+
+    // 9.B: Múltiples facturas rectificadas:
+    // Factura A -> fecha operación 01/10/2026
+    // Factura B -> fecha operación 15/10/2026 (LA MÁS RECIENTE)
+    // Factura C -> fecha operación 10/10/2026
+    const facA = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-fop-a',
+        numeroFactura: 'FAC-2026-0910',
+        fecha: '2026-10-03',
+        fechaOperacion: '2026-10-01'
+      }),
+      fiscalConfig
+    });
+    const facB = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-fop-b',
+        numeroFactura: 'FAC-2026-0911',
+        fecha: '2026-10-18',
+        fechaOperacion: '2026-10-15'
+      }),
+      fiscalConfig
+    });
+    const facC = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-fop-c',
+        numeroFactura: 'FAC-2026-0912',
+        fecha: '2026-10-12',
+        fechaOperacion: '2026-10-10'
+      }),
+      fiscalConfig
+    });
+
+    const rectMultiDraft = buildRectificativaFacturaFromUiState({
+      facturaOriginal: facA.invoice,
+      facturasAdicionalesRectificadas: [facB.invoice, facC.invoice],
+      numeroFacturaOverride: 'R-FOP-MULTI-001',
+      fecha: '2026-10-28',
+      modo: 'rectificacion_parcial',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '03',
+      motivoTexto: 'Rappel trimestral sobre 3 facturas con selección de FechaOperacion más reciente (15/10/2026)',
+      lineasEditadas: [
+        {
+          ...facA.invoice.lineas[0],
+          id: 'lin-fop-multi',
+          cantidadEstuches: -1,
+          precioUnitario: 150,
+          subtotal: -150
+        }
+      ]
+    });
+
+    assert.strictEqual(
+      rectMultiDraft.fechaOperacion,
+      '2026-10-15',
+      'En rectificativa múltiple, FechaOperacion debe ser la fecha más reciente de las facturas rectificadas (2026-10-15)'
+    );
+
+    const emittedRectMulti = await emitFiscalInvoice({ invoiceDraft: rectMultiDraft, fiscalConfig });
+    assert.strictEqual(emittedRectMulti.fiscalRecord.factura.fechaOperacion, '2026-10-15');
+
+    const xmlMulti = buildAeatVerifactuXml(emittedRectMulti.fiscalRecord);
+    assert.ok(
+      xmlMulti.includes('<sf:FechaOperacion>15-10-2026</sf:FechaOperacion>'),
+      'El XML de la rectificativa múltiple debe incluir <sf:FechaOperacion>15-10-2026</sf:FechaOperacion>'
+    );
+    const xsdMulti = validateXmlAgainstOfficialXsd(xmlMulti);
+    assert.strictEqual(xsdMulti.valid, true, `XSD inválido en rectificativa múltiple: ${xsdMulti.errors.join('; ')}`);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 10. P1: PROTECCIÓN ESTRICTA DE R5 FRENTE A FACTURAS NO SIMPLIFICADAS (F1)
+  // ---------------------------------------------------------------------------
+  await runTest("10: [P1] Prohibición simétrica y estricta de emitir R5 sobre factura ordinaria F1 (con destinatario o Art. 6.1.d) en UI, Transformador y Backend Custody", async () => {
+    await resetTestEnvironment();
+
+    const origF1 = createOriginalF1Invoice({
+      id: 'inv-f1-no-r5',
+      numeroFactura: 'FAC-2026-1001',
+      tipoFactura: 'F1',
+      clienteCif: 'B99887766',
+      clienteNombre: 'Distribuciones Avícolas del Norte S.L.'
+    });
+    const emittedF1 = await emitFiscalInvoice({ invoiceDraft: origF1, fiscalConfig });
+
+    // 10.1: UI Builder rechaza R5 sobre una factura F1 con destinatario
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: emittedF1.invoice,
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R5',
+          codigoMotivo: '01',
+          motivoTexto: 'Intento ilegal de emitir R5 sobre factura completa F1'
+        }),
+      /Violación normativa AEAT \(R5\)/,
+      'buildRectificativaFacturaFromUiState debe rechazar R5 sobre una factura F1'
+    );
+
+    // 10.2: ModelTransformer rechaza R5 si la factura trae destinatario identificado (clienteCif)
+    assert.throws(
+      () =>
+        createFiscalRecordFromInvoice(
+          {
+            ...emittedF1.invoice,
+            id: 'inv-forged-r5-with-cif',
+            numeroFactura: 'R-FORGED-001',
+            esRectificativa: true,
+            tipoFactura: 'R5',
+            claveTipoFactura: 'R5',
+            tipoRectificativa: 'por_diferencias',
+            claveTipoRectificativa: 'I',
+            facturaRectificadaNumero: emittedF1.invoice.numeroFactura,
+            facturaRectificadaFecha: emittedF1.invoice.fecha
+          },
+          fiscalConfig,
+          emittedF1.fiscalRecord
+        ),
+      /Violación normativa AEAT \(R5\)/,
+      'createFiscalRecordFromInvoice debe rechazar R5 con NIF de destinatario'
+    );
+
+    // 10.3: EmissionService (Custodia Backend) rechaza R5 sobre FAC-2026-1001 aunque el payload omita el NIF del cliente
+    await assert.rejects(
+      async () => {
+        await emitFiscalInvoice({
+          invoiceDraft: {
+            ...emittedF1.invoice,
+            id: 'inv-forged-r5-no-cif',
+            numeroFactura: 'R-FORGED-002',
+            clienteCif: '',
+            esRectificativa: true,
+            tipoFactura: 'R5',
+            claveTipoFactura: 'R5',
+            tipoRectificativa: 'por_diferencias',
+            claveTipoRectificativa: 'I',
+            facturaRectificadaNumero: emittedF1.invoice.numeroFactura,
+            facturaRectificadaFecha: emittedF1.invoice.fecha
+          },
+          fiscalConfig
+        });
+      },
+      /RECHAZO_RECTIFICATIVA_R5_ORIGEN_NO_SIMPLIFICADA/,
+      'emitFiscalInvoice debe verificar en custodia que la factura rectificada F1 no puede rectificarse con R5'
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. P1: NUMERACIÓN DE RECTIFICATIVAS BAJO AUTORIDAD BACKEND (SERIE R-YYYY-NNNN)
+  // ---------------------------------------------------------------------------
+  await runTest("11: [P1] Numeración de rectificativas bajo autoridad backend: previene colisiones multi-sesión cuando el cliente tiene estado local desactualizado", async () => {
+    await resetTestEnvironment();
+
+    const orig = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-orig-num-auth',
+        numeroFactura: 'FAC-2026-1100',
+        fecha: '2026-10-10'
+      }),
+      fiscalConfig
+    });
+
+    // Sesión A emite la primera rectificativa sin override manual (existingInvoices vacío) -> Backend asigna R-2026-0001
+    const draft1 = buildRectificativaFacturaFromUiState({
+      facturaOriginal: orig.invoice,
+      existingInvoices: [],
+      fecha: '2026-10-20',
+      modo: 'rectificacion_parcial',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '01',
+      motivoTexto: 'Primera rectificativa desde Sesión A',
+      lineasEditadas: [
+        {
+          ...orig.invoice.lineas[0],
+          id: 'lin-auth-1',
+          cantidadEstuches: -1,
+          precioUnitario: 100,
+          subtotal: -100
+        }
+      ]
+    });
+    assert.strictEqual(draft1.numeracionAutoritativaBackend, true);
+
+    const emitted1 = await emitFiscalInvoice({ invoiceDraft: draft1, fiscalConfig });
+    assert.strictEqual(emitted1.fiscalRecord.factura.numeroFactura, 'R-2026-0001');
+    assert.strictEqual(emitted1.invoice.numeroFactura, 'R-2026-0001');
+
+    // Sesión B tiene estado local obsoleto (existingInvoices: [], por lo que su borrador sugiere de nuevo 'R-2026-0001')
+    const draft2StaleClient = buildRectificativaFacturaFromUiState({
+      facturaOriginal: orig.invoice,
+      existingInvoices: [], // Cliente desincronizado que desconoce R-2026-0001
+      fecha: '2026-10-21',
+      modo: 'rectificacion_parcial',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '02',
+      motivoTexto: 'Segunda rectificativa desde Sesión B con caché local vacía',
+      lineasEditadas: [
+        {
+          ...orig.invoice.lineas[0],
+          id: 'lin-auth-2',
+          cantidadEstuches: -2,
+          precioUnitario: 100,
+          subtotal: -200
+        }
+      ]
+    });
+    // El borrador local calculó R-2026-0001 porque existingInvoices estaba vacío
+    assert.strictEqual(draft2StaleClient.numeroFactura, 'R-2026-0001');
+
+    // Al pasar por emitFiscalInvoice, la autoridad backend detecta R-2026-0001 en custodia y asigna R-2026-0002 bajo lock
+    const emitted2 = await emitFiscalInvoice({ invoiceDraft: draft2StaleClient, fiscalConfig });
+    assert.strictEqual(
+      emitted2.fiscalRecord.factura.numeroFactura,
+      'R-2026-0002',
+      'El backend debe asignar autoritativamente R-2026-0002 evitando la colisión con R-2026-0001'
+    );
+    assert.strictEqual(emitted2.invoice.numeroFactura, 'R-2026-0002');
+    assert.ok(
+      emitted2.fiscalRecord.qr?.url.includes('numserie=R-2026-0002'),
+      'El QR sellado debe contener el número autoritativo asignado por el backend (R-2026-0002)'
+    );
+
+    const hashVerif2 = await verifyFiscalRecordHash(emitted2.fiscalRecord);
+    assert.strictEqual(hashVerif2.valid, true, 'La huella SHA-256 debe haberse calculado con el número autoritativo R-2026-0002');
+
+    // Consultar el siguiente número autoritativo desde BackendFiscalCustody -> R-2026-0003
+    const nextAuthNum = await BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22');
+    assert.strictEqual(nextAuthNum, 'R-2026-0003');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. P2: INTEGRIDAD DE REFERENCIAS RECTIFICADAS Y COHERENCIA CODIGOMOTIVO <-> R1..R4
+  // ---------------------------------------------------------------------------
+  await runTest("12: [P2] Rechazo fail-closed de FacturasRectificadas duplicadas o de otro emisor, y coherencia estricta entre codigoMotivo y R1/R2/R3/R4", async () => {
+    await resetTestEnvironment();
+
+    const orig = createOriginalF1Invoice({
+      id: 'inv-orig-p2',
+      numeroFactura: 'FAC-2026-1201',
+      fecha: '2026-10-10'
+    });
+
+    // 12.1: Factura duplicada en facturasAdicionalesRectificadas -> Rechazo fail-closed
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: orig,
+          facturasAdicionalesRectificadas: [orig], // Duplicada con facturaOriginal
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R1',
+          codigoMotivo: '01',
+          motivoTexto: 'Intento con factura rectificada duplicada'
+        }),
+      /Factura rectificada duplicada/,
+      'Debe rechazar referencias duplicadas dentro de FacturasRectificadas'
+    );
+
+    // 12.2: Factura adicional de otro NIF emisor distinto al obligado tributario -> Rechazo fail-closed
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: orig,
+          facturasAdicionalesRectificadas: [
+            {
+              numeroFactura: 'FAC-OTRO-001',
+              fecha: '2026-10-11',
+              idEmisorFactura: 'B99999999' // Distinto de B12345678
+            }
+          ],
+          nifEmisor: OBLIGADO_NIF,
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R1',
+          codigoMotivo: '01',
+          motivoTexto: 'Intento con factura de otro obligado tributario'
+        }),
+      /Violación de obligado tributario en FacturasRectificadas/,
+      'Debe rechazar facturas rectificadas de otro NIF emisor'
+    );
+
+    // 12.3: Incoherencia entre codigoMotivo y claveTipoFactura:
+    // - codigoMotivo '04' (Concurso Art. 80.3 -> R2) con R1 -> Rechazo
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: orig,
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R1',
+          codigoMotivo: '04',
+          motivoTexto: 'Motivo de concurso 04 con clave R1 incoherente'
+        }),
+      /Incoherencia normativa entre TipoFactura/,
+      'Debe rechazar motivo 04 (R2) cuando se selecciona clave R1'
+    );
+
+    // - codigoMotivo '06' (Incobrables Art. 80.4 -> R3) con R2 -> Rechazo
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: orig,
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R2',
+          codigoMotivo: '06',
+          motivoTexto: 'Motivo de incobrables 06 con clave R2 incoherente'
+        }),
+      /Incoherencia normativa entre TipoFactura/,
+      'Debe rechazar motivo 06 (R3) cuando se selecciona clave R2'
+    );
+
+    // - codigoMotivo '01' (Art. 80.1/2 -> R1) con R4 -> Rechazo
+    assert.throws(
+      () =>
+        buildRectificativaFacturaFromUiState({
+          facturaOriginal: orig,
+          fecha: '2026-10-26',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R4',
+          codigoMotivo: '01',
+          motivoTexto: 'Motivo 01 con clave R4 incoherente'
+        }),
+      /Incoherencia normativa entre TipoFactura/,
+      'Debe rechazar motivo 01 (R1) cuando se selecciona clave R4'
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. P2: TRANSPORTE SOAP REAL (transportMode='real') + VALIDACIÓN XSD DE PETICIÓN Y RESPUESTA
+  // ---------------------------------------------------------------------------
+  await runTest("13: [P2] E2E Transporte SOAP real (transportMode: 'real') con verificación de sobre SOAP 1.1, validación XSD de Suministro y de RespuestaSuministro.xsd", async () => {
+    await resetTestEnvironment();
+
+    // Configurar certificado mTLS de pruebas en memoria para habilitar el transporte SOAP real
+    process.env.AEAT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtest\n-----END CERTIFICATE-----';
+    process.env.AEAT_KEY_PEM = '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCtest\n-----END PRIVATE KEY-----';
+
+    try {
+      const orig = await emitFiscalInvoice({
+        invoiceDraft: createOriginalF1Invoice({
+          id: 'inv-soap-real-orig',
+          numeroFactura: 'FAC-2026-1301',
+          fecha: '2026-10-10',
+          fechaOperacion: '2026-10-08'
+        }),
+        fiscalConfig
+      });
+
+      const rectDraft = buildRectificativaFacturaFromUiState({
+        facturaOriginal: orig.invoice,
+        fecha: '2026-10-27',
+        modo: 'anulacion_total',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '01',
+        motivoTexto: 'Rectificativa remitida por transporte SOAP 1.1 real'
+      });
+      const emittedRect = await emitFiscalInvoice({ invoiceDraft: rectDraft, fiscalConfig });
+
+      let capturedSoapUrl = '';
+      let capturedSoapHeaders: Record<string, string> = {};
+      let capturedSoapEnvelopeRequest = '';
+      let capturedSoapResponseBody = '';
+
+      const realSoapServerInterceptor: typeof fetch = async (input: any, init?: any) => {
+        capturedSoapUrl = String(input);
+        capturedSoapHeaders = (init?.headers || {}) as Record<string, string>;
+        capturedSoapEnvelopeRequest = String(init?.body || '');
+
+        capturedSoapResponseBody = MockAeatTransport.generateMockResponseBody('ACCEPTANCE', {
+          nifEmisor: OBLIGADO_NIF,
+          tiempoEsperaEnvio: 60,
+          records: [
+            {
+              nifEmisor: OBLIGADO_NIF,
+              numSerie: orig.fiscalRecord.factura.numeroFactura,
+              fechaExpedicion: orig.fiscalRecord.factura.fechaExpedicion,
+              operacion: 'Alta',
+              estadoRegistro: 'Correcto'
+            },
+            {
+              nifEmisor: OBLIGADO_NIF,
+              numSerie: emittedRect.fiscalRecord.factura.numeroFactura,
+              fechaExpedicion: emittedRect.fiscalRecord.factura.fechaExpedicion,
+              operacion: 'Alta',
+              estadoRegistro: 'Correcto'
+            }
+          ]
+        });
+
+        return new Response(capturedSoapResponseBody, {
+          status: 200,
+          headers: { 'Content-Type': 'text/xml; charset=utf-8' }
+        });
+      };
+
+      AeatFlowControlManager.reset();
+      const realSubmitRes = await executeAuthoritativeOutboxSubmission({
+        batchFromOutbox: true,
+        obligadoTributarioId: OBLIGADO_NIF,
+        internalTestOptions: {
+          transportMode: 'real',
+          customFetch: realSoapServerInterceptor
+        }
+      });
+
+      // 1. Verificar estructura SOAP 1.1 de salida y extraer <sfLR:RegFactuSistemaFacturacion>
+      assert.ok(
+        capturedSoapEnvelopeRequest.includes('<soapenv:Envelope') &&
+          capturedSoapEnvelopeRequest.includes('<soapenv:Body>'),
+        'El transporte real debe envolver el XML fiscal en un sobre SOAP 1.1 <soapenv:Envelope>'
+      );
+      const bodyMatch = capturedSoapEnvelopeRequest.match(
+        /<sfLR:RegFactuSistemaFacturacion[\s\S]*<\/sfLR:RegFactuSistemaFacturacion>/
+      );
+      assert.ok(bodyMatch, 'El cuerpo SOAP debe contener <sfLR:RegFactuSistemaFacturacion>');
+
+      // 2. Validar el payload XML extraído del sobre SOAP contra los XSD oficiales de Suministro AEAT
+      const reqXsdReport = validateXmlAgainstOfficialXsd(bodyMatch[0]);
+      assert.strictEqual(
+        reqXsdReport.valid,
+        true,
+        `El XML dentro del sobre SOAP real no superó SuministroLR.xsd: ${reqXsdReport.errors.join('; ')}`
+      );
+      assert.ok(
+        bodyMatch[0].includes('<sf:FechaOperacion>08-10-2026</sf:FechaOperacion>'),
+        'El sobre SOAP real debe transportar <sf:FechaOperacion>08-10-2026</sf:FechaOperacion>'
+      );
+
+      // 3. Validar la respuesta SOAP 1.1 oficial AEAT contra RespuestaSuministro.xsd
+      const respBodyMatch = capturedSoapResponseBody.match(
+        /<sfR:RespuestaRegFactuSistemaFacturacion[\s\S]*<\/sfR:RespuestaRegFactuSistemaFacturacion>/
+      );
+      assert.ok(respBodyMatch, 'La respuesta SOAP debe contener <sfR:RespuestaRegFactuSistemaFacturacion>');
+      const respXsdReport = validateXmlAgainstOfficialXsd(
+        respBodyMatch[0],
+        'docs/fiscal/xsd/RespuestaSuministro.xsd'
+      );
+      assert.strictEqual(
+        respXsdReport.valid,
+        true,
+        `La respuesta SOAP AEAT no superó RespuestaSuministro.xsd: ${respXsdReport.errors.join('; ')}`
+      );
+
+      assert.ok(
+        capturedSoapUrl.includes('aeat.es') || capturedSoapUrl.includes('agenciatributaria.gob.es'),
+        `Debe invocar el endpoint oficial AEAT (recibido: ${capturedSoapUrl})`
+      );
+      assert.ok(
+        (capturedSoapHeaders['Content-Type'] || '').includes('text/xml'),
+        'Debe enviar cabecera SOAP Content-Type: text/xml'
+      );
+      assert.strictEqual(realSubmitRes.submission?.estado, 'ACCEPTED');
+      assert.strictEqual(realSubmitRes.cantidadRegistros, 2);
+      assert.strictEqual(realSubmitRes.submission?.csv, 'CSV-AEAT-1234567890ABCDEF');
+      assert.strictEqual(realSubmitRes.resultadosIndividuales?.length, 2);
+      assert.strictEqual(realSubmitRes.resultadosIndividuales?.[1].numeroFactura, 'R-2026-0001');
+      assert.strictEqual(realSubmitRes.resultadosIndividuales?.[1].estado, 'ACCEPTED');
+    } finally {
+      delete process.env.AEAT_CERT_PEM;
+      delete process.env.AEAT_KEY_PEM;
+    }
   });
 
   await resetTestEnvironment();

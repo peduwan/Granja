@@ -248,14 +248,74 @@ async function executeEmitFiscalInvoice(
     throw new Error('emitFiscalInvoice: NIF del emisor es obligatorio y no puede ser ES_UNKNOWN ni estar vacío.');
   }
 
-  const totalCuota = (invoiceDraft.totales?.cuotaIva ?? 0) + (invoiceDraft.totales?.cuotaRecargo ?? 0);
-  const totalDocumento = invoiceDraft.totales?.totalDocumento ?? 0;
+  // 3.5 Autoridad backend para facturas rectificativas: validación cruzada contra custodia y asignación de serie R-YYYY-NNN bajo lock
+  let effectiveInvoiceDraft: Factura = { ...invoiceDraft };
+  const isRectificativa = Boolean(
+    effectiveInvoiceDraft.esRectificativa || ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)
+  );
+  if (isRectificativa) {
+    const allObligadoRecords = await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(obligadoTributarioId);
+
+    const rectRefs = effectiveInvoiceDraft.facturasRectificadas && effectiveInvoiceDraft.facturasRectificadas.length > 0
+      ? effectiveInvoiceDraft.facturasRectificadas
+      : (effectiveInvoiceDraft.facturaRectificadaNumero && effectiveInvoiceDraft.facturaRectificadaFecha
+        ? [{
+            idEmisorFactura: nifEmisor,
+            numSerieFactura: effectiveInvoiceDraft.facturaRectificadaNumero,
+            fechaExpedicionFactura: effectiveInvoiceDraft.facturaRectificadaFecha,
+          }]
+        : []);
+
+    for (const ref of rectRefs) {
+      const origRecord = allObligadoRecords.find(
+        r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === ref.numSerieFactura
+      );
+      if (origRecord) {
+        if (tipoFactura === 'R5' && origRecord.factura.tipoFactura !== 'F2' && origRecord.factura.tipoFactura !== 'R5') {
+          throw new Error(
+            `RECHAZO_RECTIFICATIVA_R5_ORIGEN_NO_SIMPLIFICADA: No se puede emitir una factura rectificativa R5 sobre la factura custodiada '${origRecord.factura.numeroFactura}' de tipo '${origRecord.factura.tipoFactura}' (R5 solo rectifica facturas simplificadas F2/R5).`
+          );
+        }
+        if (tipoFactura !== 'R5' && (origRecord.factura.tipoFactura === 'F2' || origRecord.factura.tipoFactura === 'R5') && !origRecord.destinatario?.nif && !origRecord.destinatario?.idOtro) {
+          throw new Error(
+            `RECHAZO_RECTIFICATIVA_SIMPLIFICADA_REQUIERE_R5: La factura original custodiada '${origRecord.factura.numeroFactura}' es simplificada (${origRecord.factura.tipoFactura}) sin destinatario; debe rectificarse mediante clave R5.`
+          );
+        }
+      }
+    }
+
+    const isSubsanacion = effectiveInvoiceDraft.subsanacion === 'S';
+    if (!isSubsanacion) {
+      const requestedNum = (effectiveInvoiceDraft.numeroFactura || '').trim();
+      const alreadyExistsInCustody = allObligadoRecords.some(
+        r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === requestedNum
+      );
+      const shouldAssignBackendNumber =
+        !requestedNum ||
+        requestedNum.toUpperCase() === 'AUTO' ||
+        effectiveInvoiceDraft.numeracionAutoritativaBackend === true ||
+        alreadyExistsInCustody;
+
+      if (shouldAssignBackendNumber) {
+        effectiveInvoiceDraft = {
+          ...effectiveInvoiceDraft,
+          numeroFactura: BackendFiscalCustody.computeNextRectificativaNumber(
+            allObligadoRecords,
+            effectiveInvoiceDraft.fecha
+          ),
+        };
+      }
+    }
+  }
+
+  const totalCuota = (effectiveInvoiceDraft.totales?.cuotaIva ?? 0) + (effectiveInvoiceDraft.totales?.cuotaRecargo ?? 0);
+  const totalDocumento = effectiveInvoiceDraft.totales?.totalDocumento ?? 0;
 
   // 4. Cálculo oficial canónico de la huella SHA-256 (FASE 2.1)
   const hashResult = await calculateAltaHash({
     nifEmisor,
-    numSerieFactura: invoiceDraft.numeroFactura,
-    fechaExpedicion: invoiceDraft.fecha,
+    numSerieFactura: effectiveInvoiceDraft.numeroFactura,
+    fechaExpedicion: effectiveInvoiceDraft.fecha,
     tipoFactura,
     cuotaTotal: totalCuota,
     importeTotal: totalDocumento,
@@ -271,7 +331,7 @@ async function executeEmitFiscalInvoice(
   // 5. Preparar registro fiscal con datos definitivos para que el QR consuma exclusivamente la fuente fiscal
   const provisionalRecord = createFiscalRecordFromInvoice(
     {
-      ...invoiceDraft,
+      ...effectiveInvoiceDraft,
       tipoFactura,
       hashActual,
       hashAnterior,
@@ -292,7 +352,7 @@ async function executeEmitFiscalInvoice(
 
   // 7. Preparar borrador enriquecido para la transformación final
   const enrichedInvoice: Factura = {
-    ...invoiceDraft,
+    ...effectiveInvoiceDraft,
     tipoFactura,
     hashActual,
     hashAnterior,

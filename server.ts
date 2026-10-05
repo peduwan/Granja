@@ -1122,6 +1122,32 @@ app.get("/api/fiscal/outbox/pending", requireFiscalAuthMiddleware, async (req: F
   }
 });
 
+// Endpoint autoritativo para consultar el siguiente correlativo de factura rectificativa (serie R-YYYY-NNN)
+app.get("/api/fiscal/rectificativas/next-number", requireFiscalAuthMiddleware, async (req: FiscalAuthenticatedRequest, res) => {
+  try {
+    const obligado = typeof req.query.obligado === 'string'
+      ? req.query.obligado.trim().toUpperCase()
+      : (typeof req.query.obligadoTributarioId === 'string' ? req.query.obligadoTributarioId.trim().toUpperCase() : '');
+    const fecha = typeof req.query.fecha === 'string' ? req.query.fecha.trim() : undefined;
+    if (!obligado) {
+      return res.status(400).json({ error: "Parámetro 'obligado' obligatorio." });
+    }
+    try {
+      assertObligadoAuthorized(req.fiscalUser!, obligado);
+    } catch (authErr: any) {
+      return res.status(authErr.statusCode || 403).json({ error: authErr.message });
+    }
+    const nextNumber = await BackendFiscalCustody.getNextRectificativaNumeroAsync(obligado, fecha);
+    return res.status(200).json({
+      obligadoTributarioId: obligado,
+      nextNumber,
+      authority: "BACKEND_CUSTODY"
+    });
+  } catch (err: any) {
+    return res.status(err?.statusCode || 500).json({ error: err.message });
+  }
+});
+
 // Vite middleware para dev y serving para producción
 async function start() {
   if (process.env.NODE_ENV !== "production") {

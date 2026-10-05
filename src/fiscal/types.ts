@@ -142,9 +142,11 @@ export interface FiscalRecord {
   readonly datosRectificativa?: {
     readonly tipoRectificativa: 'S' | 'I'; // S: sustitución, I: diferencias (incremental)
     readonly facturasRectificadas: ReadonlyArray<{
+      readonly idFactura?: string;
       readonly idEmisorFactura?: string;
       readonly numeroFactura: string;
       readonly fechaExpedicion: string;
+      readonly fechaOperacion?: string;
     }>;
     readonly importeRectificacion?: {
       readonly baseRectificada: number;
@@ -152,7 +154,7 @@ export interface FiscalRecord {
       readonly cuotaRecargoRectificado?: number;
     };
     readonly motivoRectificacion?: string;
-    readonly codigoMotivoRectificacion?: '01' | '02' | '03' | '04' | '05';
+    readonly codigoMotivoRectificacion?: '01' | '02' | '03' | '04' | '05' | '06';
   };
 
   // Anulaciones (RegistroAnulacion)

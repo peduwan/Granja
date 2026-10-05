@@ -18,11 +18,11 @@ import {
   computeInitialRectificativaLines,
   calculateRectificativaTotales,
   computeDefaultImporteRectificacion,
+  computeRectificativaFechaOperacion,
   buildRectificativaFacturaFromUiState
 } from '../fiscal/rectificativaUiBuilder';
 import { emitFiscalInvoiceViaBackend } from '../fiscal/fiscalApiClient';
 import { createDefaultFiscalConfiguration } from '../fiscal/modelTransformers';
-import { padNumero } from '../utils/storage';
 
 interface ModalFacturaRectificativaProps {
   isOpen?: boolean;
@@ -61,27 +61,47 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
   const [lineasRectificativa, setLineasRectificativa] = useState<LineaDocumentoVenta[]>([]);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [authoritativeNextNumber, setAuthoritativeNextNumber] = useState<string | null>(null);
 
   useEffect(() => {
     if (facturaOriginal) {
       const initialModo: ModoRectificacionUI = 'anulacion_total';
       const initialTipoRect: TipoRectificativa = 'por_diferencias';
       const defaultClave = inferDefaultClaveRectificativa(facturaOriginal);
+      const todayIso = new Date().toISOString().split('T')[0];
 
       setModo(initialModo);
       setTipoRectificativa(initialTipoRect);
       setClaveTipoFactura(defaultClave);
       setCodigoMotivo('01');
       setMotivoTexto('Error en la emisión original de la factura');
-      setFecha(new Date().toISOString().split('T')[0]);
+      setFecha(todayIso);
       setValidationError(null);
       setLineasRectificativa(
         computeInitialRectificativaLines(facturaOriginal, initialModo, initialTipoRect)
       );
+
+      const obligado = (fiscalConfig?.nifEmisor || config?.cifEmpresa || 'B12345678').trim().toUpperCase();
+      fetch(`/api/fiscal/rectificativas/next-number?obligado=${encodeURIComponent(obligado)}&fecha=${encodeURIComponent(todayIso)}`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+          if (data?.nextNumber) {
+            setAuthoritativeNextNumber(data.nextNumber);
+          }
+        })
+        .catch(() => {
+          setAuthoritativeNextNumber(null);
+        });
     }
-  }, [facturaOriginal, isOpen]);
+  }, [facturaOriginal, isOpen, fiscalConfig?.nifEmisor, config?.cifEmpresa]);
 
   if (!isOpen || !facturaOriginal) return null;
+
+  const isOriginalSimplified =
+    facturaOriginal.claveTipoFactura === 'F2' ||
+    facturaOriginal.claveTipoFactura === 'R5' ||
+    Boolean(facturaOriginal.facturaSinIdentifDestinatarioArt61d) ||
+    (!facturaOriginal.clienteCif?.trim() && !facturaOriginal.clienteIdOtro?.id?.trim());
 
   const handleModoChange = (nuevoModo: ModoRectificacionUI) => {
     setModo(nuevoModo);
@@ -97,6 +117,22 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
     setLineasRectificativa(
       computeInitialRectificativaLines(facturaOriginal, modo, nuevoTipo)
     );
+  };
+
+  const handleClaveTipoFacturaChange = (nuevaClave: ClaveTipoFacturaRectificativaAEAT) => {
+    setClaveTipoFactura(nuevaClave);
+    setValidationError(null);
+    if (nuevaClave !== 'R5') {
+      const currentMeta = MOTIVOS_RECTIFICATIVA_AEAT.find(m => m.codigo === codigoMotivo);
+      if (!currentMeta || currentMeta.claveFacturaSugerida !== nuevaClave) {
+        const compatibleMotivo = MOTIVOS_RECTIFICATIVA_AEAT.find(
+          m => m.claveFacturaSugerida === nuevaClave
+        );
+        if (compatibleMotivo) {
+          setCodigoMotivo(compatibleMotivo.codigo);
+        }
+      }
+    }
   };
 
   const handleCodigoMotivoChange = (nuevoCodigo: CodigoMotivoRectificativaUI) => {
@@ -156,18 +192,13 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
 
   const totales = calculateRectificativaTotales(facturaOriginal, lineasRectificativa);
   const defaultImporteRectificacion = computeDefaultImporteRectificacion(facturaOriginal);
+  const resolvedFechaOperacion = computeRectificativaFechaOperacion(facturaOriginal);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setValidationError(null);
 
     try {
-      const anio = fecha.split('-')[0] || String(new Date().getFullYear());
-      const numeroFacturaOverride =
-        typeof contadorRectificativa === 'number'
-          ? `R-${anio}-${padNumero(contadorRectificativa, 4)}`
-          : undefined;
-
       const effectiveFiscalConfig: FiscalConfiguration =
         fiscalConfig ||
         createDefaultFiscalConfiguration({
@@ -175,10 +206,11 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
           nombreRazon: config?.nombreEmpresa || 'Granja Avícola S.L.'
         });
 
+      // La numeración definitiva R-YYYY-NNN es asignada por la autoridad backend bajo cerrojo distribuido
       const borradorFactura = buildRectificativaFacturaFromUiState({
         facturaOriginal,
         existingInvoices: facturas,
-        numeroFacturaOverride,
+        numeroFacturaOverride: undefined,
         fecha,
         modo,
         tipoRectificativa,
@@ -194,7 +226,11 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
         invoiceDraft: borradorFactura,
         fiscalConfig: effectiveFiscalConfig
       });
-      await onEmitirRectificativa(emitted.invoice, reingresarStock, emitted.fiscalRecordRef);
+      const facturaAutoritativa: Factura = {
+        ...emitted.invoice,
+        numeroFactura: emitted.fiscalRecord.factura.numeroFactura || emitted.invoice.numeroFactura
+      };
+      await onEmitirRectificativa(facturaAutoritativa, reingresarStock, emitted.fiscalRecordRef);
       onClose();
     } catch (err: any) {
       setValidationError(err?.message || 'Error al construir o emitir la factura rectificativa.');
@@ -215,7 +251,12 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
             <div>
               <h2 className="text-lg font-bold tracking-tight">Emitir Factura Rectificativa (Veri*Factu)</h2>
               <p className="text-xs text-amber-200/80">
-                Rectificando Factura Original: <span className="font-mono font-bold text-white">{facturaOriginal.numeroFactura}</span> ({facturaOriginal.fecha}) - Cliente: {facturaOriginal.clienteNombre}
+                Rectificando Factura Original: <span className="font-mono font-bold text-white">{facturaOriginal.numeroFactura}</span> ({facturaOriginal.fecha}) · Fecha Operación: <span className="font-mono text-amber-100">{resolvedFechaOperacion}</span>
+                {authoritativeNextNumber && (
+                  <span className="ml-2 px-2 py-0.5 bg-amber-900/80 rounded font-mono text-[11px] text-amber-200">
+                    Serie Backend: {authoritativeNextNumber}
+                  </span>
+                )}
               </p>
             </div>
           </div>
@@ -305,14 +346,19 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
               <label className="block text-xs font-semibold text-stone-700 mb-1">Clave TipoFactura AEAT</label>
               <select
                 value={claveTipoFactura}
-                onChange={(e) => setClaveTipoFactura(e.target.value as ClaveTipoFacturaRectificativaAEAT)}
+                onChange={(e) => handleClaveTipoFacturaChange(e.target.value as ClaveTipoFacturaRectificativaAEAT)}
                 className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
               >
-                {CLAVES_FACTURA_RECTIFICATIVA_AEAT.map((c) => (
-                  <option key={c.clave} value={c.clave}>
-                    {c.label}
-                  </option>
-                ))}
+                {CLAVES_FACTURA_RECTIFICATIVA_AEAT.map((c) => {
+                  const disabled =
+                    (c.clave === 'R5' && !isOriginalSimplified) ||
+                    (c.clave !== 'R5' && isOriginalSimplified && !facturaOriginal.clienteCif?.trim() && !facturaOriginal.clienteIdOtro?.id?.trim());
+                  return (
+                    <option key={c.clave} value={c.clave} disabled={disabled}>
+                      {c.label}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 
@@ -335,11 +381,14 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
                 onChange={(e) => handleCodigoMotivoChange(e.target.value as CodigoMotivoRectificativaUI)}
                 className="w-full px-3 py-2 bg-white border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-amber-500"
               >
-                {MOTIVOS_RECTIFICATIVA_AEAT.map((m) => (
-                  <option key={m.codigo} value={m.codigo}>
-                    {m.label}
-                  </option>
-                ))}
+                {MOTIVOS_RECTIFICATIVA_AEAT.map((m) => {
+                  const compatible = m.clavesCompatibles.includes(claveTipoFactura);
+                  return (
+                    <option key={m.codigo} value={m.codigo} disabled={!compatible}>
+                      {m.label}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 

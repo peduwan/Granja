@@ -71,11 +71,13 @@ export interface AuthoritativeSubmitRequest {
    * Opciones internas exclusivas para pruebas de integración en backend (nunca expuestas a payloads de cliente).
    */
   readonly internalTestOptions?: {
+    readonly transportMode?: 'mock' | 'real';
     readonly mockScenario?: MockScenario;
     readonly mockTiempoEsperaEnvio?: number;
     readonly mockLineOverrides?: Record<string, Partial<MockRecordLineSpec>>;
     readonly staleSendingThresholdMs?: number;
     readonly nowMs?: number;
+    readonly customFetch?: typeof fetch;
   };
 }
 
@@ -698,10 +700,11 @@ export async function executeAuthoritativeOutboxSubmission(
         fiscalRecords: batchRecords,
         config: serverFiscalConfig,
         options: {
-          transportMode: serverTransportMode as any,
+          transportMode: (internalTestOptions?.transportMode || serverTransportMode) as any,
           mockScenario: internalTestOptions?.mockScenario,
           mockTiempoEsperaEnvio: internalTestOptions?.mockTiempoEsperaEnvio,
           mockLineOverrides: internalTestOptions?.mockLineOverrides,
+          customFetch: internalTestOptions?.customFetch,
           reconcilingRecordIds: batchReconcilingRecordIds,
           acquireLock: false,
           actor: actor || {

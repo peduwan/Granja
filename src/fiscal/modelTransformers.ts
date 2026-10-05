@@ -18,6 +18,12 @@ import {
 import { buildFiscalQrUrl } from './qrService';
 import { createFiscalSubmission as serviceCreateFiscalSubmission } from './submissionService';
 import { getAeatSoapEndpoint } from './aeatEndpoints';
+import {
+  computeRectificativaFechaOperacion,
+  validateMotivoCoherenceWithClave,
+  DEFAULT_MOTIVO_BY_CLAVE,
+  ClaveTipoFacturaRectificativaAEAT
+} from './rectificativaUiBuilder';
 
 /**
  * Función canónica de transformación: INVOICE -> FISCAL RECORD
@@ -183,6 +189,32 @@ export function createFiscalRecordFromInvoice(
     invoice.esRectificativa || ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)
   );
   const isSimplifiedWithoutRecipient = tipoFactura === 'F2' || tipoFactura === 'R5';
+
+  // Validación estricta de R5 frente a destinatarios o facturas F1 sin identificación Art. 6.1.d (P1)
+  if (tipoFactura === 'R5') {
+    if ((invoice.clienteCif && invoice.clienteCif.trim() !== '') || invoice.clienteIdOtro) {
+      throw new Error(
+        `createFiscalRecordFromInvoice: Violación normativa AEAT (R5). Una factura rectificativa simplificada R5 no admite identificación fiscal de destinatario (NIF o IDOtro).`
+      );
+    }
+    if (invoice.facturaSinIdentifDestinatarioArt61d === 'S') {
+      throw new Error(
+        `createFiscalRecordFromInvoice: Violación normativa AEAT (R5). Una factura F1 sin identificación de destinatario (Art. 6.1.d RD 1619/2012) no es una factura simplificada F2 y no puede rectificarse mediante R5.`
+      );
+    }
+  }
+
+  // Validación de coherencia entre codigoMotivoRectificativa y clave R1..R5 (P2)
+  const resolvedCodigoMotivo = isRectificativa
+    ? (invoice.codigoMotivoRectificativa || DEFAULT_MOTIVO_BY_CLAVE[(tipoFactura as ClaveTipoFacturaRectificativaAEAT) || 'R1'] || '01')
+    : undefined;
+  if (isRectificativa && invoice.codigoMotivoRectificativa && ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)) {
+    validateMotivoCoherenceWithClave(
+      tipoFactura as ClaveTipoFacturaRectificativaAEAT,
+      invoice.codigoMotivoRectificativa
+    );
+  }
+
   const resolvedTipoRectificativa: 'S' | 'I' =
     invoice.tipoRectificativa === 'por_diferencias' ||
     invoice.tipoRectificativa === 'diferencias' ||
@@ -190,24 +222,75 @@ export function createFiscalRecordFromInvoice(
       ? 'I'
       : 'S';
 
-  const resolvedFacturasRectificadas =
+  const rawFacturasRectificadas =
     invoice.facturasRectificadas && invoice.facturasRectificadas.length > 0
       ? invoice.facturasRectificadas.map(fr => ({
           ...(fr.idFactura ? { idFactura: fr.idFactura } : {}),
-          idEmisorFactura: fr.idEmisorFactura || config.nifEmisor,
-          numeroFactura: fr.numeroFactura,
-          fechaExpedicion: fr.fechaExpedicion
+          idEmisorFactura: (fr.idEmisorFactura || config.nifEmisor).trim().toUpperCase(),
+          numeroFactura: (fr.numeroFactura || '').trim(),
+          fechaExpedicion: (fr.fechaExpedicion || '').trim(),
+          ...(fr.fechaOperacion ? { fechaOperacion: fr.fechaOperacion } : {})
         }))
       : invoice.facturaRectificadaNumero
         ? [
             {
               ...(invoice.facturaRectificadaId ? { idFactura: invoice.facturaRectificadaId } : {}),
-              idEmisorFactura: config.nifEmisor,
-              numeroFactura: invoice.facturaRectificadaNumero,
-              fechaExpedicion: invoice.facturaRectificadaFecha || invoice.fecha
+              idEmisorFactura: config.nifEmisor.trim().toUpperCase(),
+              numeroFactura: invoice.facturaRectificadaNumero.trim(),
+              fechaExpedicion: (invoice.facturaRectificadaFecha || invoice.fecha || '').trim()
             }
           ]
         : [];
+
+  // Validar duplicados e integridad de obligado tributario en FacturasRectificadas (P2)
+  const seenRectNums = new Set<string>();
+  const cleanEmisorNif = config.nifEmisor.trim().toUpperCase();
+  for (const fr of rawFacturasRectificadas) {
+    if (!fr.numeroFactura || !fr.fechaExpedicion) {
+      throw new Error('createFiscalRecordFromInvoice: Cada elemento de FacturasRectificadas requiere numeroFactura y fechaExpedicion válidos.');
+    }
+    if (fr.idEmisorFactura !== cleanEmisorNif) {
+      throw new Error(
+        `createFiscalRecordFromInvoice: Violación de obligado tributario en FacturasRectificadas. La factura rectificada '${fr.numeroFactura}' declara emisor '${fr.idEmisorFactura}', distinto del obligado emisor '${cleanEmisorNif}'.`
+      );
+    }
+    const key = fr.numeroFactura.toUpperCase();
+    if (seenRectNums.has(key)) {
+      throw new Error(
+        `createFiscalRecordFromInvoice: Factura rectificada duplicada '${fr.numeroFactura}' en FacturasRectificadas.`
+      );
+    }
+    seenRectNums.add(key);
+  }
+
+  if (
+    isRectificativa &&
+    invoice.subsanacion !== 'S' &&
+    invoice.numeroFactura &&
+    seenRectNums.has(invoice.numeroFactura.trim().toUpperCase())
+  ) {
+    throw new Error(
+      `createFiscalRecordFromInvoice: La factura rectificativa '${invoice.numeroFactura}' no puede tener el mismo número de serie que la factura original rectificada.`
+    );
+  }
+
+  const resolvedFacturasRectificadas = rawFacturasRectificadas.map(fr => ({
+    ...(fr.idFactura ? { idFactura: fr.idFactura } : {}),
+    idEmisorFactura: fr.idEmisorFactura,
+    numeroFactura: fr.numeroFactura,
+    fechaExpedicion: fr.fechaExpedicion
+  }));
+
+  // Resolución reglamentaria de FechaOperacion en rectificativas (P1):
+  // Si no viene informada explícitamente en invoice.fechaOperacion, se calcula a partir de las facturas rectificadas
+  // (la fecha de operación original, o la más reciente si rectifica varias facturas).
+  const resolvedFechaOperacion = invoice.fechaOperacion
+    ? invoice.fechaOperacion
+    : isRectificativa && rawFacturasRectificadas.length > 0
+      ? computeRectificativaFechaOperacion(rawFacturasRectificadas)
+      : isRectificativa
+        ? (invoice.facturaRectificadaFecha || invoice.fecha)
+        : undefined;
 
   const resolvedImporteRectificacion =
     resolvedTipoRectificativa === 'S'
@@ -249,7 +332,7 @@ export function createFiscalRecordFromInvoice(
       numeroFactura: invoice.numeroFactura,
       fechaExpedicion: invoice.fecha,
       horaExpedicion,
-      fechaOperacion: invoice.fechaOperacion,
+      fechaOperacion: resolvedFechaOperacion,
       tipoFactura,
       descripcionOperacion:
         invoice.descripcionOperacion ||
@@ -285,7 +368,7 @@ export function createFiscalRecordFromInvoice(
             ? { ...resolvedImporteRectificacion }
             : undefined,
           motivoRectificacion: invoice.motivoRectificativa,
-          codigoMotivoRectificacion: invoice.codigoMotivoRectificativa || '01'
+          codigoMotivoRectificacion: resolvedCodigoMotivo || '01'
         }
       : undefined,
 
