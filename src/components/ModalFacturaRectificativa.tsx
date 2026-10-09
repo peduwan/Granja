@@ -98,8 +98,8 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
   if (!isOpen || !facturaOriginal) return null;
 
   const isOriginalSimplified =
-    facturaOriginal.claveTipoFactura === 'F2' ||
-    facturaOriginal.claveTipoFactura === 'R5' ||
+    facturaOriginal.tipoFactura === 'F2' ||
+    facturaOriginal.tipoFactura === 'R5' ||
     Boolean(facturaOriginal.facturaSinIdentifDestinatarioArt61d) ||
     (!facturaOriginal.clienteCif?.trim() && !facturaOriginal.clienteIdOtro?.id?.trim());
 
@@ -192,7 +192,7 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
 
   const totales = calculateRectificativaTotales(facturaOriginal, lineasRectificativa);
   const defaultImporteRectificacion = computeDefaultImporteRectificacion(facturaOriginal);
-  const resolvedFechaOperacion = computeRectificativaFechaOperacion(facturaOriginal);
+  const resolvedFechaOperacion = computeRectificativaFechaOperacion([facturaOriginal]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -18,6 +18,7 @@ import {
   FiscalRecordSubmissionResult,
   FiscalRecordSubmissionStatus
 } from './types';
+import { validateXmlAgainstOfficialXsd } from './aeatXsdValidatorNode';
 
 export interface AeatResponseLine {
   readonly idFactura: {
@@ -142,9 +143,55 @@ export function classifySoapFault(
 }
 
 /**
- * Parsea el XML oficial devuelto por los servicios web de la AEAT.
+ * Extrae el elemento XML raíz `<...:RespuestaRegFactuSistemaFacturacion>` de una respuesta
+ * SOAP o XML cruda, preservando declaraciones de namespaces heredadas del Envelope/Body SOAP
+ * para permitir su validación formal contra `RespuestaSuministro.xsd`.
  */
-export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
+export function extractRespuestaRegFactuXmlElement(rawXml: string): string | null {
+  const match = /<([a-zA-Z0-9_]+:)?RespuestaRegFactuSistemaFacturacion\b[\s\S]*?<\/(?:[a-zA-Z0-9_]+:)?RespuestaRegFactuSistemaFacturacion>/i.exec(rawXml);
+  if (!match) return null;
+
+  let elementXml = match[0];
+
+  // Si el nodo depende de prefijos declarados en el SOAP Envelope/Body (ej. xmlns:sfR o xmlns:sf),
+  // los inyectamos en la etiqueta de apertura si no están ya presentes en el fragmento extraído.
+  const openTagEnd = elementXml.indexOf('>');
+  if (openTagEnd !== -1) {
+    const openTag = elementXml.slice(0, openTagEnd);
+    const nsDeclarations: string[] = [];
+
+    const envNsRegex = /\bxmlns(?::([a-zA-Z0-9_-]+))?\s*=\s*(["'])([^"']+)\2/g;
+    let nsMatch: RegExpExecArray | null;
+    while ((nsMatch = envNsRegex.exec(rawXml)) !== null) {
+      const fullDecl = nsMatch[0];
+      const prefix = nsMatch[1];
+      const attrName = prefix ? `xmlns:${prefix}` : 'xmlns';
+      const alreadyHasAttr = new RegExp(`\\b${attrName}\\s*=`).test(openTag);
+      if (!alreadyHasAttr) {
+        if (prefix && (prefix.toLowerCase().includes('soap') || prefix === 'env')) {
+          continue;
+        }
+        nsDeclarations.push(fullDecl);
+      }
+    }
+
+    if (nsDeclarations.length > 0) {
+      elementXml = `${openTag} ${nsDeclarations.join(' ')}${elementXml.slice(openTagEnd)}`;
+    }
+  }
+
+  return elementXml;
+}
+
+/**
+ * Parsea el XML oficial devuelto por los servicios web de la AEAT.
+ * Valida fail-closed contra el esquema oficial `docs/fiscal/xsd/RespuestaSuministro.xsd` (libxml2-wasm)
+ * antes de confiar en la respuesta o mapear estados fiscales.
+ */
+export function parseAeatXmlResponse(
+  xmlString: string,
+  options?: { enforceOfficialXsd?: boolean }
+): AeatParsedResponse {
   if (!xmlString || typeof xmlString !== 'string' || xmlString.trim() === '') {
     throw new Error('parseAeatXmlResponse: Respuesta vacía o nula recibida de la AEAT.');
   }
@@ -199,6 +246,30 @@ export function parseAeatXmlResponse(xmlString: string): AeatParsedResponse {
   const respuestaRoot = body.RespuestaRegFactuSistemaFacturacion || parsed.RespuestaRegFactuSistemaFacturacion;
   if (!respuestaRoot) {
     throw new Error('parseAeatXmlResponse: El XML no contiene el elemento raíz oficial RespuestaRegFactuSistemaFacturacion.');
+  }
+
+  // 4.b Validación formal Fail-Closed contra RespuestaSuministro.xsd (libxml2-wasm)
+  const isNodeEnv = typeof process !== 'undefined' && Boolean(process.versions?.node) && typeof window === 'undefined';
+  const shouldEnforceXsd =
+    options?.enforceOfficialXsd === true ||
+    (options?.enforceOfficialXsd !== false &&
+      (Boolean(respuestaRoot.Cabecera) ||
+        xmlString.includes('RespuestaSuministro.xsd') ||
+        xmlString.includes('SistemaFacturacion.xsd')));
+
+  if (isNodeEnv && shouldEnforceXsd) {
+    const extractedXml = extractRespuestaRegFactuXmlElement(xmlString);
+    if (!extractedXml) {
+      throw new Error(
+        'parseAeatXmlResponse [RECHAZO_XSD_RESPUESTA_AEAT]: No se pudo aislar el bloque RespuestaRegFactuSistemaFacturacion para validarlo contra RespuestaSuministro.xsd.'
+      );
+    }
+    const xsdReport = validateXmlAgainstOfficialXsd(extractedXml, 'docs/fiscal/xsd/RespuestaSuministro.xsd');
+    if (!xsdReport.valid) {
+      throw new Error(
+        `parseAeatXmlResponse [RECHAZO_XSD_RESPUESTA_AEAT]: La respuesta XML de la AEAT incumple el esquema oficial RespuestaSuministro.xsd (${xsdReport.engine}): ${xsdReport.errors.join(' | ')}`
+      );
+    }
   }
 
   // 5. Extraer campos de cabecera y estado global

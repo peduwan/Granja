@@ -18,6 +18,7 @@ import {
   wrapInAeatSoapEnvelope
 } from '../src/fiscal/aeatTransport';
 import { AeatCertificateProvider } from '../src/fiscal/aeatCertificateProvider';
+import { MockAeatTransport } from '../src/fiscal/mockAeatTransport';
 import {
   emitFiscalInvoice,
   emitFiscalAnulacion,
@@ -292,15 +293,13 @@ async function main() {
           assert.ok(init.headers['Content-Type'].includes('text/xml'));
           return {
             status: 200,
-            text: async () => `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:sf="https://www.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/ssii/fact/ws/RespuestaSuministro.xsd">
-              <soapenv:Body>
-                <sf:RespuestaRegFactuSistemaFacturacion>
-                  <sf:Cabecera><sf:TiempoEsperaEnvio>60</sf:TiempoEsperaEnvio></sf:Cabecera>
-                  <sf:EstadoEnvio>Correcto</sf:EstadoEnvio>
-                  <sf:CSV>CSV-MTLS-REAL-12345</sf:CSV>
-                </sf:RespuestaRegFactuSistemaFacturacion>
-              </soapenv:Body>
-            </soapenv:Envelope>`
+            text: async () => MockAeatTransport.generateMockResponseBody('ACCEPTANCE', {
+              nifEmisor: rec.emisor.nif,
+              numSerie: rec.factura.numeroFactura,
+              fechaExpedicion: rec.factura.fechaExpedicion,
+              operacion: 'Alta',
+              tiempoEsperaEnvio: 60
+            }).replace('CSV-AEAT-1234567890ABCDEF', 'CSV-MTLS-REAL-12345')
           };
         }
       }

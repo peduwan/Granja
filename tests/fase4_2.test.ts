@@ -309,6 +309,12 @@ async function main() {
       xmlns:sfR="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/RespuestaSuministro.xsd"
       xmlns:sf="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/SuministroInformacion.xsd">
       <sfR:CSV>CSV-BATCH-MIX-2026</sfR:CSV>
+      <sfR:Cabecera>
+        <sf:ObligadoEmision>
+          <sf:NombreRazon>${config.nombreRazonEmisor}</sf:NombreRazon>
+          <sf:NIF>${NIF_BATCH_OBLIGADO}</sf:NIF>
+        </sf:ObligadoEmision>
+      </sfR:Cabecera>
       <sfR:TiempoEsperaEnvio>90</sfR:TiempoEsperaEnvio>
       <sfR:EstadoEnvio>ParcialmenteCorrecto</sfR:EstadoEnvio>
       <sfR:RespuestaLinea>

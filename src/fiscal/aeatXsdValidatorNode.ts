@@ -17,10 +17,6 @@
  *   ImporteRectificacion, Destinatarios, FacturasSustituidas, Tercero y Generador).
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { Worker, MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
 import { XMLParser } from 'fast-xml-parser';
 
 export interface XmlValidationReport {
@@ -29,7 +25,59 @@ export interface XmlValidationReport {
   engine?: string;
 }
 
+const IS_NODE_ENV =
+  typeof process !== 'undefined' &&
+  Boolean(process.versions?.node) &&
+  typeof window === 'undefined';
+
+let nodeDepsCache: {
+  fs: typeof import('node:fs');
+  path: typeof import('node:path');
+  fileURLToPath: typeof import('node:url')['fileURLToPath'];
+  Worker: typeof import('node:worker_threads')['Worker'];
+  MessageChannel: typeof import('node:worker_threads')['MessageChannel'];
+  receiveMessageOnPort: typeof import('node:worker_threads')['receiveMessageOnPort'];
+} | null = null;
+
+function getNodeDeps() {
+  if (!IS_NODE_ENV) {
+    throw new Error('aeatXsdValidatorNode solo puede ejecutarse en entorno Node.js.');
+  }
+  if (nodeDepsCache) {
+    return nodeDepsCache;
+  }
+  const nodeReq =
+    typeof require === 'function'
+      ? require
+      : (globalThis as any).process?.getBuiltinModule?.bind((globalThis as any).process);
+
+  if (!nodeReq) {
+    throw new Error('No se pudo obtener cargador de módulos nativos de Node.js.');
+  }
+
+  const fs = nodeReq('node:fs') as typeof import('node:fs');
+  const path = nodeReq('node:path') as typeof import('node:path');
+  const { fileURLToPath } = nodeReq('node:url') as typeof import('node:url');
+  const { Worker, MessageChannel, receiveMessageOnPort } = nodeReq(
+    'node:worker_threads'
+  ) as typeof import('node:worker_threads');
+
+  nodeDepsCache = {
+    fs,
+    path,
+    fileURLToPath,
+    Worker,
+    MessageChannel,
+    receiveMessageOnPort
+  };
+  return nodeDepsCache;
+}
+
 function getModuleDir(): string {
+  if (!IS_NODE_ENV) {
+    return '/';
+  }
+  const { path, fileURLToPath } = getNodeDeps();
   try {
     if (typeof __dirname === 'string' && __dirname) {
       return __dirname;
@@ -38,7 +86,7 @@ function getModuleDir(): string {
   try {
     return path.dirname(fileURLToPath(import.meta.url));
   } catch {
-    return process.cwd();
+    return typeof process !== 'undefined' && typeof process.cwd === 'function' ? process.cwd() : '/';
   }
 }
 
@@ -46,7 +94,13 @@ function getModuleDir(): string {
  * Resuelve de forma determinista la ruta del worker libxml2 tanto en el build de producción
  * (`dist/fiscal/libxml2XsdWorker.mjs`) como en desarrollo (`src/fiscal/libxml2XsdWorker.mjs`).
  */
-export function resolveXsdWorkerPath(baseDir: string = process.cwd()): string {
+export function resolveXsdWorkerPath(
+  baseDir: string = IS_NODE_ENV && typeof process.cwd === 'function' ? process.cwd() : '/'
+): string {
+  if (!IS_NODE_ENV) {
+    return '/dist/fiscal/libxml2XsdWorker.mjs';
+  }
+  const { fs, path } = getNodeDeps();
   const modDir = getModuleDir();
   const candidates = [
     path.resolve(baseDir, 'dist/fiscal/libxml2XsdWorker.mjs'),
@@ -66,7 +120,13 @@ export function resolveXsdWorkerPath(baseDir: string = process.cwd()): string {
  * Resuelve de forma determinista el esquema oficial SuministroLR.xsd tanto en el build de
  * producción (`dist/fiscal/xsd/SuministroLR.xsd`) como en desarrollo (`docs/fiscal/xsd/SuministroLR.xsd`).
  */
-export function resolveDefaultOfficialXsdPath(baseDir: string = process.cwd()): string {
+export function resolveDefaultOfficialXsdPath(
+  baseDir: string = IS_NODE_ENV && typeof process.cwd === 'function' ? process.cwd() : '/'
+): string {
+  if (!IS_NODE_ENV) {
+    return '/dist/fiscal/xsd/SuministroLR.xsd';
+  }
+  const { fs, path } = getNodeDeps();
   const modDir = getModuleDir();
   const candidates = [
     path.resolve(baseDir, 'dist/fiscal/xsd/SuministroLR.xsd'),
@@ -82,10 +142,11 @@ export function resolveDefaultOfficialXsdPath(baseDir: string = process.cwd()): 
   return candidates[0];
 }
 
-let xsdWorker: Worker | null = null;
+let xsdWorker: import('node:worker_threads').Worker | null = null;
 let xsdWorkerResolvedPath: string | null = null;
 
-function getOrCreateXsdWorker(): Worker {
+function getOrCreateXsdWorker(): import('node:worker_threads').Worker {
+  const { fs, Worker } = getNodeDeps();
   const workerPath = resolveXsdWorkerPath();
   if (!fs.existsSync(workerPath)) {
     throw new Error(`No se encontró el worker de validación XSD libxml2 en '${workerPath}'.`);
@@ -214,6 +275,16 @@ export function validateXmlAgainstOfficialXsd(
       engine: 'libxml2-wasm'
     };
   }
+
+  if (!IS_NODE_ENV) {
+    return {
+      valid: false,
+      errors: ['FAIL-CLOSED: El validador XSD oficial libxml2 requiere entorno Node.js.'],
+      engine: 'libxml2-wasm'
+    };
+  }
+
+  const { fs, path, MessageChannel, receiveMessageOnPort } = getNodeDeps();
 
   const schemaPath = xsdFilePath
     ? (xsdFilePath === 'RESPUESTA'

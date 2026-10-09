@@ -11,6 +11,8 @@
  * 4. Las credenciales se inyectan mediante variables de entorno seguras en el servidor.
  */
 
+import crypto from 'node:crypto';
+
 export interface AeatCertificateCredentials {
   readonly pfx?: Buffer;
   readonly passphrase?: string;
@@ -22,6 +24,19 @@ export interface AeatCertificateInfo {
   readonly available: boolean;
   readonly type?: 'PKCS12' | 'PEM';
   readonly subject?: string;
+  readonly issuer?: string;
+  readonly validFrom?: string;
+  readonly validTo?: string;
+}
+
+export interface AeatCertificateValidationReport {
+  readonly valid: boolean;
+  readonly subject?: string;
+  readonly issuer?: string;
+  readonly validFrom?: string;
+  readonly validTo?: string;
+  readonly serialNumber?: string;
+  readonly reason?: string;
 }
 
 export class AeatCertificateProvider {
@@ -31,6 +46,77 @@ export class AeatCertificateProvider {
     if (!val) return true;
     const t = val.trim().toLowerCase();
     return t === '' || t === 'vacio' || t === 'vacío' || t === 'placeholder' || t === 'none' || t === 'undefined';
+  }
+
+  /**
+   * Valida criptográficamente un par PEM (certificado X.509 + clave privada) verificando:
+   * 1. Estructura ASN.1 / X.509 válida.
+   * 2. Vigencia temporal (validFrom <= now <= validTo).
+   * 3. Correspondencia matemática entre la clave privada y la clave pública del certificado.
+   */
+  public static validatePemCertificatePair(
+    certPem: string,
+    keyPem: string,
+    passphrase?: string
+  ): AeatCertificateValidationReport {
+    try {
+      const x509 = new crypto.X509Certificate(certPem);
+      const now = Date.now();
+      const validFromMs = Date.parse(x509.validFrom);
+      const validToMs = Date.parse(x509.validTo);
+
+      if (!isNaN(validFromMs) && now < validFromMs) {
+        return {
+          valid: false,
+          subject: x509.subject,
+          issuer: x509.issuer,
+          validFrom: x509.validFrom,
+          validTo: x509.validTo,
+          serialNumber: x509.serialNumber,
+          reason: `El certificado X.509 aún no es válido (validFrom: ${x509.validFrom}).`
+        };
+      }
+      if (!isNaN(validToMs) && now > validToMs) {
+        return {
+          valid: false,
+          subject: x509.subject,
+          issuer: x509.issuer,
+          validFrom: x509.validFrom,
+          validTo: x509.validTo,
+          serialNumber: x509.serialNumber,
+          reason: `El certificado X.509 ha expirado (validTo: ${x509.validTo}).`
+        };
+      }
+
+      const privKey = crypto.createPrivateKey({
+        key: keyPem,
+        format: 'pem',
+        ...(passphrase ? { passphrase } : {})
+      });
+
+      if (!x509.checkPrivateKey(privKey)) {
+        return {
+          valid: false,
+          subject: x509.subject,
+          issuer: x509.issuer,
+          reason: 'La clave privada suministrada no corresponde a la clave pública del certificado X.509.'
+        };
+      }
+
+      return {
+        valid: true,
+        subject: x509.subject,
+        issuer: x509.issuer,
+        validFrom: x509.validFrom,
+        validTo: x509.validTo,
+        serialNumber: x509.serialNumber
+      };
+    } catch (err: any) {
+      return {
+        valid: false,
+        reason: `Certificado X.509 o clave privada PEM criptográficamente inválidos: ${err?.message || String(err)}`
+      };
+    }
   }
 
   /**

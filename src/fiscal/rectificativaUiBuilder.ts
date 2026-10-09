@@ -588,7 +588,7 @@ export function buildRectificativaFacturaFromUiState(
   const isR5Simplified = claveTipoFactura === 'R5';
 
   const nuevaFactura: Factura = {
-    id: idOverride || `rect-${Date.now()}`,
+    id: idOverride || `rect-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     numeroFactura: numeroRectificativa,
     numeracionAutoritativaBackend: !numeroFacturaOverride && subsanacion !== 'S',
     fecha,

@@ -30,6 +30,8 @@
  */
 
 import assert from 'node:assert';
+import https from 'node:https';
+import crypto from 'node:crypto';
 import { Factura } from '../src/types';
 import {
   FiscalConfiguration,
@@ -1109,9 +1111,7 @@ async function main() {
             numeroFactura: 'R-FORGED-001',
             esRectificativa: true,
             tipoFactura: 'R5',
-            claveTipoFactura: 'R5',
             tipoRectificativa: 'por_diferencias',
-            claveTipoRectificativa: 'I',
             facturaRectificadaNumero: emittedF1.invoice.numeroFactura,
             facturaRectificadaFecha: emittedF1.invoice.fecha
           },
@@ -1133,9 +1133,7 @@ async function main() {
             clienteCif: '',
             esRectificativa: true,
             tipoFactura: 'R5',
-            claveTipoFactura: 'R5',
             tipoRectificativa: 'por_diferencias',
-            claveTipoRectificativa: 'I',
             facturaRectificadaNumero: emittedF1.invoice.numeroFactura,
             facturaRectificadaFecha: emittedF1.invoice.fecha
           },
@@ -1227,9 +1225,112 @@ async function main() {
     const hashVerif2 = await verifyFiscalRecordHash(emitted2.fiscalRecord);
     assert.strictEqual(hashVerif2.valid, true, 'La huella SHA-256 debe haberse calculado con el número autoritativo R-2026-0002');
 
-    // Consultar el siguiente número autoritativo desde BackendFiscalCustody -> R-2026-0003
-    const nextAuthNum = await BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22');
-    assert.strictEqual(nextAuthNum, 'R-2026-0003');
+    // 11.B: Concurrencia real multi-instancia (Promise.all entre Instancia Cloud Run A e Instancia Cloud Run B)
+    // Ambas instancias parten simultáneamente con caché local obsoleta ('R-2026-0001') y compiten en commitRecord OCC.
+    const draftConcurrentA = buildRectificativaFacturaFromUiState({
+      facturaOriginal: orig.invoice,
+      existingInvoices: [],
+      fecha: '2026-10-22',
+      modo: 'rectificacion_parcial',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '01',
+      motivoTexto: 'Emisión concurrente desde Cloud Run Instancia A',
+      lineasEditadas: [
+        {
+          ...orig.invoice.lineas[0],
+          id: 'lin-conc-a',
+          cantidadEstuches: -1,
+          precioUnitario: 100,
+          subtotal: -100
+        }
+      ]
+    });
+
+    const draftConcurrentB = buildRectificativaFacturaFromUiState({
+      facturaOriginal: orig.invoice,
+      existingInvoices: [],
+      fecha: '2026-10-22',
+      modo: 'rectificacion_parcial',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '02',
+      motivoTexto: 'Emisión concurrente desde Cloud Run Instancia B',
+      lineasEditadas: [
+        {
+          ...orig.invoice.lineas[0],
+          id: 'lin-conc-b',
+          cantidadEstuches: -2,
+          precioUnitario: 100,
+          subtotal: -200
+        }
+      ]
+    });
+
+    let resolveInstanceACommitted!: () => void;
+    const instanceACommittedPromise = new Promise<void>(resolve => {
+      resolveInstanceACommitted = resolve;
+    });
+    let instanceBAttempts = 0;
+
+    const [concurrentResA, concurrentResB] = await Promise.all([
+      emitFiscalInvoice({
+        invoiceDraft: draftConcurrentA,
+        fiscalConfig,
+        _simulateIndependentCloudRunInstance: true
+      }).then(res => {
+        resolveInstanceACommitted();
+        return res;
+      }),
+      emitFiscalInvoice({
+        invoiceDraft: draftConcurrentB,
+        fiscalConfig,
+        _simulateIndependentCloudRunInstance: true,
+        _onBeforeCommitAttempt: async (attempt) => {
+          instanceBAttempts = attempt;
+          if (attempt === 1) {
+            // Forzar determinísticamente que Instancia A haga commit antes de que Instancia B intente su primer commit OCC
+            await instanceACommittedPromise;
+          }
+        }
+      })
+    ]);
+
+    assert.ok(
+      instanceBAttempts >= 2,
+      `La Instancia B debe haber detectado la contienda OCC y reintentado automáticamente (intentos: ${instanceBAttempts})`
+    );
+
+    const emittedNumbers = [
+      concurrentResA.fiscalRecord.factura.numeroFactura,
+      concurrentResB.fiscalRecord.factura.numeroFactura
+    ].sort();
+    assert.deepStrictEqual(
+      emittedNumbers,
+      ['R-2026-0003', 'R-2026-0004'],
+      'Dos emisiones concurrentes en instancias independientes deben reservar atómicamente R-2026-0003 y R-2026-0004 sin huecos ni colisiones'
+    );
+
+    const verifConcA = await verifyFiscalRecordHash(concurrentResA.fiscalRecord);
+    const verifConcB = await verifyFiscalRecordHash(concurrentResB.fiscalRecord);
+    assert.strictEqual(verifConcA.valid, true, 'Huella SHA-256 de Instancia A debe ser válida');
+    assert.strictEqual(verifConcB.valid, true, 'Huella SHA-256 de Instancia B re-sellada tras OCC debe ser válida');
+    assert.strictEqual(
+      concurrentResB.fiscalRecord.encadenamiento.registroAnterior?.huella,
+      concurrentResA.fiscalRecord.huella.hash,
+      'Tras el reintento OCC, la Instancia B debe encadenar su huella exactamente al hash recién confirmado por la Instancia A'
+    );
+
+    // 11.C: Dos reservas concurrentes de siguiente número (GET /next-number) nunca devuelven el mismo número
+    const [reservedNum1, reservedNum2] = await Promise.all([
+      BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22'),
+      BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22')
+    ]);
+    assert.deepStrictEqual(
+      [reservedNum1, reservedNum2].sort(),
+      ['R-2026-0005', 'R-2026-0006'],
+      'Dos llamadas concurrentes a getNextRectificativaNumeroAsync deben reservar atómicamente R-2026-0005 y R-2026-0006 sin colisión'
+    );
   });
 
   // ---------------------------------------------------------------------------
@@ -1336,14 +1437,221 @@ async function main() {
   });
 
   // ---------------------------------------------------------------------------
-  // 13. P2: TRANSPORTE SOAP REAL (transportMode='real') + VALIDACIÓN XSD DE PETICIÓN Y RESPUESTA
+  // 13. P2: TRANSPORTE SOAP REAL (transportMode='real') CON SERVIDOR HTTPS mTLS REAL + X.509 + XSD
   // ---------------------------------------------------------------------------
-  await runTest("13: [P2] E2E Transporte SOAP real (transportMode: 'real') con verificación de sobre SOAP 1.1, validación XSD de Suministro y de RespuestaSuministro.xsd", async () => {
+  await runTest("13: [P2] E2E Transporte SOAP real (transportMode: 'real') sobre servidor HTTPS mTLS real (https.Agent + certificado X.509 cliente verificado) y validación XSD de Suministro y RespuestaSuministro.xsd", async () => {
     await resetTestEnvironment();
+    const { AeatCertificateProvider } = await import('../src/fiscal/aeatCertificateProvider');
 
-    // Configurar certificado mTLS de pruebas en memoria para habilitar el transporte SOAP real
-    process.env.AEAT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtest\n-----END CERTIFICATE-----';
-    process.env.AEAT_KEY_PEM = '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCtest\n-----END PRIVATE KEY-----';
+    // Helper ASN.1 / DER puro (Node.js crypto) para emitir certificados X.509 v3 reales firmados por una CA de prueba
+    function derLen(len: number): Buffer {
+      if (len < 128) return Buffer.from([len]);
+      const bytes: number[] = [];
+      let n = len;
+      while (n > 0) {
+        bytes.unshift(n & 0xff);
+        n >>= 8;
+      }
+      return Buffer.from([0x80 | bytes.length, ...bytes]);
+    }
+    function derNode(tag: number, content: Buffer): Buffer {
+      return Buffer.concat([Buffer.from([tag]), derLen(content.length), content]);
+    }
+    function derSeq(items: Buffer[]): Buffer {
+      return derNode(0x30, Buffer.concat(items));
+    }
+    function derSet(items: Buffer[]): Buffer {
+      return derNode(0x31, Buffer.concat(items));
+    }
+    function derOid(oid: number[]): Buffer {
+      const first = 40 * oid[0] + oid[1];
+      const body: number[] = [first];
+      for (let i = 2; i < oid.length; i++) {
+        let v = oid[i];
+        const sub: number[] = [v & 0x7f];
+        v = Math.floor(v / 128);
+        while (v > 0) {
+          sub.unshift((v & 0x7f) | 0x80);
+          v = Math.floor(v / 128);
+        }
+        body.push(...sub);
+      }
+      return derNode(0x06, Buffer.from(body));
+    }
+    function derInt(num: number): Buffer {
+      const b = Buffer.alloc(4);
+      b.writeUInt32BE(num, 0);
+      let start = 0;
+      while (start < 3 && b[start] === 0) start++;
+      let slice = b.subarray(start);
+      if (slice[0] & 0x80) slice = Buffer.concat([Buffer.from([0x00]), slice]);
+      return derNode(0x02, slice);
+    }
+    function derUtcTime(date: Date): Buffer {
+      const yy = String(date.getUTCFullYear() % 100).padStart(2, '0');
+      const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(date.getUTCDate()).padStart(2, '0');
+      const hh = String(date.getUTCHours()).padStart(2, '0');
+      const mi = String(date.getUTCMinutes()).padStart(2, '0');
+      const ss = String(date.getUTCSeconds()).padStart(2, '0');
+      return derNode(0x17, Buffer.from(`${yy}${mm}${dd}${hh}${mi}${ss}Z`, 'ascii'));
+    }
+    function derName(cn: string): Buffer {
+      // C=ES, O=AEAT Test PKI, CN=<cn>
+      const attrC = derSet([derSeq([derOid([2, 5, 4, 6]), derNode(0x13, Buffer.from('ES', 'ascii'))])]);
+      const attrO = derSet([derSeq([derOid([2, 5, 4, 10]), derNode(0x0c, Buffer.from('AEAT Test PKI', 'utf8'))])]);
+      const attrCN = derSet([derSeq([derOid([2, 5, 4, 3]), derNode(0x0c, Buffer.from(cn, 'utf8'))])]);
+      return derSeq([attrC, attrO, attrCN]);
+    }
+    function createX509Pem(opts: {
+      serial: number;
+      subjectCn: string;
+      issuerCn: string;
+      subjectPubKeyDer: Buffer;
+      issuerPrivKeyPem: string;
+      isCa: boolean;
+      sanDns?: string[];
+      sanIps?: number[][];
+    }): string {
+      const version = derNode(0xa0, derInt(2)); // v3
+      const serial = derInt(opts.serial);
+      // sha256WithRSAEncryption (1.2.840.113549.1.1.11)
+      const sigAlg = derSeq([derOid([1, 2, 840, 113549, 1, 1, 11]), Buffer.from([0x05, 0x00])]);
+      const issuer = derName(opts.issuerCn);
+      const now = Date.now();
+      const validity = derSeq([
+        derUtcTime(new Date(now - 24 * 3600 * 1000)),
+        derUtcTime(new Date(now + 365 * 24 * 3600 * 1000))
+      ]);
+      const subject = derName(opts.subjectCn);
+
+      const exts: Buffer[] = [];
+      // BasicConstraints (2.5.29.19)
+      const bcVal = opts.isCa ? derSeq([Buffer.from([0x01, 0x01, 0xff])]) : derSeq([]);
+      exts.push(derSeq([derOid([2, 5, 29, 19]), Buffer.from([0x01, 0x01, 0xff]), derNode(0x04, bcVal)]));
+
+      // ExtendedKeyUsage (2.5.29.37): serverAuth (1.3.6.1.5.5.7.3.1) + clientAuth (1.3.6.1.5.5.7.3.2)
+      if (!opts.isCa) {
+        const ekuVal = derSeq([
+          derOid([1, 3, 6, 1, 5, 5, 7, 3, 1]),
+          derOid([1, 3, 6, 1, 5, 5, 7, 3, 2])
+        ]);
+        exts.push(derSeq([derOid([2, 5, 29, 37]), derNode(0x04, ekuVal)]));
+      }
+
+      // SubjectAltName (2.5.29.17)
+      if ((opts.sanDns && opts.sanDns.length > 0) || (opts.sanIps && opts.sanIps.length > 0)) {
+        const generalNames: Buffer[] = [];
+        for (const dns of opts.sanDns || []) {
+          generalNames.push(derNode(0x82, Buffer.from(dns, 'ascii')));
+        }
+        for (const ip of opts.sanIps || []) {
+          generalNames.push(derNode(0x87, Buffer.from(ip)));
+        }
+        exts.push(derSeq([derOid([2, 5, 29, 17]), derNode(0x04, derSeq(generalNames))]));
+      }
+
+      const extensions = derNode(0xa3, derSeq(exts));
+      const tbs = derSeq([version, serial, sigAlg, issuer, validity, subject, opts.subjectPubKeyDer, extensions]);
+      const signature = crypto.sign('sha256', tbs, opts.issuerPrivKeyPem);
+      const bitStringSig = derNode(0x03, Buffer.concat([Buffer.from([0x00]), signature]));
+      const certDer = derSeq([tbs, sigAlg, bitStringSig]);
+      const b64 = certDer.toString('base64').match(/.{1,64}/g)!.join('\n');
+      return `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----\n`;
+    }
+
+    // 1. Generar PKI X.509 real: CA Raíz, Certificado Servidor AEAT y Certificado Cliente mTLS del Obligado
+    const caKeys = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    const serverKeys = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    const clientKeys = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+
+    const caCertPem = createX509Pem({
+      serial: 100,
+      subjectCn: 'AEAT Root CA Pruebas',
+      issuerCn: 'AEAT Root CA Pruebas',
+      subjectPubKeyDer: caKeys.publicKey,
+      issuerPrivKeyPem: caKeys.privateKey,
+      isCa: true
+    });
+    const serverCertPem = createX509Pem({
+      serial: 101,
+      subjectCn: 'prewww1.aeat.es',
+      issuerCn: 'AEAT Root CA Pruebas',
+      subjectPubKeyDer: serverKeys.publicKey,
+      issuerPrivKeyPem: caKeys.privateKey,
+      isCa: false,
+      sanDns: ['prewww1.aeat.es', 'localhost'],
+      sanIps: [[127, 0, 0, 1]]
+    });
+    const clientCertPem = createX509Pem({
+      serial: 102,
+      subjectCn: `${OBLIGADO_NIF} - Granja Avicola El Valle SL`,
+      issuerCn: 'AEAT Root CA Pruebas',
+      subjectPubKeyDer: clientKeys.publicKey,
+      issuerPrivKeyPem: caKeys.privateKey,
+      isCa: false
+    });
+
+    // Verificar criptográficamente el par PEM de cliente con AeatCertificateProvider
+    const certValidation = AeatCertificateProvider.validatePemCertificatePair(clientCertPem, clientKeys.privateKey);
+    assert.strictEqual(certValidation.valid, true, `El certificado X.509 de cliente debe ser válido: ${certValidation.reason}`);
+
+    process.env.AEAT_CERT_PEM = clientCertPem;
+    process.env.AEAT_KEY_PEM = clientKeys.privateKey;
+    AeatCertificateProvider.clear();
+
+    let capturedSoapUrl = '';
+    let capturedSoapHeaders: Record<string, any> = {};
+    let capturedSoapEnvelopeRequest = '';
+    let capturedSoapResponseBody = '';
+    let mTlsClientAuthorized = false;
+    let mTlsClientCertSubject = '';
+
+    // 2. Levantar servidor HTTPS local con mTLS estricto (requestCert: true, rejectUnauthorized: true)
+    const mtlsServer = https.createServer(
+      {
+        key: serverKeys.privateKey,
+        cert: serverCertPem,
+        ca: [caCertPem],
+        requestCert: true,
+        rejectUnauthorized: true
+      },
+      (req, res) => {
+        const tlsSocket = req.socket as any;
+        mTlsClientAuthorized = Boolean(tlsSocket.authorized);
+        const peerCert = tlsSocket.getPeerCertificate?.() || {};
+        mTlsClientCertSubject = peerCert?.subject?.CN || '';
+        capturedSoapUrl = req.url || '';
+        capturedSoapHeaders = req.headers;
+
+        let body = '';
+        req.setEncoding('utf-8');
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          capturedSoapEnvelopeRequest = body;
+          res.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
+          res.end(capturedSoapResponseBody);
+        });
+      }
+    );
+
+    await new Promise<void>((resolve) => mtlsServer.listen(0, '127.0.0.1', () => resolve()));
+    const address = mtlsServer.address() as { port: number };
+    const localMtlsEndpoint = `https://127.0.0.1:${address.port}/wlpl/TIKE-CONT/ws/SistemaFacturacion/VerifactuSOAP`;
 
     try {
       const orig = await emitFiscalInvoice({
@@ -1363,58 +1671,65 @@ async function main() {
         tipoRectificativa: 'por_diferencias',
         claveTipoFactura: 'R1',
         codigoMotivo: '01',
-        motivoTexto: 'Rectificativa remitida por transporte SOAP 1.1 real'
+        motivoTexto: 'Rectificativa remitida por transporte SOAP 1.1 mTLS real'
       });
       const emittedRect = await emitFiscalInvoice({ invoiceDraft: rectDraft, fiscalConfig });
 
-      let capturedSoapUrl = '';
-      let capturedSoapHeaders: Record<string, string> = {};
-      let capturedSoapEnvelopeRequest = '';
-      let capturedSoapResponseBody = '';
+      capturedSoapResponseBody = MockAeatTransport.generateMockResponseBody('ACCEPTANCE', {
+        nifEmisor: OBLIGADO_NIF,
+        tiempoEsperaEnvio: 60,
+        records: [
+          {
+            nifEmisor: OBLIGADO_NIF,
+            numSerie: orig.fiscalRecord.factura.numeroFactura,
+            fechaExpedicion: orig.fiscalRecord.factura.fechaExpedicion,
+            operacion: 'Alta',
+            estadoRegistro: 'Correcto'
+          },
+          {
+            nifEmisor: OBLIGADO_NIF,
+            numSerie: emittedRect.fiscalRecord.factura.numeroFactura,
+            fechaExpedicion: emittedRect.fiscalRecord.factura.fechaExpedicion,
+            operacion: 'Alta',
+            estadoRegistro: 'Correcto'
+          }
+        ]
+      });
 
-      const realSoapServerInterceptor: typeof fetch = async (input: any, init?: any) => {
-        capturedSoapUrl = String(input);
-        capturedSoapHeaders = (init?.headers || {}) as Record<string, string>;
-        capturedSoapEnvelopeRequest = String(init?.body || '');
-
-        capturedSoapResponseBody = MockAeatTransport.generateMockResponseBody('ACCEPTANCE', {
-          nifEmisor: OBLIGADO_NIF,
-          tiempoEsperaEnvio: 60,
-          records: [
-            {
-              nifEmisor: OBLIGADO_NIF,
-              numSerie: orig.fiscalRecord.factura.numeroFactura,
-              fechaExpedicion: orig.fiscalRecord.factura.fechaExpedicion,
-              operacion: 'Alta',
-              estadoRegistro: 'Correcto'
-            },
-            {
-              nifEmisor: OBLIGADO_NIF,
-              numSerie: emittedRect.fiscalRecord.factura.numeroFactura,
-              fechaExpedicion: emittedRect.fiscalRecord.factura.fechaExpedicion,
-              operacion: 'Alta',
-              estadoRegistro: 'Correcto'
-            }
-          ]
-        });
-
-        return new Response(capturedSoapResponseBody, {
-          status: 200,
-          headers: { 'Content-Type': 'text/xml; charset=utf-8' }
-        });
-      };
-
+      // 3. Ejecutar envío Outbox usando el camino nativo https.request + https.Agent (SIN customFetch)
       AeatFlowControlManager.reset();
       const realSubmitRes = await executeAuthoritativeOutboxSubmission({
         batchFromOutbox: true,
         obligadoTributarioId: OBLIGADO_NIF,
         internalTestOptions: {
           transportMode: 'real',
-          customFetch: realSoapServerInterceptor
+          endpointOverride: localMtlsEndpoint,
+          customCaCerts: caCertPem,
+          servername: 'prewww1.aeat.es'
         }
       });
 
-      // 1. Verificar estructura SOAP 1.1 de salida y extraer <sfLR:RegFactuSistemaFacturacion>
+      // 4. Verificar autenticación mutua TLS (mTLS) real en el socket del servidor
+      assert.strictEqual(
+        mTlsClientAuthorized,
+        true,
+        'El servidor HTTPS mTLS debe haber autenticado criptográficamente el certificado X.509 de cliente enviado por https.Agent'
+      );
+      assert.ok(
+        mTlsClientCertSubject.includes(OBLIGADO_NIF),
+        `El certificado X.509 de cliente presentado en el handshake TLS debe pertenecer al obligado ${OBLIGADO_NIF} (recibido: ${mTlsClientCertSubject})`
+      );
+      assert.strictEqual(
+        capturedSoapUrl,
+        '/wlpl/TIKE-CONT/ws/SistemaFacturacion/VerifactuSOAP',
+        'Debe invocar la ruta SOAP oficial de VerifactuSOAP'
+      );
+      assert.ok(
+        String(capturedSoapHeaders['content-type'] || '').includes('text/xml'),
+        'Debe enviar cabecera SOAP Content-Type: text/xml'
+      );
+
+      // 5. Verificar estructura SOAP 1.1 de salida y extraer <sfLR:RegFactuSistemaFacturacion>
       assert.ok(
         capturedSoapEnvelopeRequest.includes('<soapenv:Envelope') &&
           capturedSoapEnvelopeRequest.includes('<soapenv:Body>'),
@@ -1425,7 +1740,7 @@ async function main() {
       );
       assert.ok(bodyMatch, 'El cuerpo SOAP debe contener <sfLR:RegFactuSistemaFacturacion>');
 
-      // 2. Validar el payload XML extraído del sobre SOAP contra los XSD oficiales de Suministro AEAT
+      // 6. Validar el payload XML extraído del sobre SOAP contra los XSD oficiales de Suministro AEAT
       const reqXsdReport = validateXmlAgainstOfficialXsd(bodyMatch[0]);
       assert.strictEqual(
         reqXsdReport.valid,
@@ -1437,7 +1752,7 @@ async function main() {
         'El sobre SOAP real debe transportar <sf:FechaOperacion>08-10-2026</sf:FechaOperacion>'
       );
 
-      // 3. Validar la respuesta SOAP 1.1 oficial AEAT contra RespuestaSuministro.xsd
+      // 7. Validar la respuesta SOAP 1.1 oficial AEAT contra RespuestaSuministro.xsd
       const respBodyMatch = capturedSoapResponseBody.match(
         /<sfR:RespuestaRegFactuSistemaFacturacion[\s\S]*<\/sfR:RespuestaRegFactuSistemaFacturacion>/
       );
@@ -1452,14 +1767,6 @@ async function main() {
         `La respuesta SOAP AEAT no superó RespuestaSuministro.xsd: ${respXsdReport.errors.join('; ')}`
       );
 
-      assert.ok(
-        capturedSoapUrl.includes('aeat.es') || capturedSoapUrl.includes('agenciatributaria.gob.es'),
-        `Debe invocar el endpoint oficial AEAT (recibido: ${capturedSoapUrl})`
-      );
-      assert.ok(
-        (capturedSoapHeaders['Content-Type'] || '').includes('text/xml'),
-        'Debe enviar cabecera SOAP Content-Type: text/xml'
-      );
       assert.strictEqual(realSubmitRes.submission?.estado, 'ACCEPTED');
       assert.strictEqual(realSubmitRes.cantidadRegistros, 2);
       assert.strictEqual(realSubmitRes.submission?.csv, 'CSV-AEAT-1234567890ABCDEF');
@@ -1467,8 +1774,373 @@ async function main() {
       assert.strictEqual(realSubmitRes.resultadosIndividuales?.[1].numeroFactura, 'R-2026-0001');
       assert.strictEqual(realSubmitRes.resultadosIndividuales?.[1].estado, 'ACCEPTED');
     } finally {
+      await new Promise<void>((resolve) => mtlsServer.close(() => resolve()));
       delete process.env.AEAT_CERT_PEM;
       delete process.env.AEAT_KEY_PEM;
+      AeatCertificateProvider.clear();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. P1: VALIDACIÓN FAIL-CLOSED DE RESPUESTASUMINISTRO.XSD EN EL CAMINO PRODUCTIVO
+  // ---------------------------------------------------------------------------
+  await runTest("14: [P1] Validación fail-closed de RespuestaSuministro.xsd en el camino productivo: rechazo de respuesta AEAT que incumple XSD antes de alterar el estado fiscal", async () => {
+    await resetTestEnvironment();
+
+    process.env.AEAT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtest\n-----END CERTIFICATE-----';
+    process.env.AEAT_KEY_PEM = '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCtest\n-----END PRIVATE KEY-----';
+
+    try {
+      const orig = await emitFiscalInvoice({
+        invoiceDraft: createOriginalF1Invoice({
+          id: 'inv-xsd-resp-fail-orig',
+          numeroFactura: 'FAC-2026-1401',
+          fecha: '2026-10-10'
+        }),
+        fiscalConfig
+      });
+
+      const rectDraft = buildRectificativaFacturaFromUiState({
+        facturaOriginal: orig.invoice,
+        fecha: '2026-10-28',
+        modo: 'anulacion_total',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '01',
+        motivoTexto: 'Rectificativa ante respuesta AEAT XSD inválida'
+      });
+      const emittedRect = await emitFiscalInvoice({ invoiceDraft: rectDraft, fiscalConfig });
+
+      // Servidor devuelve un XML bien formado sintácticamente que aparenta EstadoEnvio=Correcto y CSV válido,
+      // pero introduce una etiqueta no permitida / viola RespuestaSuministro.xsd (falta Cabecera obligatoria y EstadoEnvio fuera de enumeración XSD).
+      const malformedXsdSoapResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:sfR="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/RespuestaSuministro.xsd"
+                  xmlns:sf="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/SistemaFacturacion.xsd">
+  <soapenv:Body>
+    <sfR:RespuestaRegFactuSistemaFacturacion>
+      <sfR:CSV>CSV-FALSO-NO-CONFIAR-999</sfR:CSV>
+      <sfR:TiempoEsperaEnvio>60</sfR:TiempoEsperaEnvio>
+      <sfR:EstadoEnvio>Correcto</sfR:EstadoEnvio>
+      <sfR:ElementoIntrusoNoPermitidoPorXsd>MALICIOUS_OR_CORRUPTED</sfR:ElementoIntrusoNoPermitidoPorXsd>
+      <sfR:RespuestaLinea>
+        <sfR:IDFactura>
+          <sf:IDEmisorFactura>${OBLIGADO_NIF}</sf:IDEmisorFactura>
+          <sf:NumSerieFactura>${emittedRect.fiscalRecord.factura.numeroFactura}</sf:NumSerieFactura>
+          <sf:FechaExpedicionFactura>${emittedRect.fiscalRecord.factura.fechaExpedicion}</sf:FechaExpedicionFactura>
+        </sfR:IDFactura>
+        <sfR:EstadoRegistro>Correcto</sfR:EstadoRegistro>
+      </sfR:RespuestaLinea>
+    </sfR:RespuestaRegFactuSistemaFacturacion>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+
+      AeatFlowControlManager.reset();
+      const submitRes = await executeAuthoritativeOutboxSubmission({
+        batchFromOutbox: true,
+        obligadoTributarioId: OBLIGADO_NIF,
+        internalTestOptions: {
+          transportMode: 'real',
+          customFetch: async () =>
+            new Response(malformedXsdSoapResponse, {
+              status: 200,
+              headers: { 'Content-Type': 'text/xml; charset=utf-8' }
+            })
+        }
+      });
+
+      // El camino productivo debe rechazar fail-closed la respuesta que incumple RespuestaSuministro.xsd
+      assert.strictEqual(
+        submitRes.submission?.estado,
+        'FAILED_TECHNICAL',
+        'El backend debe rechazar fail-closed (FAILED_TECHNICAL) una respuesta que incumple RespuestaSuministro.xsd aunque diga EstadoEnvio=Correcto'
+      );
+      assert.strictEqual(
+        submitRes.submission?.codigoAeat,
+        'ERR_XML_INVALID',
+        'Debe registrar código ERR_XML_INVALID cuando falla la validación RespuestaSuministro.xsd'
+      );
+      assert.ok(
+        (submitRes.submission?.descripcion || '').includes('RECHAZO_XSD_RESPUESTA_AEAT'),
+        `La descripción del rechazo debe evidenciar RECHAZO_XSD_RESPUESTA_AEAT (recibido: ${submitRes.submission?.descripcion})`
+      );
+      assert.strictEqual(
+        submitRes.submission?.csv,
+        undefined,
+        'No debe confiar ni almacenar el CSV de una respuesta que no superó RespuestaSuministro.xsd'
+      );
+
+      // Verificar que el registro fiscal en custodia NO pasó a ACCEPTED
+      const custodyRecordAfter = await BackendFiscalCustody.getFiscalRecordByIdAsync(emittedRect.fiscalRecord.id);
+      assert.notStrictEqual(
+        custodyRecordAfter?.estadoEnvio,
+        'ACCEPTED',
+        'El estado fiscal del registro custodiado NO debe alterarse a ACCEPTED cuando la respuesta AEAT incumple RespuestaSuministro.xsd'
+      );
+    } finally {
+      delete process.env.AEAT_CERT_PEM;
+      delete process.env.AEAT_KEY_PEM;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. P2: AUTORIDAD DISTRIBUIDA EN MODO FISCAL_COORDINATOR_MODE='firestore' (TRANSACCIONES OCC)
+  // ---------------------------------------------------------------------------
+  await runTest("15: [P2] E2E Autoridad distribuida con FISCAL_COORDINATOR_MODE='firestore': reserva atómica, emisión concurrente OCC (runTransaction) y remisión Outbox sobre colecciones Firestore", async () => {
+    await resetTestEnvironment();
+
+    const prevCoordinatorModeEnv = process.env.FISCAL_COORDINATOR_MODE;
+    process.env.FISCAL_COORDINATOR_MODE = 'firestore';
+    CloudDistributedChainCoordinator.setMode(null); // Usar resolución real desde process.env.FISCAL_COORDINATOR_MODE
+
+    // Motor transaccional Firestore en memoria con semántica real de colecciones, queries y transacciones OCC (runTransaction)
+    const collections: Record<string, Map<string, any>> = {
+      fiscal_chain_state: new Map(),
+      fiscal_records: new Map(),
+      fiscal_submissions: new Map(),
+      fiscal_events: new Map(),
+      aeat_send_locks: new Map(),
+      aeat_flow_control: new Map()
+    };
+    let transactionCount = 0;
+
+    function getColMap(name: string): Map<string, any> {
+      if (!collections[name]) collections[name] = new Map();
+      return collections[name];
+    }
+
+    function createDocRef(colName: string, docId: string) {
+      return {
+        __type: 'doc',
+        colName,
+        docId,
+        get: async () => {
+          const map = getColMap(colName);
+          const val = map.get(docId);
+          return {
+            exists: val !== undefined,
+            data: () => (val !== undefined ? JSON.parse(JSON.stringify(val)) : undefined)
+          };
+        },
+        set: async (data: any) => {
+          getColMap(colName).set(docId, JSON.parse(JSON.stringify(data)));
+        },
+        update: async (data: any) => {
+          const map = getColMap(colName);
+          const cur = map.get(docId) || {};
+          map.set(docId, JSON.parse(JSON.stringify({ ...cur, ...data })));
+        }
+      };
+    }
+
+    function createQueryRef(colName: string, field: string, op: string, value: any) {
+      return {
+        __type: 'query',
+        colName,
+        field,
+        op,
+        value,
+        get: async () => {
+          const map = getColMap(colName);
+          const matched: any[] = [];
+          for (const item of map.values()) {
+            if (op === '==' && item?.[field] === value) {
+              matched.push(JSON.parse(JSON.stringify(item)));
+            } else if (op === 'array-contains' && Array.isArray(item?.[field]) && item[field].includes(value)) {
+              matched.push(JSON.parse(JSON.stringify(item)));
+            }
+          }
+          return {
+            empty: matched.length === 0,
+            size: matched.length,
+            forEach: (cb: (doc: { data: () => any }) => void) => {
+              for (const m of matched) {
+                cb({ data: () => m });
+              }
+            }
+          };
+        }
+      };
+    }
+
+    let txLock: Promise<void> = Promise.resolve();
+    const transactionalFirestoreEngine = {
+      collection: (colName: string) => ({
+        doc: (docId: string) => createDocRef(colName, docId),
+        where: (field: string, op: string, value: any) => createQueryRef(colName, field, op, value)
+      }),
+      runTransaction: async <T>(updateFunction: (tx: any) => Promise<T>): Promise<T> => {
+        // Serializar la ejecución atómica de cada transacción OCC en Firestore
+        const prev = txLock;
+        let releaseTx!: () => void;
+        txLock = new Promise<void>((res) => {
+          releaseTx = res;
+        });
+        await prev;
+        transactionCount++;
+        try {
+          const stagedWrites: Array<() => Promise<void>> = [];
+          const tx = {
+            get: async (refOrQuery: any) => refOrQuery.get(),
+            set: (docRef: any, data: any) => {
+              stagedWrites.push(() => docRef.set(data));
+            },
+            update: (docRef: any, data: any) => {
+              stagedWrites.push(() => docRef.update(data));
+            }
+          };
+          const res = await updateFunction(tx);
+          for (const writeOp of stagedWrites) {
+            await writeOp();
+          }
+          return res;
+        } finally {
+          releaseTx();
+        }
+      }
+    };
+
+    CloudDistributedChainCoordinator.setFirestoreAdminInstance(transactionalFirestoreEngine as any);
+
+    try {
+      // 1. Verificar que el coordinador está operando estrictamente en modo 'firestore'
+      assert.strictEqual(
+        CloudDistributedChainCoordinator.getMode(),
+        'firestore',
+        'El coordinador debe operar en modo firestore cuando FISCAL_COORDINATOR_MODE=firestore'
+      );
+
+      // 2. Emitir factura original F1 en modo Firestore
+      const origRes = await emitFiscalInvoice({
+        invoiceDraft: createOriginalF1Invoice({
+          id: 'inv-fs-mode-orig',
+          numeroFactura: 'FAC-2026-1501',
+          fecha: '2026-10-10'
+        }),
+        fiscalConfig
+      });
+      assert.strictEqual(origRes.fiscalRecord.encadenamiento.primerRegistro, true);
+
+      // 3. Emitir 2 rectificativas R1 en concurrencia multi-instancia (Promise.all) contra Firestore OCC
+      let notifyFsInstanceADone!: () => void;
+      const waitFsInstanceADone = new Promise<void>((res) => {
+        notifyFsInstanceADone = res;
+      });
+      let fsInstanceBAttempts = 0;
+
+      const fsDraftA = buildRectificativaFacturaFromUiState({
+        facturaOriginal: origRes.invoice,
+        numeroFactura: 'R-2026-0001',
+        fecha: '2026-10-29',
+        modo: 'parcial',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '01',
+        motivoTexto: 'Rectificativa A en modo Firestore OCC',
+        lineasModificadas: [
+          {
+            id: 'lin-fs-a',
+            loteEnvasadoId: 'lot-1',
+            codigoLoteEnvasado: 'LOTE-2026-01',
+            formatoId: 'fmt-1',
+            nombreFormato: 'Estuche 12 Huevos L',
+            cantidadEstuches: -10,
+            precioUnitario: 2.5,
+            subtotal: -25.0,
+            fechaConsumoPreferente: '2026-11-10',
+            trazabilidadPuesta: []
+          }
+        ]
+      });
+
+      const fsDraftB = buildRectificativaFacturaFromUiState({
+        facturaOriginal: origRes.invoice,
+        numeroFactura: 'R-2026-0001', // Mismo borrador inicial -> el coordinador Firestore resolverá R-2026-0001 y R-2026-0002
+        fecha: '2026-10-29',
+        modo: 'parcial',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '01',
+        motivoTexto: 'Rectificativa B en modo Firestore OCC',
+        lineasModificadas: [
+          {
+            id: 'lin-fs-b',
+            loteEnvasadoId: 'lot-1',
+            codigoLoteEnvasado: 'LOTE-2026-01',
+            formatoId: 'fmt-1',
+            nombreFormato: 'Estuche 12 Huevos L',
+            cantidadEstuches: -20,
+            precioUnitario: 2.5,
+            subtotal: -50.0,
+            fechaConsumoPreferente: '2026-11-10',
+            trazabilidadPuesta: []
+          }
+        ]
+      });
+
+      const [fsResA, fsResB] = await Promise.all([
+        emitFiscalInvoice({
+          invoiceDraft: fsDraftA,
+          fiscalConfig,
+          _simulateIndependentCloudRunInstance: true,
+          persistRecordFn: async (rec) => {
+            await BackendFiscalCustody.saveFiscalRecord(rec);
+            notifyFsInstanceADone();
+          }
+        }),
+        emitFiscalInvoice({
+          invoiceDraft: fsDraftB,
+          fiscalConfig,
+          _simulateIndependentCloudRunInstance: true,
+          _onBeforeCommitAttempt: async (attempt) => {
+            fsInstanceBAttempts = attempt + 1;
+            if (attempt === 0) {
+              await waitFsInstanceADone;
+            }
+          }
+        })
+      ]);
+
+      assert.ok(fsInstanceBAttempts >= 2, 'La instancia B debe haber reintentado tras detectar contienda OCC en Firestore');
+      const fsNums = [fsResA.fiscalRecord.factura.numeroFactura, fsResB.fiscalRecord.factura.numeroFactura].sort();
+      assert.deepStrictEqual(
+        fsNums,
+        ['R-2026-0001', 'R-2026-0002'],
+        'En modo Firestore OCC debe asignar R-2026-0001 y R-2026-0002 sin duplicados ni huecos'
+      );
+
+      // 4. Verificar el documento de estado en la colección Firestore `fiscal_chain_state`
+      const chainStateDoc = collections.fiscal_chain_state.get(OBLIGADO_NIF);
+      assert.ok(chainStateDoc, 'Debe existir el documento de estado en fiscal_chain_state de Firestore');
+      assert.strictEqual(chainStateDoc.totalRecords, 3);
+      assert.strictEqual(chainStateDoc.sequence, 3);
+      assert.strictEqual(chainStateDoc.rectificativaCountersByYear?.['2026'], 2);
+      assert.strictEqual(collections.fiscal_records.size, 3, 'Deben existir los 3 FiscalRecord en la colección fiscal_records de Firestore');
+      assert.ok(transactionCount >= 4, `Se deben haber ejecutado transacciones OCC reales en Firestore (ejecutadas: ${transactionCount})`);
+
+      // 5. Ejecutar remisión Outbox completa en modo Firestore y verificar persistencia en fiscal_submissions y fiscal_events
+      AeatFlowControlManager.reset();
+      const outboxRes = await executeAuthoritativeOutboxSubmission({
+        batchFromOutbox: true,
+        obligadoTributarioId: OBLIGADO_NIF,
+        internalTestOptions: {
+          transportMode: 'mock',
+          mockScenario: 'ACCEPTANCE'
+        }
+      });
+
+      assert.strictEqual(outboxRes.submission?.estado, 'ACCEPTED');
+      assert.strictEqual(outboxRes.cantidadRegistros, 3);
+      assert.ok(collections.fiscal_submissions.size >= 1, 'La sumisión debe haberse persistido en la colección fiscal_submissions de Firestore');
+      assert.ok(collections.fiscal_events.size >= 1, 'Los eventos deben haberse persistido en la colección fiscal_events de Firestore');
+    } finally {
+      CloudDistributedChainCoordinator.setFirestoreAdminInstance(null);
+      if (prevCoordinatorModeEnv !== undefined) {
+        process.env.FISCAL_COORDINATOR_MODE = prevCoordinatorModeEnv;
+      } else {
+        delete process.env.FISCAL_COORDINATOR_MODE;
+      }
+      CloudDistributedChainCoordinator.setMode('simulator');
     }
   });
 

@@ -518,6 +518,15 @@ export interface AeatTransportOptions {
   readonly endpointOverride?: string;
   readonly httpHeaders?: Record<string, string>;
   readonly customFetch?: (url: string, init: any) => Promise<any>;
+  /**
+   * Certificados CA raíz de confianza adicionales (PEM) para el handshake TLS del servidor.
+   * Permite validar conexiones mTLS reales contra servidores de prueba locales con PKI propia.
+   */
+  readonly customCaCerts?: string | string[] | Buffer;
+  /**
+   * Nombre de servidor TLS (SNI / checkServerIdentity) esperado en pruebas locales mTLS.
+   */
+  readonly servername?: string;
   readonly acquireLock?: boolean;
   /**
    * Identificadores de registros que están siendo reconciliados tras un estado SENDING huérfano
@@ -692,7 +701,11 @@ export async function executeAeatSubmission(params: {
       'https://prewww10.aeat.es',
       'mock://'
     ];
-    const isAllowed = allowedPrefixes.some(prefix => override.startsWith(prefix));
+    const isLocalMtlsTestLoopback =
+      process.env.NODE_ENV !== 'production' &&
+      Boolean(options.customCaCerts) &&
+      (override.startsWith('https://127.0.0.1:') || override.startsWith('https://localhost:'));
+    const isAllowed = allowedPrefixes.some(prefix => override.startsWith(prefix)) || isLocalMtlsTestLoopback;
     if (!isAllowed) {
       throw new Error(`executeAeatSubmission: endpointOverride ('${override}') no autorizado. Solo se permiten destinos oficiales de la Agencia Tributaria. Prohibido desviar tráfico o credenciales mTLS a hosts de terceros.`);
     }
@@ -853,7 +866,11 @@ export async function executeAeatSubmission(params: {
             'https://prewww10.aeat.es',
             'mock://'
           ];
-          const isAllowed = allowedPrefixes.some(prefix => override.startsWith(prefix));
+          const isLocalMtlsTestLoopback =
+            process.env.NODE_ENV !== 'production' &&
+            Boolean(options.customCaCerts) &&
+            (override.startsWith('https://127.0.0.1:') || override.startsWith('https://localhost:'));
+          const isAllowed = allowedPrefixes.some(prefix => override.startsWith(prefix)) || isLocalMtlsTestLoopback;
           if (!isAllowed) {
             throw new Error(`executeAeatSubmission: endpointOverride ('${override}') no autorizado. Solo se permiten destinos oficiales de la Agencia Tributaria. Prohibido desviar tráfico o credenciales mTLS a hosts de terceros.`);
           }
@@ -876,14 +893,38 @@ export async function executeAeatSubmission(params: {
           httpStatus = res.status;
           responseText = await res.text();
         } else {
-          // En entorno Node.js, utilizar agente HTTPS mTLS nativo con las credenciales
+          // En entorno Node.js, utilizar agente HTTPS mTLS nativo con las credenciales X.509
           if (!certCreds) {
             throw new Error('executeAeatSubmission: No se dispone de credenciales de certificado mTLS para la conexión real con AEAT.');
           }
 
+          // Si son credenciales PEM, validar criptográficamente el certificado X.509 y su clave privada antes de abrir el socket
+          if (certCreds.cert && certCreds.key) {
+            if (certCreds.cert.includes('-----BEGIN CERTIFICATE-----') && certCreds.key.includes('-----BEGIN')) {
+              const certCheck = AeatCertificateProvider.validatePemCertificatePair(
+                certCreds.cert,
+                certCreds.key,
+                certCreds.passphrase
+              );
+              if (!certCheck.valid && configuredMode === 'real') {
+                throw new Error(`executeAeatSubmission: Credenciales mTLS inválidas (${certCheck.reason})`);
+              }
+            }
+          }
+
           const httpsAgent = certCreds.pfx
-            ? new https.Agent({ pfx: certCreds.pfx, passphrase: certCreds.passphrase, rejectUnauthorized: true })
-            : new https.Agent({ cert: certCreds.cert, key: certCreds.key, rejectUnauthorized: true });
+            ? new https.Agent({
+                pfx: certCreds.pfx,
+                passphrase: certCreds.passphrase,
+                ca: options?.customCaCerts,
+                rejectUnauthorized: true
+              })
+            : new https.Agent({
+                cert: certCreds.cert,
+                key: certCreds.key,
+                ca: options?.customCaCerts,
+                rejectUnauthorized: true
+              });
 
           const timeoutMs = options?.timeoutMs || 30000;
           const urlObj = new URL(endpoint);
@@ -892,6 +933,7 @@ export async function executeAeatSubmission(params: {
             const req = https.request(urlObj, {
               method: 'POST',
               agent: httpsAgent,
+              ...(options?.servername ? { servername: options.servername } : {}),
               headers: {
                 'Content-Type': 'text/xml; charset=utf-8',
                 'SOAPAction': '""',
@@ -981,10 +1023,10 @@ export async function executeAeatSubmission(params: {
         };
       }
 
-      // 4. Parsear la respuesta funcional de la AEAT
+      // 4. Parsear y validar formalmente contra RespuestaSuministro.xsd (libxml2-wasm Fail-Closed) la respuesta funcional de la AEAT
       let parsed: AeatParsedResponse;
       try {
-        parsed = parseAeatXmlResponse(responseText);
+        parsed = parseAeatXmlResponse(responseText, { enforceOfficialXsd: true });
       } catch (parseErr: any) {
         // Si la respuesta no es un XML válido conforme a la especificación, es un fallo técnico
         const parseErrorMsg = parseErr?.message || 'Respuesta devuelta por la AEAT no es un XML válido';

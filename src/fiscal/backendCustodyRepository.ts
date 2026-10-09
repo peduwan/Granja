@@ -893,15 +893,25 @@ export class BackendFiscalCustody {
   }
 
   /**
-   * Obtiene el siguiente número de factura rectificativa consultando la autoridad (Firestore/Custodia).
+   * Reserva atómicamente el siguiente número de factura rectificativa consultando y actualizando
+   * el contador distribuido en la autoridad (Firestore / Cloud Coordinator).
+   * Garantiza que dos solicitudes concurrentes nunca reciban el mismo número.
    */
   public static async getNextRectificativaNumeroAsync(
     obligadoTributarioId: string,
     fechaExpedicion?: string
   ): Promise<string> {
     const cleanObligado = obligadoTributarioId.trim().toUpperCase();
+    const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    const reserved = await CloudDistributedChainCoordinator.reserveNextRectificativaNumber(
+      cleanObligado,
+      fechaExpedicion
+    );
     const records = await this.getAllFiscalRecordsByObligadoAsync(cleanObligado);
-    return this.computeNextRectificativaNumber(records, fechaExpedicion);
+    const custodyNext = this.computeNextRectificativaNumber(records, fechaExpedicion);
+    const parsedReserved = parseInt(reserved.split('-')[2] || '0', 10);
+    const parsedCustody = parseInt(custodyNext.split('-')[2] || '0', 10);
+    return parsedCustody > parsedReserved ? custodyNext : reserved;
   }
 
   /**

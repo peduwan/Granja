@@ -78,6 +78,9 @@ export interface AuthoritativeSubmitRequest {
     readonly staleSendingThresholdMs?: number;
     readonly nowMs?: number;
     readonly customFetch?: typeof fetch;
+    readonly endpointOverride?: string;
+    readonly customCaCerts?: string | string[] | Buffer;
+    readonly servername?: string;
   };
 }
 
@@ -705,6 +708,9 @@ export async function executeAuthoritativeOutboxSubmission(
           mockTiempoEsperaEnvio: internalTestOptions?.mockTiempoEsperaEnvio,
           mockLineOverrides: internalTestOptions?.mockLineOverrides,
           customFetch: internalTestOptions?.customFetch,
+          endpointOverride: internalTestOptions?.endpointOverride,
+          customCaCerts: internalTestOptions?.customCaCerts,
+          servername: internalTestOptions?.servername,
           reconcilingRecordIds: batchReconcilingRecordIds,
           acquireLock: false,
           actor: actor || {

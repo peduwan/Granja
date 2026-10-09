@@ -57,6 +57,10 @@ export interface EmitFiscalInvoiceParams {
   previousRecordRef?: FiscalRecordRef | FiscalRecord | null;
   /** Inyección opcional para testing/mocks de persistencia */
   persistRecordFn?: (record: FiscalRecord) => Promise<boolean | void>;
+  /** Hook opcional para tests de contienda OCC multi-instancia (simula dos instancias Cloud Run sin cola en memoria compartida) */
+  _simulateIndependentCloudRunInstance?: boolean;
+  /** Callback opcional invocado justo antes del commit OCC del intento indicado (para tests deterministas de carrera) */
+  _onBeforeCommitAttempt?: (attempt: number, candidateRecord: FiscalRecord) => Promise<void>;
 }
 
 export interface EmitFiscalInvoiceResult {
@@ -184,6 +188,10 @@ export async function emitFiscalInvoice(
     throw new Error('emitFiscalInvoice: obligadoTributarioId es obligatorio y no puede estar vacío ni ser ES_UNKNOWN.');
   }
 
+  if (params._simulateIndependentCloudRunInstance) {
+    return await executeEmitFiscalInvoice(params, obligadoTributarioId);
+  }
+
   // Serialización aislada por obligadoTributarioId en backend
   const currentQueue = emissionQueuesByObligado.get(obligadoTributarioId) || Promise.resolve();
 
@@ -200,6 +208,27 @@ export async function emitFiscalInvoice(
   return nextPromise;
 }
 
+function isRetryableDistributedConflictError(err: any): boolean {
+  const msg = String(err?.message || '');
+  return (
+    msg.includes('Bifurcación de cadena detectada') ||
+    msg.includes('Violación de encadenamiento') ||
+    msg.includes('Colisión de numeración detectada') ||
+    msg.includes('ABORTED') ||
+    msg.includes('Transaction lock')
+  );
+}
+
+function normalizeDateToIsoForComparison(dateStr?: string): string {
+  if (!dateStr) return '';
+  const trimmed = dateStr.trim();
+  const mIso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (mIso) return `${mIso[1]}-${mIso[2]}-${mIso[3]}`;
+  const mAeat = /^(\d{2})-(\d{2})-(\d{4})$/.exec(trimmed);
+  if (mAeat) return `${mAeat[3]}-${mAeat[2]}-${mAeat[1]}`;
+  return trimmed;
+}
+
 async function executeEmitFiscalInvoice(
   params: EmitFiscalInvoiceParams,
   obligadoTributarioId: string
@@ -211,213 +240,297 @@ async function executeEmitFiscalInvoice(
   }
 
   const { BackendFiscalCustody } = await import('./backendCustodyRepository');
-  const releaseProcessLock = await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
+  const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+  const releaseProcessLock = params._simulateIndependentCloudRunInstance
+    ? null
+    : await BackendFiscalCustody.acquireProcessLock(obligadoTributarioId);
 
   try {
-    // 1. Obtener la huella anterior DENTRO de la sección serializada
-    // NUNCA de invoiceDraft.hashAnterior ni de invoiceDraft.hashActual
-    let previousRecord: FiscalRecordRef | FiscalRecord | null = null;
-    if (params.previousRecordRef !== undefined) {
-      previousRecord = params.previousRecordRef;
-    } else {
-      // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
-      // Se resuelve exclusivamente contra la custodia distribuida de la nube.
-      // Si la autoridad falla o está inaccesible, se arroja excepción inmediata (sin degradación a memoria local).
-      const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
-      previousRecord = latestFromCustody || latestEmittedByObligado.get(obligadoTributarioId) || null;
+    const tipoFactura = resolveInvoiceTipoFactura(invoiceDraft);
+    const nifEmisor = fiscalConfig.nifEmisor;
+    if (!nifEmisor || nifEmisor === 'ES_UNKNOWN' || nifEmisor.trim() === '') {
+      throw new Error('emitFiscalInvoice: NIF del emisor es obligatorio y no puede ser ES_UNKNOWN ni estar vacío.');
     }
 
-  let hashAnterior = '';
-  if (previousRecord) {
-    if ('huellaHash' in previousRecord) {
-      hashAnterior = previousRecord.huellaHash;
-    } else if ('huella' in previousRecord) {
-      hashAnterior = previousRecord.huella.hash;
-    }
-  }
+    const isRectificativa = Boolean(
+      invoiceDraft.esRectificativa || ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)
+    );
+    const isSubsanacion = invoiceDraft.subsanacion === 'S';
 
-  // 2. Timestamp oficial inmutable con huso horario según Orden HAC/1177/2024
-  const fechaHoraHusoGenRegistro = formatFechaHoraHusoGenRegistro();
+    // Reintento automático ante contienda OCC distribuida entre múltiples instancias Cloud Run
+    const maxAttempts = params.previousRecordRef !== undefined ? 1 : 8;
+    let lastConflictError: any = null;
+    let reservedBackendNumber: string | null = null;
 
-  // 3. Comprobación estricta de requisitos del registro anterior (Orden HAC/1177/2024)
-  await validatePreviousRecordRequirement(fechaHoraHusoGenRegistro, obligadoTributarioId, previousRecord);
-
-  const tipoFactura = resolveInvoiceTipoFactura(invoiceDraft);
-  const nifEmisor = fiscalConfig.nifEmisor;
-  if (!nifEmisor || nifEmisor === 'ES_UNKNOWN' || nifEmisor.trim() === '') {
-    throw new Error('emitFiscalInvoice: NIF del emisor es obligatorio y no puede ser ES_UNKNOWN ni estar vacío.');
-  }
-
-  // 3.5 Autoridad backend para facturas rectificativas: validación cruzada contra custodia y asignación de serie R-YYYY-NNN bajo lock
-  let effectiveInvoiceDraft: Factura = { ...invoiceDraft };
-  const isRectificativa = Boolean(
-    effectiveInvoiceDraft.esRectificativa || ['R1', 'R2', 'R3', 'R4', 'R5'].includes(tipoFactura)
-  );
-  if (isRectificativa) {
-    const allObligadoRecords = await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(obligadoTributarioId);
-
-    const rectRefs = effectiveInvoiceDraft.facturasRectificadas && effectiveInvoiceDraft.facturasRectificadas.length > 0
-      ? effectiveInvoiceDraft.facturasRectificadas
-      : (effectiveInvoiceDraft.facturaRectificadaNumero && effectiveInvoiceDraft.facturaRectificadaFecha
-        ? [{
-            idEmisorFactura: nifEmisor,
-            numSerieFactura: effectiveInvoiceDraft.facturaRectificadaNumero,
-            fechaExpedicionFactura: effectiveInvoiceDraft.facturaRectificadaFecha,
-          }]
-        : []);
-
-    for (const ref of rectRefs) {
-      const origRecord = allObligadoRecords.find(
-        r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === ref.numSerieFactura
-      );
-      if (origRecord) {
-        if (tipoFactura === 'R5' && origRecord.factura.tipoFactura !== 'F2' && origRecord.factura.tipoFactura !== 'R5') {
-          throw new Error(
-            `RECHAZO_RECTIFICATIVA_R5_ORIGEN_NO_SIMPLIFICADA: No se puede emitir una factura rectificativa R5 sobre la factura custodiada '${origRecord.factura.numeroFactura}' de tipo '${origRecord.factura.tipoFactura}' (R5 solo rectifica facturas simplificadas F2/R5).`
-          );
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // 1. Obtener la huella anterior DENTRO de la sección serializada (y actualizada en cada intento OCC)
+        // NUNCA de invoiceDraft.hashAnterior ni de invoiceDraft.hashActual
+        let previousRecord: FiscalRecordRef | FiscalRecord | null = null;
+        if (params.previousRecordRef !== undefined) {
+          previousRecord = params.previousRecordRef;
+        } else {
+          // AUTORIDAD DISTRIBUIDA FAIL-CLOSED EN BACKEND:
+          const latestFromCustody = await BackendFiscalCustody.getLatestFiscalRecordAsync(obligadoTributarioId);
+          previousRecord = latestFromCustody || (attempt === 1 ? latestEmittedByObligado.get(obligadoTributarioId) : null) || null;
         }
-        if (tipoFactura !== 'R5' && (origRecord.factura.tipoFactura === 'F2' || origRecord.factura.tipoFactura === 'R5') && !origRecord.destinatario?.nif && !origRecord.destinatario?.idOtro) {
-          throw new Error(
-            `RECHAZO_RECTIFICATIVA_SIMPLIFICADA_REQUIERE_R5: La factura original custodiada '${origRecord.factura.numeroFactura}' es simplificada (${origRecord.factura.tipoFactura}) sin destinatario; debe rectificarse mediante clave R5.`
-          );
+
+        let hashAnterior = '';
+        if (previousRecord) {
+          if ('huellaHash' in previousRecord) {
+            hashAnterior = previousRecord.huellaHash;
+          } else if ('huella' in previousRecord) {
+            hashAnterior = previousRecord.huella.hash;
+          }
         }
-      }
-    }
 
-    const isSubsanacion = effectiveInvoiceDraft.subsanacion === 'S';
-    if (!isSubsanacion) {
-      const requestedNum = (effectiveInvoiceDraft.numeroFactura || '').trim();
-      const alreadyExistsInCustody = allObligadoRecords.some(
-        r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === requestedNum
-      );
-      const shouldAssignBackendNumber =
-        !requestedNum ||
-        requestedNum.toUpperCase() === 'AUTO' ||
-        effectiveInvoiceDraft.numeracionAutoritativaBackend === true ||
-        alreadyExistsInCustody;
+        // 2. Timestamp oficial inmutable con huso horario según Orden HAC/1177/2024
+        const fechaHoraHusoGenRegistro = formatFechaHoraHusoGenRegistro();
 
-      if (shouldAssignBackendNumber) {
-        effectiveInvoiceDraft = {
+        // 3. Comprobación estricta de requisitos del registro anterior (Orden HAC/1177/2024)
+        await validatePreviousRecordRequirement(fechaHoraHusoGenRegistro, obligadoTributarioId, previousRecord);
+
+        // 3.5 Autoridad backend para facturas rectificativas: validación cruzada contra custodia y reserva atómica de serie R-YYYY-NNN
+        let effectiveInvoiceDraft: Factura = { ...invoiceDraft };
+        if (isRectificativa) {
+          const allObligadoRecords = await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(obligadoTributarioId);
+
+          const rectRefs =
+            effectiveInvoiceDraft.facturasRectificadas && effectiveInvoiceDraft.facturasRectificadas.length > 0
+              ? effectiveInvoiceDraft.facturasRectificadas.map(r => ({
+                  idEmisorFactura: (r.idEmisorFactura || nifEmisor).trim(),
+                  numSerieFactura: (r.numeroFactura || (r as any).numSerieFactura || '').trim(),
+                  fechaExpedicionFactura: (r.fechaExpedicion || (r as any).fechaExpedicionFactura || '').trim()
+                }))
+              : effectiveInvoiceDraft.facturaRectificadaNumero && effectiveInvoiceDraft.facturaRectificadaFecha
+              ? [
+                  {
+                    idEmisorFactura: nifEmisor,
+                    numSerieFactura: effectiveInvoiceDraft.facturaRectificadaNumero.trim(),
+                    fechaExpedicionFactura: effectiveInvoiceDraft.facturaRectificadaFecha.trim()
+                  }
+                ]
+              : [];
+
+          const originalOperationDatesIso: string[] = [];
+
+          for (const ref of rectRefs) {
+            const origRecord = allObligadoRecords.find(
+              r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === ref.numSerieFactura
+            );
+            if (origRecord) {
+              // Verificar coherencia de la fecha de expedición referenciada con la fecha custodiada del registro original
+              const origExpIso = normalizeDateToIsoForComparison(origRecord.factura.fechaExpedicion);
+              const refExpIso = normalizeDateToIsoForComparison(ref.fechaExpedicionFactura);
+              if (origExpIso && refExpIso && origExpIso !== refExpIso) {
+                throw new Error(
+                  `RECHAZO_RECTIFICATIVA_FECHA_INCONSISTENTE: La fecha de expedición indicada (${ref.fechaExpedicionFactura}) para la factura rectificada '${ref.numSerieFactura}' no coincide con la fecha custodiada en el libro registro (${origRecord.factura.fechaExpedicion}).`
+                );
+              }
+
+              if (tipoFactura === 'R5' && origRecord.factura.tipoFactura !== 'F2' && origRecord.factura.tipoFactura !== 'R5') {
+                throw new Error(
+                  `RECHAZO_RECTIFICATIVA_R5_ORIGEN_NO_SIMPLIFICADA: No se puede emitir una factura rectificativa R5 sobre la factura custodiada '${origRecord.factura.numeroFactura}' de tipo '${origRecord.factura.tipoFactura}' (R5 solo rectifica facturas simplificadas F2/R5).`
+                );
+              }
+              if (
+                tipoFactura !== 'R5' &&
+                (origRecord.factura.tipoFactura === 'F2' || origRecord.factura.tipoFactura === 'R5') &&
+                !origRecord.destinatario?.nif &&
+                !origRecord.destinatario?.idOtro
+              ) {
+                throw new Error(
+                  `RECHAZO_RECTIFICATIVA_SIMPLIFICADA_REQUIERE_R5: La factura original custodiada '${origRecord.factura.numeroFactura}' es simplificada (${origRecord.factura.tipoFactura}) sin destinatario; debe rectificarse mediante clave R5.`
+                );
+              }
+
+              const origFechaOpIso = normalizeDateToIsoForComparison(
+                origRecord.factura.fechaOperacion || origRecord.factura.fechaExpedicion
+              );
+              if (origFechaOpIso) {
+                originalOperationDatesIso.push(origFechaOpIso);
+              }
+            }
+          }
+
+          // Si el borrador no especifica fechaOperacion y las facturas originales están custodiadas,
+          // asignar autoritativamente la fecha de operación original (la más reciente si rectifica varias)
+          if (!effectiveInvoiceDraft.fechaOperacion && originalOperationDatesIso.length > 0) {
+            originalOperationDatesIso.sort();
+            effectiveInvoiceDraft = {
+              ...effectiveInvoiceDraft,
+              fechaOperacion: originalOperationDatesIso[originalOperationDatesIso.length - 1]
+            };
+          }
+
+          if (!isSubsanacion) {
+            const requestedNum = ( reservedBackendNumber || effectiveInvoiceDraft.numeroFactura || '').trim();
+            const alreadyExistsInCustody = allObligadoRecords.some(
+              r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === requestedNum
+            );
+            const isStandardRectSeries = /^R-\d{4}-\d+$/i.test(requestedNum);
+            const shouldAssignBackendNumber =
+              !requestedNum ||
+              requestedNum.toUpperCase() === 'AUTO' ||
+              effectiveInvoiceDraft.numeracionAutoritativaBackend === true ||
+              alreadyExistsInCustody ||
+              (attempt > 1 && isStandardRectSeries);
+
+            if (shouldAssignBackendNumber) {
+              if (!reservedBackendNumber || alreadyExistsInCustody) {
+                // Reserva atómica en transacción Firestore OCC / Cloud Coordinator
+                let reservedNumber = await CloudDistributedChainCoordinator.reserveNextRectificativaNumber(
+                  obligadoTributarioId,
+                  effectiveInvoiceDraft.fecha
+                );
+                const custodyNextNumber = BackendFiscalCustody.computeNextRectificativaNumber(
+                  allObligadoRecords,
+                  effectiveInvoiceDraft.fecha
+                );
+                const parsedReserved = parseInt(reservedNumber.split('-')[2] || '0', 10);
+                const parsedCustody = parseInt(custodyNextNumber.split('-')[2] || '0', 10);
+                if (parsedCustody > parsedReserved) {
+                  reservedNumber = custodyNextNumber;
+                }
+                reservedBackendNumber = reservedNumber;
+              }
+
+              effectiveInvoiceDraft = {
+                ...effectiveInvoiceDraft,
+                numeroFactura: reservedBackendNumber
+              };
+            }
+          }
+        }
+
+        const totalCuota = (effectiveInvoiceDraft.totales?.cuotaIva ?? 0) + (effectiveInvoiceDraft.totales?.cuotaRecargo ?? 0);
+        const totalDocumento = effectiveInvoiceDraft.totales?.totalDocumento ?? 0;
+
+        // 4. Cálculo oficial canónico de la huella SHA-256 (FASE 2.1)
+        const hashResult = await calculateAltaHash({
+          nifEmisor,
+          numSerieFactura: effectiveInvoiceDraft.numeroFactura,
+          fechaExpedicion: effectiveInvoiceDraft.fecha,
+          tipoFactura,
+          cuotaTotal: totalCuota,
+          importeTotal: totalDocumento,
+          huellaAnterior: hashAnterior,
+          fechaHoraHusoGenRegistro
+        });
+
+        const hashActual = hashResult.hash;
+        if (!hashActual || hashActual.length !== 64) {
+          throw new Error('emitFiscalInvoice: Huella fiscal calculada inválida o con longitud errónea.');
+        }
+
+        // 5. Preparar registro fiscal con datos definitivos para que el QR consuma exclusivamente la fuente fiscal
+        const provisionalRecord = createFiscalRecordFromInvoice(
+          {
+            ...effectiveInvoiceDraft,
+            tipoFactura,
+            hashActual,
+            hashAnterior,
+            fechaHoraSellado: fechaHoraHusoGenRegistro
+          },
+          fiscalConfig,
+          previousRecord,
+          {
+            hashActual,
+            fechaHoraSellado: fechaHoraHusoGenRegistro,
+            cadenaTextoCanonico: hashResult.canonicalString
+          }
+        );
+
+        // 6. QR tributario oficial generado EXCLUSIVAMENTE a partir del FiscalRecord sellado (FASE 2.3)
+        const urlVeriFactu = buildFiscalQrUrl(provisionalRecord);
+        const qrDataUri = await generateQrDataUri(urlVeriFactu);
+
+        // 7. Preparar borrador enriquecido para la transformación final
+        const enrichedInvoice: Factura = {
           ...effectiveInvoiceDraft,
-          numeroFactura: BackendFiscalCustody.computeNextRectificativaNumber(
-            allObligadoRecords,
-            effectiveInvoiceDraft.fecha
-          ),
+          tipoFactura,
+          hashActual,
+          hashAnterior,
+          fechaHoraSellado: fechaHoraHusoGenRegistro,
+          urlVeriFactu,
+          qrDataUri
         };
+
+        // 8. Crear el FiscalRecord definitivo e inmutable con su QR sellado antes del freeze final
+        const fiscalRecord = createFiscalRecordFromInvoice(
+          enrichedInvoice,
+          fiscalConfig,
+          previousRecord,
+          {
+            hashActual,
+            fechaHoraSellado: fechaHoraHusoGenRegistro,
+            cadenaTextoCanonico: hashResult.canonicalString,
+            urlVeriFactu,
+            qrDataUri
+          }
+        );
+
+        // 8. Verificación inmediata de integridad criptográfica (cero falsos positivos)
+        const verification = await verifyFiscalRecordHash(fiscalRecord);
+        if (!verification.valid) {
+          throw new Error(`emitFiscalInvoice: Fallo crítico de integridad criptográfica en el registro generado: ${verification.reason}`);
+        }
+
+        // 9. Validaciones de esquema antes de persistir
+        if (!fiscalRecord.obligadoTributarioId || fiscalRecord.obligadoTributarioId === 'ES_UNKNOWN' || fiscalRecord.obligadoTributarioId.trim() === '') {
+          throw new Error('emitFiscalInvoice: FiscalRecord inválido. obligadoTributarioId no puede ser vacío ni ES_UNKNOWN.');
+        }
+        if (!fiscalRecord.huella?.hash || fiscalRecord.huella.hash.length !== 64) {
+          throw new Error('emitFiscalInvoice: FiscalRecord inválido. Huella fiscal ausente o longitud incorrecta.');
+        }
+        if (fiscalRecord.xmlOficial === '<pending_xml/>') {
+          throw new Error('emitFiscalInvoice: FiscalRecord inválido. No se permite <pending_xml/>.');
+        }
+
+        // 7. Persistir el FiscalRecord en la autoridad fiscal del backend (transacción OCC en Firestore)
+        // Si la persistencia falla por contienda concurrente multi-instancia, el bucle OCC reintenta automáticamente
+        if (params._onBeforeCommitAttempt) {
+          await params._onBeforeCommitAttempt(attempt, fiscalRecord);
+        }
+
+        const defaultSaveFn = async (rec: FiscalRecord) => {
+          await BackendFiscalCustody.saveFiscalRecord(rec);
+          return true;
+        };
+        const saveFn = persistRecordFn || defaultSaveFn;
+        await saveFn(fiscalRecord);
+
+        // 8. Generar la referencia liviana indexable para AppData
+        const fiscalRecordRef = createFiscalRecordRef(fiscalRecord);
+
+        // 9. Registrar la referencia en la sesión activa del obligado tributario
+        registerEmittedFiscalRecordRef(obligadoTributarioId, fiscalRecordRef);
+
+        // 10. Crear la Factura comercial final vinculada 1:1 a su FiscalRecord
+        const finalInvoice: Factura = {
+          ...enrichedInvoice,
+          fiscalRecordId: fiscalRecord.id // VINCULACIÓN PRINCIPAL
+        };
+
+        return {
+          invoice: finalInvoice,
+          fiscalRecord,
+          fiscalRecordRef
+        };
+      } catch (err: any) {
+        if (attempt < maxAttempts && !persistRecordFn && isRetryableDistributedConflictError(err)) {
+          if (String(err?.message || '').includes('Colisión de numeración detectada')) {
+            reservedBackendNumber = null;
+          }
+          lastConflictError = err;
+          await new Promise(resolve => setTimeout(resolve, 15 * attempt));
+          continue;
+        }
+        throw err;
       }
     }
-  }
 
-  const totalCuota = (effectiveInvoiceDraft.totales?.cuotaIva ?? 0) + (effectiveInvoiceDraft.totales?.cuotaRecargo ?? 0);
-  const totalDocumento = effectiveInvoiceDraft.totales?.totalDocumento ?? 0;
-
-  // 4. Cálculo oficial canónico de la huella SHA-256 (FASE 2.1)
-  const hashResult = await calculateAltaHash({
-    nifEmisor,
-    numSerieFactura: effectiveInvoiceDraft.numeroFactura,
-    fechaExpedicion: effectiveInvoiceDraft.fecha,
-    tipoFactura,
-    cuotaTotal: totalCuota,
-    importeTotal: totalDocumento,
-    huellaAnterior: hashAnterior,
-    fechaHoraHusoGenRegistro
-  });
-
-  const hashActual = hashResult.hash;
-  if (!hashActual || hashActual.length !== 64) {
-    throw new Error('emitFiscalInvoice: Huella fiscal calculada inválida o con longitud errónea.');
-  }
-
-  // 5. Preparar registro fiscal con datos definitivos para que el QR consuma exclusivamente la fuente fiscal
-  const provisionalRecord = createFiscalRecordFromInvoice(
-    {
-      ...effectiveInvoiceDraft,
-      tipoFactura,
-      hashActual,
-      hashAnterior,
-      fechaHoraSellado: fechaHoraHusoGenRegistro
-    },
-    fiscalConfig,
-    previousRecord,
-    {
-      hashActual,
-      fechaHoraSellado: fechaHoraHusoGenRegistro,
-      cadenaTextoCanonico: hashResult.canonicalString
-    }
-  );
-
-  // 6. QR tributario oficial generado EXCLUSIVAMENTE a partir del FiscalRecord sellado (FASE 2.3)
-  const urlVeriFactu = buildFiscalQrUrl(provisionalRecord);
-  const qrDataUri = await generateQrDataUri(urlVeriFactu);
-
-  // 7. Preparar borrador enriquecido para la transformación final
-  const enrichedInvoice: Factura = {
-    ...effectiveInvoiceDraft,
-    tipoFactura,
-    hashActual,
-    hashAnterior,
-    fechaHoraSellado: fechaHoraHusoGenRegistro,
-    urlVeriFactu,
-    qrDataUri
-  };
-
-  // 8. Crear el FiscalRecord definitivo e inmutable con su QR sellado antes del freeze final
-  const fiscalRecord = createFiscalRecordFromInvoice(
-    enrichedInvoice,
-    fiscalConfig,
-    previousRecord,
-    {
-      hashActual,
-      fechaHoraSellado: fechaHoraHusoGenRegistro,
-      cadenaTextoCanonico: hashResult.canonicalString,
-      urlVeriFactu,
-      qrDataUri
-    }
-  );
-
-  // 8. Verificación inmediata de integridad criptográfica (cero falsos positivos)
-  const verification = await verifyFiscalRecordHash(fiscalRecord);
-  if (!verification.valid) {
-    throw new Error(`emitFiscalInvoice: Fallo crítico de integridad criptográfica en el registro generado: ${verification.reason}`);
-  }
-
-  // 9. Validaciones de esquema antes de persistir
-  if (!fiscalRecord.obligadoTributarioId || fiscalRecord.obligadoTributarioId === 'ES_UNKNOWN' || fiscalRecord.obligadoTributarioId.trim() === '') {
-    throw new Error('emitFiscalInvoice: FiscalRecord inválido. obligadoTributarioId no puede ser vacío ni ES_UNKNOWN.');
-  }
-  if (!fiscalRecord.huella?.hash || fiscalRecord.huella.hash.length !== 64) {
-    throw new Error('emitFiscalInvoice: FiscalRecord inválido. Huella fiscal ausente o longitud incorrecta.');
-  }
-  if (fiscalRecord.xmlOficial === '<pending_xml/>') {
-    throw new Error('emitFiscalInvoice: FiscalRecord inválido. No se permite <pending_xml/>.');
-  }
-
-  // 7. Persistir el FiscalRecord en la autoridad fiscal del backend
-  // Si la persistencia falla, el error debe propagarse obligatoriamente al llamador
-  const defaultSaveFn = async (rec: FiscalRecord) => {
-    await BackendFiscalCustody.saveFiscalRecord(rec);
-    return true;
-  };
-  const saveFn = persistRecordFn || defaultSaveFn;
-  await saveFn(fiscalRecord);
-
-  // 8. Generar la referencia liviana indexable para AppData
-  const fiscalRecordRef = createFiscalRecordRef(fiscalRecord);
-
-  // 9. Registrar la referencia en la sesión activa del obligado tributario
-  registerEmittedFiscalRecordRef(obligadoTributarioId, fiscalRecordRef);
-
-  // 10. Crear la Factura comercial final vinculada 1:1 a su FiscalRecord
-  const finalInvoice: Factura = {
-    ...enrichedInvoice,
-    fiscalRecordId: fiscalRecord.id // VINCULACIÓN PRINCIPAL
-  };
-
-  return {
-    invoice: finalInvoice,
-    fiscalRecord,
-    fiscalRecordRef
-  };
+    throw lastConflictError || new Error('emitFiscalInvoice: Fallo tras agotar reintentos de concurrencia distribuida.');
   } finally {
     if (releaseProcessLock) {
       releaseProcessLock();

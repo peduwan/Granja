@@ -192,6 +192,10 @@ ${linesXml}
   <soapenv:Body>
     <sfR:RespuestaRegFactuSistemaFacturacion xmlns:sfR="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/RespuestaSuministro.xsd" xmlns:sf="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/SuministroInformacion.xsd">
       <sfR:CSV>CSV-AEAT-AVISO-987654321</sfR:CSV>
+      <sfR:DatosPresentacion>
+        <sf:NIFPresentador>${nif}</sf:NIFPresentador>
+        <sf:TimestampPresentacion>2026-10-15T10:00:00+02:00</sf:TimestampPresentacion>
+      </sfR:DatosPresentacion>
       <sfR:Cabecera>
         <sf:ObligadoEmision>
           <sf:NombreRazon>Granja Avícola El Valle S.L.</sf:NombreRazon>
@@ -240,6 +244,10 @@ ${linesXml}
   <soapenv:Body>
     <sfR:RespuestaRegFactuSistemaFacturacion xmlns:sfR="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/RespuestaSuministro.xsd" xmlns:sf="https://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/tike/cont/ws/SuministroInformacion.xsd">
       <sfR:CSV>CSV-AEAT-PARCIAL-777888999</sfR:CSV>
+      <sfR:DatosPresentacion>
+        <sf:NIFPresentador>${nif}</sf:NIFPresentador>
+        <sf:TimestampPresentacion>2026-10-15T10:00:00+02:00</sf:TimestampPresentacion>
+      </sfR:DatosPresentacion>
       <sfR:Cabecera>
         <sf:ObligadoEmision>
           <sf:NombreRazon>Granja Avícola El Valle S.L.</sf:NombreRazon>

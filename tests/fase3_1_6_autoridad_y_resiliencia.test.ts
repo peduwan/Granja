@@ -178,6 +178,7 @@ async function main() {
   // BLOQUE 4: P0/P1 - CONCURRENCIA MULTI-INSTANCIA REAL SOBRE AUTORIDAD COMPARTIDA
   // ---------------------------------------------------------------------------
   await runTest('4.1: CloudDistributedChainCoordinator serializa atómicamente la cadena y rechaza bifurcaciones', async () => {
+    BackendFiscalCustody.resetCustody();
     CloudDistributedChainCoordinator.resetCloudState();
 
     const config = createDefaultFiscalConfiguration({
