@@ -55,7 +55,63 @@ export async function emitFiscalInvoiceViaBackend(params: {
     throw new Error(errJson.error || `Error en la emisión fiscal del backend (HTTP ${res.status})`);
   }
 
-  return await res.json();
+  const data = await res.json();
+  const definitiveNumeroFactura =
+    data.assignedNumeroFactura ||
+    data.fiscalRecord?.factura?.numeroFactura ||
+    data.invoice?.numeroFactura;
+
+  return {
+    ...data,
+    invoice: data.invoice
+      ? {
+          ...data.invoice,
+          numeroFactura: definitiveNumeroFactura
+        }
+      : data.invoice
+  };
+}
+
+/**
+ * Consulta en modo SOLO LECTURA una numeración provisional sugerida para la siguiente factura rectificativa
+ * (serie R-YYYY-NNN). Esta llamada NUNCA reserva ni incrementa contadores en backend.
+ */
+export async function previewNextRectificativaNumberViaBackend(params: {
+  obligadoTributarioId: string;
+  fecha?: string;
+}): Promise<{ nextNumber: string; provisional: boolean; message?: string } | null> {
+  const cleanObligado = (params.obligadoTributarioId || '').trim().toUpperCase();
+  if (!cleanObligado) return null;
+
+  let authHeaders: Record<string, string> = {};
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    if (token) {
+      authHeaders['Authorization'] = `Bearer ${token}`;
+    }
+  } catch {}
+
+  const query = new URLSearchParams({ obligado: cleanObligado });
+  if (params.fecha) {
+    query.set('fecha', params.fecha.trim());
+  }
+
+  const res = await fetch(`/api/fiscal/rectificativas/next-number?${query.toString()}`, {
+    method: 'GET',
+    headers: {
+      ...authHeaders
+    }
+  });
+
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  if (!data?.nextNumber) return null;
+
+  return {
+    nextNumber: data.nextNumber,
+    provisional: data.provisional !== false,
+    message: data.message
+  };
 }
 
 /**

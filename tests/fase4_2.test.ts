@@ -994,7 +994,7 @@ async function main() {
             codigoError: '3000',
             descripcionError: 'Registro de facturación duplicado',
             registroDuplicado: {
-              idPeticionRegistroDuplicado: 'PET-AEAT-DUP-2026-001',
+              idPeticionRegistroDuplicado: 'PET-DUP-2026-001',
               estadoRegistroDuplicado: 'Correcta'
             }
           },

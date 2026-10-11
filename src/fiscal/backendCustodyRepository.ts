@@ -893,11 +893,45 @@ export class BackendFiscalCustody {
   }
 
   /**
-   * Reserva atómicamente el siguiente número de factura rectificativa consultando y actualizando
-   * el contador distribuido en la autoridad (Firestore / Cloud Coordinator).
-   * Garantiza que dos solicitudes concurrentes nunca reciban el mismo número.
+   * Consulta en modo SOLO LECTURA una numeración provisional sugerida para la siguiente factura rectificativa
+   * (serie R-YYYY-NNN) sin modificar contadores, estado fiscal ni documentos en custodia o Firestore.
+   * La numeración definitiva se asigna exclusivamente durante la emisión en backend mediante reserveNextRectificativaNumeroAsync.
+   */
+  public static async previewNextRectificativaNumeroAsync(
+    obligadoTributarioId: string,
+    fechaExpedicion?: string
+  ): Promise<string> {
+    const cleanObligado = obligadoTributarioId.trim().toUpperCase();
+    const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
+    const previewed = await CloudDistributedChainCoordinator.previewNextRectificativaNumber(
+      cleanObligado,
+      fechaExpedicion
+    );
+    const records = await this.getAllFiscalRecordsByObligadoAsync(cleanObligado);
+    const custodyNext = this.computeNextRectificativaNumber(records, fechaExpedicion);
+    const parsedPreview = parseInt(previewed.split('-')[2] || '0', 10);
+    const parsedCustody = parseInt(custodyNext.split('-')[2] || '0', 10);
+    return parsedCustody > parsedPreview ? custodyNext : previewed;
+  }
+
+  /**
+   * Consulta sin efectos secundarios la siguiente numeración provisional de factura rectificativa.
+   * Alias de solo lectura mantenido por compatibilidad para consumidores de consulta/previsualización:
+   * NUNCA incrementa rectificativaCountersByYear ni consume números.
    */
   public static async getNextRectificativaNumeroAsync(
+    obligadoTributarioId: string,
+    fechaExpedicion?: string
+  ): Promise<string> {
+    return await this.previewNextRectificativaNumeroAsync(obligadoTributarioId, fechaExpedicion);
+  }
+
+  /**
+   * Reserva atómicamente y de forma distribuida la numeración definitiva de factura rectificativa
+   * (serie R-YYYY-NNN) actualizando el contador en la autoridad (Firestore / Cloud Coordinator).
+   * USO EXCLUSIVO EN EL FLUJO DE EMISIÓN EN BACKEND.
+   */
+  public static async reserveNextRectificativaNumeroAsync(
     obligadoTributarioId: string,
     fechaExpedicion?: string
   ): Promise<string> {

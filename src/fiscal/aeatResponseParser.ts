@@ -148,13 +148,14 @@ export function classifySoapFault(
  * para permitir su validación formal contra `RespuestaSuministro.xsd`.
  */
 export function extractRespuestaRegFactuXmlElement(rawXml: string): string | null {
-  const match = /<([a-zA-Z0-9_]+:)?RespuestaRegFactuSistemaFacturacion\b[\s\S]*?<\/(?:[a-zA-Z0-9_]+:)?RespuestaRegFactuSistemaFacturacion>/i.exec(rawXml);
+  const match = /<([a-zA-Z0-9_-]+:)?RespuestaRegFactuSistemaFacturacion\b[\s\S]*?<\/(?:[a-zA-Z0-9_-]+:)?RespuestaRegFactuSistemaFacturacion>/i.exec(rawXml);
   if (!match) return null;
 
   let elementXml = match[0];
 
-  // Si el nodo depende de prefijos declarados en el SOAP Envelope/Body (ej. xmlns:sfR o xmlns:sf),
-  // los inyectamos en la etiqueta de apertura si no están ya presentes en el fragmento extraído.
+  // Si el nodo depende de prefijos o del namespace por defecto declarados en el SOAP Envelope/Body
+  // (ej. xmlns:sfR, xmlns:sf, xmlns="...RespuestaSuministro.xsd"), los inyectamos en la etiqueta de apertura
+  // si no están ya presentes en el fragmento extraído.
   const openTagEnd = elementXml.indexOf('>');
   if (openTagEnd !== -1) {
     const openTag = elementXml.slice(0, openTagEnd);
@@ -165,10 +166,14 @@ export function extractRespuestaRegFactuXmlElement(rawXml: string): string | nul
     while ((nsMatch = envNsRegex.exec(rawXml)) !== null) {
       const fullDecl = nsMatch[0];
       const prefix = nsMatch[1];
+      const uri = nsMatch[3] || '';
       const attrName = prefix ? `xmlns:${prefix}` : 'xmlns';
       const alreadyHasAttr = new RegExp(`\\b${attrName}\\s*=`).test(openTag);
       if (!alreadyHasAttr) {
         if (prefix && (prefix.toLowerCase().includes('soap') || prefix === 'env')) {
+          continue;
+        }
+        if (!prefix && uri.toLowerCase().includes('soap')) {
           continue;
         }
         nsDeclarations.push(fullDecl);
@@ -185,7 +190,7 @@ export function extractRespuestaRegFactuXmlElement(rawXml: string): string | nul
 
 /**
  * Parsea el XML oficial devuelto por los servicios web de la AEAT.
- * Valida fail-closed contra el esquema oficial `docs/fiscal/xsd/RespuestaSuministro.xsd` (libxml2-wasm)
+ * Valida fail-closed por defecto contra el esquema oficial `docs/fiscal/xsd/RespuestaSuministro.xsd` (libxml2-wasm)
  * antes de confiar en la respuesta o mapear estados fiscales.
  */
 export function parseAeatXmlResponse(
@@ -193,13 +198,13 @@ export function parseAeatXmlResponse(
   options?: { enforceOfficialXsd?: boolean }
 ): AeatParsedResponse {
   if (!xmlString || typeof xmlString !== 'string' || xmlString.trim() === '') {
-    throw new Error('parseAeatXmlResponse: Respuesta vacía o nula recibida de la AEAT.');
+    throw new Error('parseAeatXmlResponse [ERR_XML_EMPTY]: Respuesta vacía o nula recibida de la AEAT.');
   }
 
   // 1. Validar sintaxis XML básica
   const validationResult = XMLValidator.validate(xmlString);
   if (validationResult !== true) {
-    throw new Error(`parseAeatXmlResponse: Sintaxis XML inválida en la respuesta de la AEAT: ${JSON.stringify(validationResult)}`);
+    throw new Error(`parseAeatXmlResponse [ERR_XML_MALFORMED]: Sintaxis XML inválida en la respuesta de la AEAT: ${JSON.stringify(validationResult)}`);
   }
 
   // 2. Parsear el árbol XML eliminando prefijos de namespace para una extracción limpia
@@ -219,11 +224,19 @@ export function parseAeatXmlResponse(
   const fault = body.Fault || parsed.Fault;
 
   if (fault) {
-    const faultcode = fault.faultcode || fault.Code || 'soapenv:Server';
-    const faultstring = fault.faultstring || fault.Reason || 'Error SOAP de infraestructura';
+    const rawCode = fault.faultcode ?? fault.Code;
+    const rawString = fault.faultstring ?? fault.Reason;
+    const faultcode =
+      typeof rawCode === 'object' && rawCode !== null
+        ? String(rawCode.Value || rawCode['#text'] || JSON.stringify(rawCode))
+        : String(rawCode || 'soapenv:Server');
+    const faultstring =
+      typeof rawString === 'object' && rawString !== null
+        ? String(rawString.Text || rawString['#text'] || JSON.stringify(rawString))
+        : String(rawString || 'Error SOAP de infraestructura');
     const detail = typeof fault.detail === 'object' ? JSON.stringify(fault.detail) : String(fault.detail || '');
 
-    const classification = classifySoapFault(String(faultcode), String(faultstring), detail || undefined);
+    const classification = classifySoapFault(faultcode, faultstring, detail || undefined);
 
     return {
       rawXml: xmlString,
@@ -235,8 +248,8 @@ export function parseAeatXmlResponse(
       avisos: [],
       errores: [
         {
-          codigo: String(faultcode),
-          descripcion: String(faultstring)
+          codigo: faultcode,
+          descripcion: faultstring
         }
       ]
     };
@@ -244,18 +257,14 @@ export function parseAeatXmlResponse(
 
   // 4. Localizar el nodo raíz RespuestaRegFactuSistemaFacturacion
   const respuestaRoot = body.RespuestaRegFactuSistemaFacturacion || parsed.RespuestaRegFactuSistemaFacturacion;
-  if (!respuestaRoot) {
-    throw new Error('parseAeatXmlResponse: El XML no contiene el elemento raíz oficial RespuestaRegFactuSistemaFacturacion.');
+  if (!respuestaRoot || typeof respuestaRoot !== 'object') {
+    throw new Error('parseAeatXmlResponse [ERR_XML_UNEXPECTED_ROOT]: El XML no contiene el elemento raíz oficial RespuestaRegFactuSistemaFacturacion.');
   }
 
   // 4.b Validación formal Fail-Closed contra RespuestaSuministro.xsd (libxml2-wasm)
+  // En entorno Node.js es SIEMPRE obligatoria por defecto salvo que un test unitario sintético indique enforceOfficialXsd: false.
   const isNodeEnv = typeof process !== 'undefined' && Boolean(process.versions?.node) && typeof window === 'undefined';
-  const shouldEnforceXsd =
-    options?.enforceOfficialXsd === true ||
-    (options?.enforceOfficialXsd !== false &&
-      (Boolean(respuestaRoot.Cabecera) ||
-        xmlString.includes('RespuestaSuministro.xsd') ||
-        xmlString.includes('SistemaFacturacion.xsd')));
+  const shouldEnforceXsd = options?.enforceOfficialXsd !== false;
 
   if (isNodeEnv && shouldEnforceXsd) {
     const extractedXml = extractRespuestaRegFactuXmlElement(xmlString);

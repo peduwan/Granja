@@ -866,20 +866,37 @@ app.post("/api/fiscal/emit-invoice", requireFiscalAuthMiddleware, async (req: Fi
       return res.status(authErr.statusCode || 403).json({ error: authErr.message });
     }
 
-    if (!invoiceDraft.numeroFactura || !invoiceDraft.fecha) {
+    const isRectificativaDraft = Boolean(
+      invoiceDraft.esRectificativa ||
+      ['R1', 'R2', 'R3', 'R4', 'R5'].includes(invoiceDraft.tipoFactura || '')
+    );
+    const isSubsanacionDraft = invoiceDraft.subsanacion === 'S';
+
+    if ((!invoiceDraft.numeroFactura && (!isRectificativaDraft || isSubsanacionDraft)) || !invoiceDraft.fecha) {
       return res.status(400).json({ error: "numeroFactura y fecha de expedición son obligatorios." });
     }
 
     // AUTORIDAD EXCLUSIVA DE SERVIDOR (P1):
-    // La configuración fiscal se genera autoritativamente en el backend.
-    // El cliente NO puede forzar modoFiscal, versionEspecificacion, sistemaInformatico ni remisionAutomatica.
+    // 1. La configuración fiscal se genera autoritativamente en el backend.
+    //    El cliente NO puede forzar modoFiscal, versionEspecificacion, sistemaInformatico ni remisionAutomatica.
+    // 2. En facturas rectificativas (no subsanación), el cliente NO puede fijar la numeración definitiva;
+    //    se fuerza numeracionAutoritativaBackend=true para que el backend reserve atómicamente la serie R-YYYY-NNNN.
     const serverFiscalConfig = createDefaultFiscalConfiguration({
       nif: verifiedObligado,
       nombreRazon: (req.body.nombreRazon || invoiceDraft.emisorNombre || 'Gestión Avícola AgroTech Software S.L.').trim()
     });
 
+    const authoritativeInvoiceDraft =
+      isRectificativaDraft && !isSubsanacionDraft
+        ? {
+            ...invoiceDraft,
+            numeroFactura: 'AUTO',
+            numeracionAutoritativaBackend: true
+          }
+        : invoiceDraft;
+
     const result = await emitFiscalInvoice({
-      invoiceDraft,
+      invoiceDraft: authoritativeInvoiceDraft,
       fiscalConfig: serverFiscalConfig,
       persistRecordFn: async (record) => {
         await BackendFiscalCustody.saveFiscalRecord(record);
@@ -890,7 +907,8 @@ app.post("/api/fiscal/emit-invoice", requireFiscalAuthMiddleware, async (req: Fi
       success: true,
       invoice: result.invoice,
       fiscalRecord: result.fiscalRecord,
-      fiscalRecordRef: result.fiscalRecordRef
+      fiscalRecordRef: result.fiscalRecordRef,
+      assignedNumeroFactura: result.fiscalRecord.factura.numeroFactura
     });
   } catch (err: any) {
     console.error("Error en emisión fiscal backend:", err);
@@ -1122,7 +1140,8 @@ app.get("/api/fiscal/outbox/pending", requireFiscalAuthMiddleware, async (req: F
   }
 });
 
-// Endpoint autoritativo para consultar el siguiente correlativo de factura rectificativa (serie R-YYYY-NNN)
+// Endpoint de previsualización en SOLO LECTURA para sugerir el siguiente correlativo provisional de factura rectificativa (serie R-YYYY-NNN)
+// NUNCA incrementa rectificativaCountersByYear, NUNCA reserva numeración y NUNCA produce efectos secundarios.
 app.get("/api/fiscal/rectificativas/next-number", requireFiscalAuthMiddleware, async (req: FiscalAuthenticatedRequest, res) => {
   try {
     const obligado = typeof req.query.obligado === 'string'
@@ -1137,11 +1156,14 @@ app.get("/api/fiscal/rectificativas/next-number", requireFiscalAuthMiddleware, a
     } catch (authErr: any) {
       return res.status(authErr.statusCode || 403).json({ error: authErr.message });
     }
-    const nextNumber = await BackendFiscalCustody.getNextRectificativaNumeroAsync(obligado, fecha);
+    const nextNumber = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(obligado, fecha);
     return res.status(200).json({
       obligadoTributarioId: obligado,
       nextNumber,
-      authority: "BACKEND_CUSTODY"
+      provisional: true,
+      isProvisional: true,
+      message: "Numeración provisional de previsualización (sin reserva). La numeración definitiva se asigna atómicamente durante la emisión en backend.",
+      authority: "BACKEND_CUSTODY_PREVIEW"
     });
   } catch (err: any) {
     return res.status(err?.statusCode || 500).json({ error: err.message });

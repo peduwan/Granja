@@ -1321,15 +1321,23 @@ async function main() {
       'Tras el reintento OCC, la Instancia B debe encadenar su huella exactamente al hash recién confirmado por la Instancia A'
     );
 
-    // 11.C: Dos reservas concurrentes de siguiente número (GET /next-number) nunca devuelven el mismo número
-    const [reservedNum1, reservedNum2] = await Promise.all([
+    // 11.C: Consultar previsualización (getNextRectificativaNumeroAsync / previewNextRectificativaNumeroAsync) NO consume números,
+    // mientras que reserveNextRectificativaNumeroAsync (exclusivo de emisión) sí reserva atómicamente sin colisión
+    const [preview1, preview2] = await Promise.all([
       BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22'),
-      BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22')
+      BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22')
+    ]);
+    assert.strictEqual(preview1, 'R-2026-0005', 'La previsualización debe sugerir R-2026-0005 sin consumir');
+    assert.strictEqual(preview2, 'R-2026-0005', 'Repetir la previsualización no debe incrementar el contador');
+
+    const [reservedNum1, reservedNum2] = await Promise.all([
+      BackendFiscalCustody.reserveNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22'),
+      BackendFiscalCustody.reserveNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22')
     ]);
     assert.deepStrictEqual(
       [reservedNum1, reservedNum2].sort(),
       ['R-2026-0005', 'R-2026-0006'],
-      'Dos llamadas concurrentes a getNextRectificativaNumeroAsync deben reservar atómicamente R-2026-0005 y R-2026-0006 sin colisión'
+      'Dos reservas atómicas concurrentes deben asignar R-2026-0005 y R-2026-0006 sin colisión'
     );
   });
 
@@ -2142,6 +2150,280 @@ async function main() {
       }
       CloudDistributedChainCoordinator.setMode('simulator');
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. P1 REGRESIÓN OBLIGATORIA: PREVISUALIZACIÓN SIN CONSUMO VS RESERVA ATÓMICA EN EMISIÓN
+  // ---------------------------------------------------------------------------
+  await runTest("18: [P1 Regresión] Previsualización sin efectos secundarios (abrir/repetir/cerrar/cancelar modal), reserva atómica exclusiva en emisión, rechazo de número cliente, idempotencia en reintentos y aislamiento por emisor/ejercicio", async () => {
+    await resetTestEnvironment();
+
+    const orig = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-reg-p1-orig',
+        numeroFactura: 'FAC-2026-1801',
+        fecha: '2026-10-10'
+      }),
+      fiscalConfig
+    });
+
+    // 18.1: Abrir el modal una vez no modifica el contador en CloudChainState
+    const stateBeforePreview = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+    assert.strictEqual(
+      stateBeforePreview?.rectificativaCountersByYear?.['2026'] ?? 0,
+      0,
+      'Antes de abrir el modal, el contador de rectificativas 2026 debe ser 0'
+    );
+
+    const openOncePreview = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-20');
+    assert.strictEqual(openOncePreview, 'R-2026-0001');
+
+    const stateAfterSingleOpen = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+    assert.strictEqual(
+      stateAfterSingleOpen?.rectificativaCountersByYear?.['2026'] ?? 0,
+      0,
+      'Abrir el modal una vez NO debe modificar rectificativaCountersByYear'
+    );
+
+    // 18.2: Consultar la previsualización repetidamente (secuencial y concurrentemente) no consume números
+    for (let i = 0; i < 5; i++) {
+      const p = await BackendFiscalCustody.getNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-20');
+      assert.strictEqual(p, 'R-2026-0001', `Consulta repetida #${i + 1} debe seguir devolviendo R-2026-0001`);
+    }
+    const parallelPreviews = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        CloudDistributedChainCoordinator.previewNextRectificativaNumber(OBLIGADO_NIF, '2026-10-20')
+      )
+    );
+    assert.ok(
+      parallelPreviews.every(n => n === 'R-2026-0001'),
+      'Múltiples previsualizaciones concurrentes no deben consumir números'
+    );
+
+    // 18.3 y 18.4: Cerrar y volver a abrir el modal y cancelar la operación sin emitir no consume números
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      // Simula abrir modal -> consultar previsualización -> editar campos en memoria -> pulsar Cancelar (onClose)
+      const modalPreview = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-21');
+      assert.strictEqual(modalPreview, 'R-2026-0001');
+    }
+    const stateAfterCancelCycles = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+    assert.strictEqual(
+      stateAfterCancelCycles?.rectificativaCountersByYear?.['2026'] ?? 0,
+      0,
+      'Cerrar/reabrir el modal y cancelar la operación no debe haber consumido ningún número'
+    );
+
+    // 18.5: Una emisión correcta reserva el número definitivo (R-2026-0001) en backend e ignora numeración propuesta por el cliente
+    const clientForgedDraft = buildRectificativaFacturaFromUiState({
+      facturaOriginal: orig.invoice,
+      fecha: '2026-10-22',
+      modo: 'anulacion_total',
+      tipoRectificativa: 'por_diferencias',
+      claveTipoFactura: 'R1',
+      codigoMotivo: '01',
+      motivoTexto: 'Primera emisión real tras múltiples previsualizaciones canceladas'
+    });
+    // Aunque el cliente intente proponer R-2026-0999 o un número arbitrario sin autorización:
+    const tamperedDraft = {
+      ...clientForgedDraft,
+      id: 'inv-reg-p1-rect-1',
+      numeroFactura: 'R-2026-0999',
+      numeracionAutoritativaBackend: true
+    };
+
+    const emitted1 = await emitFiscalInvoice({
+      invoiceDraft: tamperedDraft,
+      fiscalConfig
+    });
+    assert.strictEqual(
+      emitted1.fiscalRecord.factura.numeroFactura,
+      'R-2026-0001',
+      'La primera emisión real debe recibir R-2026-0001 ignorando el R-2026-0999 propuesto por el cliente'
+    );
+    assert.strictEqual(
+      emitted1.invoice.numeroFactura,
+      'R-2026-0001',
+      'El objeto invoice devuelto al cliente debe contener el número definitivo R-2026-0001'
+    );
+    assert.strictEqual(
+      emitted1.fiscalRecordRef.numeroFactura,
+      'R-2026-0001',
+      'La referencia fiscalRecordRef devuelta debe contener el número definitivo R-2026-0001'
+    );
+
+    // Ahora la previsualización de solo lectura debe mostrar R-2026-0002 sin incrementar más el contador
+    const previewAfterEmit1 = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-22');
+    assert.strictEqual(previewAfterEmit1, 'R-2026-0002');
+    const stateAfterEmit1 = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+    assert.strictEqual(stateAfterEmit1?.rectificativaCountersByYear?.['2026'], 1);
+
+    // 18.6: Tres emisiones concurrentes reciben numeraciones distintas y correlativas (R-2026-0002, R-2026-0003, R-2026-0004)
+    const makeConcurrentDraft = (idx: number) => ({
+      ...buildRectificativaFacturaFromUiState({
+        facturaOriginal: orig.invoice,
+        fecha: '2026-10-23',
+        modo: 'rectificacion_parcial',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '02',
+        motivoTexto: `Rectificativa concurrente lote #${idx}`,
+        lineasEditadas: [
+          {
+            ...orig.invoice.lineas[0],
+            id: `lin-reg-conc-${idx}`,
+            cantidadEstuches: -1,
+            precioUnitario: 100,
+            subtotal: -100
+          }
+        ]
+      }),
+      id: `inv-reg-p1-conc-${idx}`
+    });
+
+    const [conc1, conc2, conc3] = await Promise.all([
+      emitFiscalInvoice({ invoiceDraft: makeConcurrentDraft(1), fiscalConfig }),
+      emitFiscalInvoice({ invoiceDraft: makeConcurrentDraft(2), fiscalConfig }),
+      emitFiscalInvoice({ invoiceDraft: makeConcurrentDraft(3), fiscalConfig })
+    ]);
+    const assignedConcNums = [
+      conc1.fiscalRecord.factura.numeroFactura,
+      conc2.fiscalRecord.factura.numeroFactura,
+      conc3.fiscalRecord.factura.numeroFactura
+    ].sort();
+    assert.deepStrictEqual(
+      assignedConcNums,
+      ['R-2026-0002', 'R-2026-0003', 'R-2026-0004'],
+      'Tres emisiones concurrentes deben recibir R-2026-0002, R-2026-0003 y R-2026-0004 sin colisión'
+    );
+
+    // 18.7: Error o reintento durante la emisión:
+    // (a) Un error de validación en el borrador NO consume número
+    const invalidDraft = {
+      ...makeConcurrentDraft(99),
+      id: 'inv-reg-p1-invalid',
+      facturaRectificadaFecha: '2026-01-01', // Fecha incoherente con la factura custodiada (2026-10-10)
+      facturasRectificadas: [
+        {
+          idEmisorFactura: OBLIGADO_NIF,
+          numeroFactura: orig.invoice.numeroFactura,
+          fechaExpedicion: '2026-01-01'
+        }
+      ]
+    };
+    await assert.rejects(
+      async () => {
+        await emitFiscalInvoice({ invoiceDraft: invalidDraft, fiscalConfig });
+      },
+      /RECHAZO_RECTIFICATIVA_FECHA_INCONSISTENTE/,
+      'Debe rechazar borrador con fecha incoherente antes de reservar número'
+    );
+    assert.strictEqual(
+      await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-23'),
+      'R-2026-0005',
+      'Un fallo de validación previa no debe consumir el número R-2026-0005'
+    );
+
+    // (b) Fallo transitorio en persistencia después de reservar el número:
+    //     - Si una operación distinta se emite mientras tanto, NUNCA reutiliza el número reservado por la fallida.
+    //     - Si la misma operación se reintenta y tiene éxito, conserva su número reservado (si sigue libre) y posteriores reintentos son idempotentes.
+    const retryableDraft = {
+      ...makeConcurrentDraft(5),
+      id: 'inv-reg-p1-retryable-op'
+    };
+    await assert.rejects(
+      async () => {
+        await emitFiscalInvoice({
+          invoiceDraft: retryableDraft,
+          fiscalConfig,
+          persistRecordFn: async () => {
+            throw new Error('FALLO_SIMULADO_POST_RESERVA');
+          }
+        });
+      },
+      /FALLO_SIMULADO_POST_RESERVA/
+    );
+
+    // Emitir OTRA operación distinta ('inv-reg-p1-other-op'): NO debe reutilizar R-2026-0005 reservado por 'inv-reg-p1-retryable-op'
+    const otherOpDraft = {
+      ...makeConcurrentDraft(6),
+      id: 'inv-reg-p1-other-op'
+    };
+    const otherOpRes = await emitFiscalInvoice({
+      invoiceDraft: otherOpDraft,
+      fiscalConfig
+    });
+    assert.strictEqual(
+      otherOpRes.fiscalRecord.factura.numeroFactura,
+      'R-2026-0006',
+      'Una operación distinta nunca debe reutilizar el número R-2026-0005 reservado previamente'
+    );
+
+    // Reintentar la operación original ('inv-reg-p1-retryable-op') ahora con persistencia normal:
+    const retriedOpRes1 = await emitFiscalInvoice({
+      invoiceDraft: retryableDraft,
+      fiscalConfig
+    });
+    assert.strictEqual(
+      retriedOpRes1.fiscalRecord.factura.numeroFactura,
+      'R-2026-0005',
+      'El reintento de la misma operación recupera su reserva propia R-2026-0005 sin consumir otro número'
+    );
+
+    // Reintentar por segunda vez la misma operación ya confirmada ('inv-reg-p1-retryable-op'):
+    // Debe ser 100% idempotente (mismo FiscalRecord, sin duplicar registro ni incrementar contador)
+    const recordsCountBeforeIdempotentRetry = (await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(OBLIGADO_NIF)).length;
+    const retriedOpRes2 = await emitFiscalInvoice({
+      invoiceDraft: retryableDraft,
+      fiscalConfig
+    });
+    const recordsCountAfterIdempotentRetry = (await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(OBLIGADO_NIF)).length;
+    assert.strictEqual(retriedOpRes2.fiscalRecord.id, retriedOpRes1.fiscalRecord.id);
+    assert.strictEqual(retriedOpRes2.fiscalRecord.factura.numeroFactura, 'R-2026-0005');
+    assert.strictEqual(
+      recordsCountAfterIdempotentRetry,
+      recordsCountBeforeIdempotentRetry,
+      'El reintento de una operación ya emitida no debe crear registros duplicados'
+    );
+
+    // 18.8: Aislamiento por ejercicio fiscal (2027) y por obligado tributario (OTRO_NIF)
+    const preview2027 = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2027-01-15');
+    assert.strictEqual(preview2027, 'R-2027-0001', 'El ejercicio 2027 del mismo emisor debe iniciar en R-2027-0001');
+
+    const OTRO_NIF = 'B98765432';
+    const otroConfig = createDefaultFiscalConfiguration({
+      nif: OTRO_NIF,
+      nombreRazon: 'Segunda Explotación Avícola S.L.'
+    });
+    const previewOtroEmisor = await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OTRO_NIF, '2026-10-23');
+    assert.strictEqual(previewOtroEmisor, 'R-2026-0001', 'Otro obligado tributario en 2026 debe tener su contador aislado en R-2026-0001');
+
+    const origOtro = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-otro-emisor-orig',
+        numeroFactura: 'FAC-B-2026-0001',
+        fecha: '2026-10-10'
+      }),
+      fiscalConfig: otroConfig
+    });
+    const rectOtro = await emitFiscalInvoice({
+      invoiceDraft: buildRectificativaFacturaFromUiState({
+        facturaOriginal: origOtro.invoice,
+        fecha: '2026-10-23',
+        modo: 'anulacion_total',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '01',
+        motivoTexto: 'Rectificativa de segundo emisor aislado',
+        nifEmisor: OTRO_NIF
+      }),
+      fiscalConfig: otroConfig
+    });
+    assert.strictEqual(rectOtro.fiscalRecord.factura.numeroFactura, 'R-2026-0001');
+    assert.strictEqual(
+      await BackendFiscalCustody.previewNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-23'),
+      'R-2026-0007',
+      'La emisión del segundo obligado no debe alterar la secuencia del primer obligado (R-2026-0007)'
+    );
   });
 
   await resetTestEnvironment();

@@ -106,7 +106,7 @@ export class MockAeatTransport {
       ? `\n        <sfR:CodigoErrorRegistro>${line.codigoError}</sfR:CodigoErrorRegistro>\n        <sfR:DescripcionErrorRegistro>${line.descripcionError || 'Error en registro'}</sfR:DescripcionErrorRegistro>`
       : '';
     const dupTags = line.registroDuplicado
-      ? `\n        <sfR:RegistroDuplicado>\n          <sf:IdPeticionRegistroDuplicado>${line.registroDuplicado.idPeticionRegistroDuplicado}</sf:IdPeticionRegistroDuplicado>\n          <sf:EstadoRegistroDuplicado>${line.registroDuplicado.estadoRegistroDuplicado}</sf:EstadoRegistroDuplicado>\n        </sfR:RegistroDuplicado>`
+      ? `\n        <sfR:RegistroDuplicado>\n          <sf:IdPeticionRegistroDuplicado>${line.registroDuplicado.idPeticionRegistroDuplicado.slice(0, 20)}</sf:IdPeticionRegistroDuplicado>\n          <sf:EstadoRegistroDuplicado>${line.registroDuplicado.estadoRegistroDuplicado}</sf:EstadoRegistroDuplicado>\n        </sfR:RegistroDuplicado>`
       : '';
 
     return `      <sfR:RespuestaLinea>

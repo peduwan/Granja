@@ -82,11 +82,20 @@ const emissionQueuesByObligado = new Map<string, Promise<any>>();
 const latestEmittedByObligado = new Map<string, FiscalRecordRef>();
 
 /**
+ * Registro en memoria de números rectificativos reservados por operación (obligado:invoiceId)
+ * para garantizar que un reintento de la misma operación tras fallo transitorio post-reserva
+ * no consuma otro número ni duplique registros, mientras que ninguna otra operación distinta
+ * puede reutilizar jamás un número ya reservado.
+ */
+const reservedRectificativaByOperationKey = new Map<string, string>();
+
+/**
  * Reinicia las colas y cachés de emisión (esencial para tests unitarios).
  */
 export function resetFiscalQueue(): void {
   emissionQueuesByObligado.clear();
   latestEmittedByObligado.clear();
+  reservedRectificativaByOperationKey.clear();
 }
 
 /**
@@ -257,13 +266,50 @@ async function executeEmitFiscalInvoice(
     );
     const isSubsanacion = invoiceDraft.subsanacion === 'S';
 
+    const operationKey = invoiceDraft.id
+      ? `${obligadoTributarioId.trim().toUpperCase()}:${invoiceDraft.id.trim()}`
+      : null;
+
     // Reintento automático ante contienda OCC distribuida entre múltiples instancias Cloud Run
     const maxAttempts = params.previousRecordRef !== undefined ? 1 : 8;
     let lastConflictError: any = null;
-    let reservedBackendNumber: string | null = null;
+    let reservedBackendNumber: string | null = operationKey
+      ? reservedRectificativaByOperationKey.get(operationKey) || null
+      : null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        // 0. Idempotencia de operación: si la misma factura (mismo obligado e invoiceDraft.id) ya fue
+        // sellada y persistida en un intento previo, devolver el registro existente sin duplicar ni consumir otro número.
+        if (params.previousRecordRef === undefined && invoiceDraft.id) {
+          const candidateRecordId = `frec-${invoiceDraft.id}`;
+          const existingRecord = await BackendFiscalCustody.getFiscalRecordByIdAsync(candidateRecordId);
+          if (
+            existingRecord &&
+            existingRecord.obligadoTributarioId === obligadoTributarioId &&
+            (isRectificativa || existingRecord.factura.numeroFactura === invoiceDraft.numeroFactura)
+          ) {
+            const existingRef = createFiscalRecordRef(existingRecord);
+            registerEmittedFiscalRecordRef(obligadoTributarioId, existingRef);
+            const idempotentInvoice: Factura = {
+              ...invoiceDraft,
+              numeroFactura: existingRecord.factura.numeroFactura,
+              tipoFactura: existingRecord.factura.tipoFactura,
+              hashActual: existingRecord.huella.hash,
+              hashAnterior: existingRecord.encadenamiento.registroAnterior?.huella || '',
+              fechaHoraSellado: existingRecord.fechaHoraHusoGenRegistro,
+              urlVeriFactu: existingRecord.qrFiscal?.urlVeriFactu,
+              qrDataUri: existingRecord.qrFiscal?.qrDataUri,
+              fiscalRecordId: existingRecord.id
+            };
+            return {
+              invoice: idempotentInvoice,
+              fiscalRecord: existingRecord,
+              fiscalRecordRef: existingRef
+            };
+          }
+        }
+
         // 1. Obtener la huella anterior DENTRO de la sección serializada (y actualizada en cada intento OCC)
         // NUNCA de invoiceDraft.hashAnterior ni de invoiceDraft.hashActual
         let previousRecord: FiscalRecordRef | FiscalRecord | null = null;
@@ -364,35 +410,54 @@ async function executeEmitFiscalInvoice(
           }
 
           if (!isSubsanacion) {
-            const requestedNum = ( reservedBackendNumber || effectiveInvoiceDraft.numeroFactura || '').trim();
-            const alreadyExistsInCustody = allObligadoRecords.some(
-              r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === requestedNum
+            const rawDraftNum = (effectiveInvoiceDraft.numeroFactura || '').trim();
+            const isStandardRectSeries = /^R-\d{4}-\d+$/i.test(rawDraftNum);
+            const alreadyExistsDraftNum = allObligadoRecords.some(
+              r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === rawDraftNum
             );
-            const isStandardRectSeries = /^R-\d{4}-\d+$/i.test(requestedNum);
             const shouldAssignBackendNumber =
-              !requestedNum ||
-              requestedNum.toUpperCase() === 'AUTO' ||
-              effectiveInvoiceDraft.numeracionAutoritativaBackend === true ||
-              alreadyExistsInCustody ||
+              !rawDraftNum ||
+              rawDraftNum.toUpperCase() === 'AUTO' ||
+              effectiveInvoiceDraft.numeracionAutoritativaBackend !== false ||
+              alreadyExistsDraftNum ||
               (attempt > 1 && isStandardRectSeries);
 
             if (shouldAssignBackendNumber) {
-              if (!reservedBackendNumber || alreadyExistsInCustody) {
-                // Reserva atómica en transacción Firestore OCC / Cloud Coordinator
-                let reservedNumber = await CloudDistributedChainCoordinator.reserveNextRectificativaNumber(
+              // Pre-validar el borrador rectificativo ANTES de reservar numeración atómica,
+              // garantizando que ningún error de validación consuma números en rectificativaCountersByYear.
+              createFiscalRecordFromInvoice(
+                {
+                  ...effectiveInvoiceDraft,
+                  numeroFactura: `R-PRECHECK-${Date.now()}`,
+                  tipoFactura,
+                  hashActual: '0'.repeat(64),
+                  hashAnterior,
+                  fechaHoraSellado: fechaHoraHusoGenRegistro
+                },
+                fiscalConfig,
+                previousRecord,
+                {
+                  hashActual: '0'.repeat(64),
+                  fechaHoraSellado: fechaHoraHusoGenRegistro,
+                  cadenaTextoCanonico: 'PRECHECK'
+                }
+              );
+
+              const reservedAlreadyTaken =
+                reservedBackendNumber !== null &&
+                allObligadoRecords.some(
+                  r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === reservedBackendNumber
+                );
+
+              if (!reservedBackendNumber || reservedAlreadyTaken) {
+                // Reserva atómica y distribuida en Firestore OCC / Cloud Coordinator (exclusivo en emisión)
+                reservedBackendNumber = await BackendFiscalCustody.reserveNextRectificativaNumeroAsync(
                   obligadoTributarioId,
                   effectiveInvoiceDraft.fecha
                 );
-                const custodyNextNumber = BackendFiscalCustody.computeNextRectificativaNumber(
-                  allObligadoRecords,
-                  effectiveInvoiceDraft.fecha
-                );
-                const parsedReserved = parseInt(reservedNumber.split('-')[2] || '0', 10);
-                const parsedCustody = parseInt(custodyNextNumber.split('-')[2] || '0', 10);
-                if (parsedCustody > parsedReserved) {
-                  reservedNumber = custodyNextNumber;
+                if (operationKey) {
+                  reservedRectificativaByOperationKey.set(operationKey, reservedBackendNumber);
                 }
-                reservedBackendNumber = reservedNumber;
               }
 
               effectiveInvoiceDraft = {
@@ -518,9 +583,12 @@ async function executeEmitFiscalInvoice(
           fiscalRecordRef
         };
       } catch (err: any) {
-        if (attempt < maxAttempts && !persistRecordFn && isRetryableDistributedConflictError(err)) {
+        if (attempt < maxAttempts && isRetryableDistributedConflictError(err)) {
           if (String(err?.message || '').includes('Colisión de numeración detectada')) {
             reservedBackendNumber = null;
+            if (operationKey) {
+              reservedRectificativaByOperationKey.delete(operationKey);
+            }
           }
           lastConflictError = err;
           await new Promise(resolve => setTimeout(resolve, 15 * attempt));

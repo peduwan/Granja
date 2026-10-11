@@ -898,18 +898,14 @@ export async function executeAeatSubmission(params: {
             throw new Error('executeAeatSubmission: No se dispone de credenciales de certificado mTLS para la conexión real con AEAT.');
           }
 
-          // Si son credenciales PEM, validar criptográficamente el certificado X.509 y su clave privada antes de abrir el socket
-          if (certCreds.cert && certCreds.key) {
-            if (certCreds.cert.includes('-----BEGIN CERTIFICATE-----') && certCreds.key.includes('-----BEGIN')) {
-              const certCheck = AeatCertificateProvider.validatePemCertificatePair(
-                certCreds.cert,
-                certCreds.key,
-                certCreds.passphrase
-              );
-              if (!certCheck.valid && configuredMode === 'real') {
-                throw new Error(`executeAeatSubmission: Credenciales mTLS inválidas (${certCheck.reason})`);
-              }
-            }
+          // Validar criptográficamente el certificado X.509 (tanto PEM como PKCS#12/PFX) y su clave privada antes de abrir el socket
+          const certCheck = AeatCertificateProvider.validateCredentials(certCreds);
+          if (!certCheck.valid && configuredMode === 'real') {
+            throw new Error(
+              AeatCertificateProvider.sanitizeSensitiveData(
+                `executeAeatSubmission: Credenciales mTLS inválidas (${certCheck.reason})`
+              )
+            );
           }
 
           const httpsAgent = certCreds.pfx
@@ -1337,10 +1333,11 @@ export async function executeAeatSubmission(params: {
       };
 
     } catch (networkErr: any) {
-      // 7. Captura de errores técnicos de red (Timeout, DNS, TLS, Socket closed)
+      // 7. Captura de errores técnicos de red (Timeout, DNS, TLS, Socket closed) con sanitización de secretos
       const durationMs = Date.now() - startTime;
       const errorCode = networkErr?.code || 'ERR_NETWORK_FAILED';
-      const errorMessage = networkErr?.message || 'Error de comunicación de red al conectar con AEAT';
+      const rawMessage = networkErr?.message || 'Error de comunicación de red al conectar con AEAT';
+      const errorMessage = AeatCertificateProvider.sanitizeSensitiveData(rawMessage);
 
       const failedSub = transitionSubmissionStatus(sendingSubmission, 'FAILED_TECHNICAL', {
         codigoAeat: errorCode,

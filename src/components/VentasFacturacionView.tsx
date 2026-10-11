@@ -1981,15 +1981,20 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
       {facturaARectificar && (
         <ModalFacturaRectificativa
           facturaOriginal={facturaARectificar}
+          facturas={facturas}
           contadorRectificativa={contadorRectificativa}
           config={config}
           fiscalRecordRefs={fiscalRecordRefs}
           fiscalConfig={fiscalConfig}
           onClose={() => setFacturaARectificar(null)}
           onEmitirRectificativa={async (rectificativa, reingresarStock, nuevoFiscalRecord) => {
-            await onAddFacturaRectificativa(rectificativa, reingresarStock, nuevoFiscalRecord);
+            const facturaDefinitiva: Factura = {
+              ...rectificativa,
+              numeroFactura: nuevoFiscalRecord.numeroFactura || rectificativa.numeroFactura
+            };
+            await onAddFacturaRectificativa(facturaDefinitiva, reingresarStock, nuevoFiscalRecord);
             setFacturaARectificar(null);
-            setDocumentoImprimir({ tipo: 'factura', doc: rectificativa });
+            setDocumentoImprimir({ tipo: 'factura', doc: facturaDefinitiva });
           }}
         />
       )}

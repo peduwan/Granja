@@ -21,7 +21,10 @@ import {
   computeRectificativaFechaOperacion,
   buildRectificativaFacturaFromUiState
 } from '../fiscal/rectificativaUiBuilder';
-import { emitFiscalInvoiceViaBackend } from '../fiscal/fiscalApiClient';
+import {
+  emitFiscalInvoiceViaBackend,
+  previewNextRectificativaNumberViaBackend
+} from '../fiscal/fiscalApiClient';
 import { createDefaultFiscalConfiguration } from '../fiscal/modelTransformers';
 
 interface ModalFacturaRectificativaProps {
@@ -61,10 +64,11 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
   const [lineasRectificativa, setLineasRectificativa] = useState<LineaDocumentoVenta[]>([]);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
-  const [authoritativeNextNumber, setAuthoritativeNextNumber] = useState<string | null>(null);
+  const [provisionalNextNumber, setProvisionalNextNumber] = useState<string | null>(null);
+  const [draftOperationId, setDraftOperationId] = useState<string>('');
 
   useEffect(() => {
-    if (facturaOriginal) {
+    if (facturaOriginal && isOpen) {
       const initialModo: ModoRectificacionUI = 'anulacion_total';
       const initialTipoRect: TipoRectificativa = 'por_diferencias';
       const defaultClave = inferDefaultClaveRectificativa(facturaOriginal);
@@ -77,23 +81,37 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
       setMotivoTexto('Error en la emisión original de la factura');
       setFecha(todayIso);
       setValidationError(null);
+      setDraftOperationId(`fac-rect-${facturaOriginal.id || Date.now()}-${Date.now()}`);
       setLineasRectificativa(
         computeInitialRectificativaLines(facturaOriginal, initialModo, initialTipoRect)
       );
-
-      const obligado = (fiscalConfig?.nifEmisor || config?.cifEmpresa || 'B12345678').trim().toUpperCase();
-      fetch(`/api/fiscal/rectificativas/next-number?obligado=${encodeURIComponent(obligado)}&fecha=${encodeURIComponent(todayIso)}`)
-        .then(r => (r.ok ? r.json() : null))
-        .then(data => {
-          if (data?.nextNumber) {
-            setAuthoritativeNextNumber(data.nextNumber);
-          }
-        })
-        .catch(() => {
-          setAuthoritativeNextNumber(null);
-        });
     }
-  }, [facturaOriginal, isOpen, fiscalConfig?.nifEmisor, config?.cifEmpresa]);
+  }, [facturaOriginal, isOpen]);
+
+  useEffect(() => {
+    if (!facturaOriginal || !isOpen) return;
+    let cancelled = false;
+    const obligado = (fiscalConfig?.nifEmisor || config?.cifEmpresa || 'B12345678').trim().toUpperCase();
+
+    previewNextRectificativaNumberViaBackend({
+      obligadoTributarioId: obligado,
+      fecha
+    })
+      .then(data => {
+        if (!cancelled) {
+          setProvisionalNextNumber(data?.nextNumber || null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setProvisionalNextNumber(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [facturaOriginal, isOpen, fecha, fiscalConfig?.nifEmisor, config?.cifEmpresa]);
 
   if (!isOpen || !facturaOriginal) return null;
 
@@ -206,8 +224,8 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
           nombreRazon: config?.nombreEmpresa || 'Granja Avícola S.L.'
         });
 
-      // La numeración definitiva R-YYYY-NNN es asignada por la autoridad backend bajo cerrojo distribuido
-      const borradorFactura = buildRectificativaFacturaFromUiState({
+      // La numeración definitiva R-YYYY-NNNN es reservada y asignada atómicamente en el backend durante la emisión
+      const borradorBase = buildRectificativaFacturaFromUiState({
         facturaOriginal,
         existingInvoices: facturas,
         numeroFacturaOverride: undefined,
@@ -220,15 +238,21 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
         lineasEditadas: lineasRectificativa,
         nifEmisor: effectiveFiscalConfig.nifEmisor
       });
+      const borradorFactura: Factura = {
+        ...borradorBase,
+        id: draftOperationId || borradorBase.id
+      };
 
       setIsSubmitting(true);
       const emitted = await emitFiscalInvoiceViaBackend({
         invoiceDraft: borradorFactura,
         fiscalConfig: effectiveFiscalConfig
       });
+      const definitiveNumeroFactura =
+        emitted.fiscalRecord.factura.numeroFactura || emitted.invoice.numeroFactura;
       const facturaAutoritativa: Factura = {
         ...emitted.invoice,
-        numeroFactura: emitted.fiscalRecord.factura.numeroFactura || emitted.invoice.numeroFactura
+        numeroFactura: definitiveNumeroFactura
       };
       await onEmitirRectificativa(facturaAutoritativa, reingresarStock, emitted.fiscalRecordRef);
       onClose();
@@ -252,9 +276,12 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
               <h2 className="text-lg font-bold tracking-tight">Emitir Factura Rectificativa (Veri*Factu)</h2>
               <p className="text-xs text-amber-200/80">
                 Rectificando Factura Original: <span className="font-mono font-bold text-white">{facturaOriginal.numeroFactura}</span> ({facturaOriginal.fecha}) · Fecha Operación: <span className="font-mono text-amber-100">{resolvedFechaOperacion}</span>
-                {authoritativeNextNumber && (
-                  <span className="ml-2 px-2 py-0.5 bg-amber-900/80 rounded font-mono text-[11px] text-amber-200">
-                    Serie Backend: {authoritativeNextNumber}
+                {provisionalNextNumber && (
+                  <span
+                    className="ml-2 px-2 py-0.5 bg-amber-900/80 rounded font-mono text-[11px] text-amber-200"
+                    title="Sugerencia provisional en modo solo lectura (sin consumir numeración). La numeración definitiva se reserva atómicamente durante la emisión en backend."
+                  >
+                    Nº Provisional: {provisionalNextNumber} (definitivo al emitir)
                   </span>
                 )}
               </p>

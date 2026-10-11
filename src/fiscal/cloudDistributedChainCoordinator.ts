@@ -427,9 +427,111 @@ export class CloudDistributedChainCoordinator {
   }
 
   /**
+  /**
+   * Previsualiza en modo SOLO LECTURA el siguiente número correlativo sugerido de factura rectificativa
+   * (serie R-YYYY-NNN) consultando el estado actual sin incrementar contadores, sin adquirir bloqueos
+   * de escritura y sin producir ningún efecto secundario persistente.
+   * La numeración definitiva únicamente se asigna mediante reserveNextRectificativaNumber durante la emisión.
+   */
+  public static async previewNextRectificativaNumber(
+    obligadoId: string,
+    fechaIsoOrAeat?: string
+  ): Promise<string> {
+    if (!obligadoId || obligadoId.trim() === '') {
+      throw new Error('CloudDistributedChainCoordinator: previewNextRectificativaNumber requiere un obligadoId válido.');
+    }
+    const cleanObligado = obligadoId.trim().toUpperCase();
+
+    let year = new Date().getFullYear().toString();
+    if (fechaIsoOrAeat) {
+      const mIso = /^(\d{4})-\d{2}-\d{2}$/.exec(fechaIsoOrAeat.trim());
+      const mAeat = /^\d{2}-\d{2}-(\d{4})$/.exec(fechaIsoOrAeat.trim());
+      if (mIso) year = mIso[1];
+      else if (mAeat) year = mAeat[1];
+    }
+    const prefix = `R-${year}-`;
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible en modo firestore para previewNextRectificativaNumber (Fail-Closed).'
+        );
+      }
+
+      const stateRef = firestore.collection('fiscal_chain_state').doc(cleanObligado);
+      const recordsQuery = firestore
+        .collection('fiscal_records')
+        .where('obligadoTributarioId', '==', cleanObligado);
+
+      const [stateSnap, recordsSnap] = await Promise.all([
+        stateRef.get(),
+        recordsQuery.get()
+      ]);
+
+      const current = stateSnap.exists ? (stateSnap.data() as CloudChainState) : null;
+      let maxNum = current?.rectificativaCountersByYear?.[year] || 0;
+
+      if (recordsSnap && !recordsSnap.empty) {
+        recordsSnap.forEach((doc: any) => {
+          const rec = doc.data() as FiscalRecord;
+          const numFac = rec?.factura?.numeroFactura || '';
+          if (numFac.startsWith(prefix)) {
+            const parsed = parseInt(numFac.slice(prefix.length), 10);
+            if (!isNaN(parsed) && parsed > maxNum) {
+              maxNum = parsed;
+            }
+          }
+        });
+      }
+
+      const nextNum = maxNum + 1;
+      return `${prefix}${String(nextNum).padStart(4, '0')}`;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    let allStates: Record<string, CloudChainState> = {};
+    if (fs.existsSync(SHARED_STATE_FILE)) {
+      try {
+        allStates = JSON.parse(fs.readFileSync(SHARED_STATE_FILE, 'utf-8'));
+      } catch {}
+    }
+    let allRecords: Record<string, FiscalRecord> = {};
+    if (fs.existsSync(SHARED_RECORDS_FILE)) {
+      try {
+        allRecords = JSON.parse(fs.readFileSync(SHARED_RECORDS_FILE, 'utf-8'));
+      } catch {}
+    }
+
+    const current = allStates[cleanObligado] || null;
+    let maxNum = current?.rectificativaCountersByYear?.[year] || 0;
+
+    for (const rec of Object.values(allRecords)) {
+      if (rec.obligadoTributarioId !== cleanObligado) continue;
+      const numFac = rec.factura?.numeroFactura || '';
+      if (numFac.startsWith(prefix)) {
+        const parsed = parseInt(numFac.slice(prefix.length), 10);
+        if (!isNaN(parsed) && parsed > maxNum) {
+          maxNum = parsed;
+        }
+      }
+    }
+
+    const nextNum = maxNum + 1;
+    return `${prefix}${String(nextNum).padStart(4, '0')}`;
+  }
+
+  /**
    * Reserva atómicamente el siguiente número correlativo de factura rectificativa (serie R-YYYY-NNN)
    * mediante una transacción distribuida OCC en Firestore (o cerrojo atómico en simulador).
    * Garantiza que dos instancias o procesos concurrentes NUNCA reciban el mismo número de serie.
+   * USO EXCLUSIVO EN EL FLUJO DE EMISIÓN EN BACKEND.
    */
   public static async reserveNextRectificativaNumber(
     obligadoId: string,
