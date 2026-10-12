@@ -235,6 +235,9 @@ async function main() {
     await assert.rejects(async () => {
       await CloudDistributedChainCoordinator.commitRecord(forkedRecord as any);
     }, /Bifurcación de cadena detectada/);
+
+    BackendFiscalCustody.resetCustody();
+    CloudDistributedChainCoordinator.resetCloudState();
   });
 
   console.log('================================================================');

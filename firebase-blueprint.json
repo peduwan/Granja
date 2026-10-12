@@ -91,6 +91,10 @@
     "/fiscal_events/{eventId}": {
       "schema": "RegistroFacturacionVeriFactu",
       "description": "Libro de auditoría de eventos inmutables del sistema fiscal"
+    },
+    "/fiscal_emission_operations/{operationId}": {
+      "schema": "RegistroFacturacionVeriFactu",
+      "description": "Registro distribuido de idempotencia de operaciones de emisión y reservas de numeración entre instancias Cloud Run"
     }
   }
 }

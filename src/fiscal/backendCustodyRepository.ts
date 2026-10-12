@@ -929,6 +929,7 @@ export class BackendFiscalCustody {
   /**
    * Reserva atómicamente y de forma distribuida la numeración definitiva de factura rectificativa
    * (serie R-YYYY-NNN) actualizando el contador en la autoridad (Firestore / Cloud Coordinator).
+   * Devuelve exactamente el número asignado por la transacción atómica sin sustituirlo por segundas lecturas.
    * USO EXCLUSIVO EN EL FLUJO DE EMISIÓN EN BACKEND.
    */
   public static async reserveNextRectificativaNumeroAsync(
@@ -937,15 +938,10 @@ export class BackendFiscalCustody {
   ): Promise<string> {
     const cleanObligado = obligadoTributarioId.trim().toUpperCase();
     const { CloudDistributedChainCoordinator } = await import('./cloudDistributedChainCoordinator');
-    const reserved = await CloudDistributedChainCoordinator.reserveNextRectificativaNumber(
+    return await CloudDistributedChainCoordinator.reserveNextRectificativaNumber(
       cleanObligado,
       fechaExpedicion
     );
-    const records = await this.getAllFiscalRecordsByObligadoAsync(cleanObligado);
-    const custodyNext = this.computeNextRectificativaNumber(records, fechaExpedicion);
-    const parsedReserved = parseInt(reserved.split('-')[2] || '0', 10);
-    const parsedCustody = parseInt(custodyNext.split('-')[2] || '0', 10);
-    return parsedCustody > parsedReserved ? custodyNext : reserved;
   }
 
   /**
@@ -960,8 +956,25 @@ export class BackendFiscalCustody {
       if (fs.existsSync(RECORDS_FILE)) fs.unlinkSync(RECORDS_FILE);
       if (fs.existsSync(SUBMISSIONS_FILE)) fs.unlinkSync(SUBMISSIONS_FILE);
       if (fs.existsSync(EVENTS_FILE)) fs.unlinkSync(EVENTS_FILE);
-      const sharedState = path.resolve(process.cwd(), 'data', 'cloud_shared_chain_state.json');
-      if (fs.existsSync(sharedState)) fs.unlinkSync(sharedState);
+      const filesToClean = [
+        'cloud_shared_chain_state.json',
+        'cloud_shared_records.json',
+        'cloud_shared_submissions.json',
+        'cloud_shared_events.json',
+        'cloud_shared_flow_control.json',
+        'cloud_shared_send_locks.json',
+        'cloud_shared_emission_operations.json'
+      ];
+      for (const f of filesToClean) {
+        const p = path.resolve(DATA_DIR, f);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      }
+      if (fs.existsSync(LOCKS_DIR)) {
+        const lockFiles = fs.readdirSync(LOCKS_DIR);
+        for (const file of lockFiles) {
+          try { fs.unlinkSync(path.join(LOCKS_DIR, file)); } catch {}
+        }
+      }
     } catch {}
   }
 }

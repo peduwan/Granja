@@ -1,0 +1,17 @@
+{
+  "_description": "Fixture explícito de pruebas unitarias/integración para validar aislamiento y no-bifurcación de cadenas fiscales.",
+  "obligadoTributarioId": "B77777777",
+  "nombreRazon": "Granja San Antonio S.L.",
+  "sampleInvoices": [
+    {
+      "numeroFactura": "FAC-DISTRIB-01",
+      "fecha": "2026-03-01",
+      "primerRegistro": true
+    },
+    {
+      "numeroFactura": "FAC-DISTRIB-02",
+      "fecha": "2026-03-01",
+      "primerRegistro": false
+    }
+  ]
+}

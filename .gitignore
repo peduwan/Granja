@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Artefactos persistentes y cerrojos generados en ejecución (no ignorar fixtures en tests/fixtures/)
+data/*.json
+data/*.tmp
+data/*.lock
+data/locks/
+!tests/fixtures/**
+

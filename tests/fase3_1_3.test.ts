@@ -404,6 +404,10 @@ async function main() {
     }, /Fallo de integridad criptográfica en el registro/);
   });
 
+  BackendFiscalCustody.resetCustody();
+  AeatFlowControlManager.reset();
+  resetFiscalQueue();
+
   // -----------------------------------------------------------------------------
   // RESUMEN FINAL
   // -----------------------------------------------------------------------------

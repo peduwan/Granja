@@ -84,6 +84,12 @@ service cloud.firestore {
       allow read: if isAuthorizedUser();
       allow write: if false;
     }
+
+    // Registro Distribuido de Idempotencia de Operaciones de Emisión Fiscal (Gestionado exclusivamente por Backend)
+    match /fiscal_emission_operations/{operationId} {
+      allow read: if isAuthorizedUser();
+      allow write: if false;
+    }
   }
 }
 

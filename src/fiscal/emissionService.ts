@@ -51,6 +51,8 @@ import {
 export interface EmitFiscalInvoiceParams {
   invoiceDraft: Factura;
   fiscalConfig: FiscalConfiguration;
+  /** Clave opcional de idempotencia de operación (por defecto se deriva determinísticamente de obligadoTributarioId + idempotencyKey/invoiceDraft.id) */
+  operationKey?: string;
   /** Opcional: lista de referencias conocidas (ej. appData.fiscalRecordRefs) para buscar el histórico */
   existingRecordRefs?: FiscalRecordRef[];
   /** Opcional: registro anterior explícito para testing o forzar caso inicial */
@@ -82,20 +84,11 @@ const emissionQueuesByObligado = new Map<string, Promise<any>>();
 const latestEmittedByObligado = new Map<string, FiscalRecordRef>();
 
 /**
- * Registro en memoria de números rectificativos reservados por operación (obligado:invoiceId)
- * para garantizar que un reintento de la misma operación tras fallo transitorio post-reserva
- * no consuma otro número ni duplique registros, mientras que ninguna otra operación distinta
- * puede reutilizar jamás un número ya reservado.
- */
-const reservedRectificativaByOperationKey = new Map<string, string>();
-
-/**
  * Reinicia las colas y cachés de emisión (esencial para tests unitarios).
  */
 export function resetFiscalQueue(): void {
   emissionQueuesByObligado.clear();
   latestEmittedByObligado.clear();
-  reservedRectificativaByOperationKey.clear();
 }
 
 /**
@@ -266,40 +259,78 @@ async function executeEmitFiscalInvoice(
     );
     const isSubsanacion = invoiceDraft.subsanacion === 'S';
 
-    const operationKey = invoiceDraft.id
-      ? `${obligadoTributarioId.trim().toUpperCase()}:${invoiceDraft.id.trim()}`
+    const rawOpId = (
+      params.operationKey ||
+      (invoiceDraft as any).idempotencyKey ||
+      invoiceDraft.id ||
+      ''
+    ).trim();
+    const operationKey = rawOpId
+      ? rawOpId.includes(':')
+        ? rawOpId.toUpperCase()
+        : `${obligadoTributarioId.trim().toUpperCase()}:${rawOpId}`
       : null;
 
     // Reintento automático ante contienda OCC distribuida entre múltiples instancias Cloud Run
     const maxAttempts = params.previousRecordRef !== undefined ? 1 : 8;
     let lastConflictError: any = null;
-    let reservedBackendNumber: string | null = operationKey
-      ? reservedRectificativaByOperationKey.get(operationKey) || null
-      : null;
+    let reservedBackendNumber: string | null = null;
+    let forceNewReservationOnNextAttempt = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        // 0. Idempotencia de operación: si la misma factura (mismo obligado e invoiceDraft.id) ya fue
-        // sellada y persistida en un intento previo, devolver el registro existente sin duplicar ni consumir otro número.
-        if (params.previousRecordRef === undefined && invoiceDraft.id) {
-          const candidateRecordId = `frec-${invoiceDraft.id}`;
-          const existingRecord = await BackendFiscalCustody.getFiscalRecordByIdAsync(candidateRecordId);
+        // 0. Idempotencia distribuida de operación:
+        // Consultar en la autoridad distribuida (Firestore / Cloud Coordinator) tanto por operationKey
+        // como por el identificador determinista del registro (`frec-${invoiceDraft.id}`).
+        // Si la operación ya terminó en esta u otra instancia de Cloud Run, devolver su resultado
+        // anterior sin crear otro registro ni reservar otra numeración.
+        if (params.previousRecordRef === undefined) {
+          let existingRecord: FiscalRecord | null = null;
+
+          if (operationKey) {
+            const existingOp = await CloudDistributedChainCoordinator.getEmissionOperation(operationKey);
+            if (existingOp) {
+              if (existingOp.status === 'COMPLETED' && existingOp.fiscalRecordId) {
+                existingRecord = await BackendFiscalCustody.getFiscalRecordByIdAsync(existingOp.fiscalRecordId);
+              }
+              if (!reservedBackendNumber && existingOp.reservedNumeroFactura) {
+                reservedBackendNumber = existingOp.reservedNumeroFactura;
+              }
+            }
+          }
+
+          if (!existingRecord && invoiceDraft.id) {
+            const candidateRecordId = `frec-${invoiceDraft.id}`;
+            existingRecord = await BackendFiscalCustody.getFiscalRecordByIdAsync(candidateRecordId);
+          }
+
           if (
             existingRecord &&
             existingRecord.obligadoTributarioId === obligadoTributarioId &&
             (isRectificativa || existingRecord.factura.numeroFactura === invoiceDraft.numeroFactura)
           ) {
+            if (operationKey) {
+              await CloudDistributedChainCoordinator.markEmissionOperationCompleted({
+                operationKey,
+                obligadoId: obligadoTributarioId,
+                invoiceId: existingRecord.invoiceId || invoiceDraft.id,
+                isRectificativa,
+                fiscalRecordId: existingRecord.id,
+                assignedNumeroFactura: existingRecord.factura.numeroFactura
+              });
+            }
             const existingRef = createFiscalRecordRef(existingRecord);
             registerEmittedFiscalRecordRef(obligadoTributarioId, existingRef);
             const idempotentInvoice: Factura = {
               ...invoiceDraft,
+              id: existingRecord.invoiceId || invoiceDraft.id,
               numeroFactura: existingRecord.factura.numeroFactura,
               tipoFactura: existingRecord.factura.tipoFactura,
               hashActual: existingRecord.huella.hash,
               hashAnterior: existingRecord.encadenamiento.registroAnterior?.huella || '',
               fechaHoraSellado: existingRecord.fechaHoraHusoGenRegistro,
-              urlVeriFactu: existingRecord.qrFiscal?.urlVeriFactu,
-              qrDataUri: existingRecord.qrFiscal?.qrDataUri,
+              urlVeriFactu: existingRecord.qr?.url,
+              qrDataUri: existingRecord.qr?.qrDataUri,
               fiscalRecordId: existingRecord.id
             };
             return {
@@ -449,15 +480,24 @@ async function executeEmitFiscalInvoice(
                   r => r.tipoRegistro === 'alta' && r.factura.numeroFactura === reservedBackendNumber
                 );
 
-              if (!reservedBackendNumber || reservedAlreadyTaken) {
-                // Reserva atómica y distribuida en Firestore OCC / Cloud Coordinator (exclusivo en emisión)
-                reservedBackendNumber = await BackendFiscalCustody.reserveNextRectificativaNumeroAsync(
-                  obligadoTributarioId,
-                  effectiveInvoiceDraft.fecha
-                );
+              if (!reservedBackendNumber || reservedAlreadyTaken || forceNewReservationOnNextAttempt) {
                 if (operationKey) {
-                  reservedRectificativaByOperationKey.set(operationKey, reservedBackendNumber);
+                  // Reserva/recuperación atómica y distribuida vinculada a operationKey en Firestore OCC / Cloud Coordinator
+                  reservedBackendNumber =
+                    await CloudDistributedChainCoordinator.reserveNextRectificativaNumberForOperation({
+                      operationKey,
+                      obligadoId: obligadoTributarioId,
+                      invoiceId: effectiveInvoiceDraft.id,
+                      fechaIsoOrAeat: effectiveInvoiceDraft.fecha,
+                      forceNewReservation: reservedAlreadyTaken || forceNewReservationOnNextAttempt
+                    });
+                } else {
+                  reservedBackendNumber = await BackendFiscalCustody.reserveNextRectificativaNumeroAsync(
+                    obligadoTributarioId,
+                    effectiveInvoiceDraft.fecha
+                  );
                 }
+                forceNewReservationOnNextAttempt = false;
               }
 
               effectiveInvoiceDraft = {
@@ -565,6 +605,17 @@ async function executeEmitFiscalInvoice(
         const saveFn = persistRecordFn || defaultSaveFn;
         await saveFn(fiscalRecord);
 
+        if (operationKey && params.previousRecordRef === undefined) {
+          await CloudDistributedChainCoordinator.markEmissionOperationCompleted({
+            operationKey,
+            obligadoId: obligadoTributarioId,
+            invoiceId: effectiveInvoiceDraft.id,
+            isRectificativa,
+            fiscalRecordId: fiscalRecord.id,
+            assignedNumeroFactura: fiscalRecord.factura.numeroFactura
+          });
+        }
+
         // 8. Generar la referencia liviana indexable para AppData
         const fiscalRecordRef = createFiscalRecordRef(fiscalRecord);
 
@@ -586,9 +637,7 @@ async function executeEmitFiscalInvoice(
         if (attempt < maxAttempts && isRetryableDistributedConflictError(err)) {
           if (String(err?.message || '').includes('Colisión de numeración detectada')) {
             reservedBackendNumber = null;
-            if (operationKey) {
-              reservedRectificativaByOperationKey.delete(operationKey);
-            }
+            forceNewReservationOnNextAttempt = true;
           }
           lastConflictError = err;
           await new Promise(resolve => setTimeout(resolve, 15 * attempt));

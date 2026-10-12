@@ -999,6 +999,13 @@ async function main() {
       delete process.env.AEAT_CERT_PASSWORD;
       delete process.env.AEAT_KEY_PEM;
       AeatCertificateProvider.clear();
+      try {
+        AeatFlowControlManager.reset();
+        const { BackendFiscalCustody } = await import('../src/fiscal/backendCustodyRepository');
+        BackendFiscalCustody.resetCustody();
+        const { CloudDistributedChainCoordinator } = await import('../src/fiscal/cloudDistributedChainCoordinator');
+        CloudDistributedChainCoordinator.resetCloudState();
+      } catch {}
     }
   });
 

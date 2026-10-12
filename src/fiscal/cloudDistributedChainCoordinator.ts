@@ -90,6 +90,7 @@ const SHARED_SUBMISSIONS_FILE = path.resolve(process.cwd(), 'data', 'cloud_share
 const SHARED_EVENTS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_events.json');
 const SHARED_FLOW_CONTROL_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_flow_control.json');
 const SHARED_SEND_LOCKS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_send_locks.json');
+const SHARED_OPERATIONS_FILE = path.resolve(process.cwd(), 'data', 'cloud_shared_emission_operations.json');
 
 export interface CloudFlowControlDoc {
   obligadoTributarioId: string;
@@ -105,6 +106,19 @@ export interface CloudSendLockDoc {
   ownerToken: string;
   acquiredAt: number;
   expiresAt: number;
+}
+
+export interface CloudEmissionOperationDoc {
+  operationKey: string;
+  obligadoTributarioId: string;
+  invoiceId: string;
+  isRectificativa: boolean;
+  status: 'RESERVED' | 'COMPLETED';
+  reservedNumeroFactura?: string;
+  assignedNumeroFactura?: string;
+  fiscalRecordId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 function extractRectificativaYearAndNumber(numeroFactura?: string): { year: string; num: number } | null {
@@ -313,10 +327,12 @@ export class CloudDistributedChainCoordinator {
       }
 
       const stateRef = firestore.collection('fiscal_chain_state').doc(record.obligadoTributarioId);
-      const recordRef = firestore.collection('fiscal_records').doc(record.id);
-      const recordsQuery = firestore
-        .collection('fiscal_records')
-        .where('obligadoTributarioId', '==', record.obligadoTributarioId);
+      const recordsCol = firestore.collection('fiscal_records');
+      const recordRef = recordsCol.doc(record.id);
+      const recordsQuery =
+        typeof (recordsCol as any).where === 'function'
+          ? recordsCol.where('obligadoTributarioId', '==', record.obligadoTributarioId)
+          : null;
 
       // runTransaction ejecuta con Optimistic Concurrency Control (OCC) en Google Cloud Firestore.
       // Cualquier fallo en la transacción se propaga inmediatamente (Fail-Closed).
@@ -332,7 +348,7 @@ export class CloudDistributedChainCoordinator {
 
         // Unicidad de numeroFactura para el mismo obligado en registros de alta no subsanatorios
         const tipoReg = (record.tipoRegistro || 'alta').toLowerCase();
-        if (tipoReg === 'alta' && record.factura?.subsanacion !== 'S' && typeof (recordsQuery as any)?.get === 'function') {
+        if (tipoReg === 'alta' && record.factura?.subsanacion !== 'S' && recordsQuery && typeof (recordsQuery as any)?.get === 'function') {
           const obligedRecordsSnap = await (typeof (tx as any).get === 'function' ? tx.get(recordsQuery as any) : (recordsQuery as any).get());
           if (obligedRecordsSnap && !obligedRecordsSnap.empty && typeof obligedRecordsSnap.forEach === 'function') {
             let duplicateId: string | null = null;
@@ -1259,9 +1275,15 @@ export class CloudDistributedChainCoordinator {
       const existing = allLocks[obligadoId];
       if (existing && (!ownerToken || !existing.ownerToken || existing.ownerToken === ownerToken)) {
         delete allLocks[obligadoId];
-        const tmp = `${SHARED_SEND_LOCKS_FILE}.${process.pid}.${Date.now()}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(allLocks, null, 2), 'utf-8');
-        fs.renameSync(tmp, SHARED_SEND_LOCKS_FILE);
+        if (Object.keys(allLocks).length === 0) {
+          try {
+            if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) fs.unlinkSync(SHARED_SEND_LOCKS_FILE);
+          } catch {}
+        } else {
+          const tmp = `${SHARED_SEND_LOCKS_FILE}.${process.pid}.${Date.now()}.tmp`;
+          fs.writeFileSync(tmp, JSON.stringify(allLocks, null, 2), 'utf-8');
+          fs.renameSync(tmp, SHARED_SEND_LOCKS_FILE);
+        }
       }
     }
   }
@@ -1376,6 +1398,406 @@ export class CloudDistributedChainCoordinator {
   }
 
   /**
+   * Consulta en la autoridad distribuida (Firestore / Cloud Simulator) el estado duradero de una operación
+   * de emisión fiscal identificada por su clave estable (`operationKey`).
+   * Permite idempotencia distribuida entre múltiples instancias de Cloud Run.
+   */
+  public static async getEmissionOperation(operationKey: string): Promise<CloudEmissionOperationDoc | null> {
+    if (!operationKey || !operationKey.trim()) return null;
+    const cleanKey = operationKey.trim();
+    const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para getEmissionOperation (Fail-Closed).'
+        );
+      }
+      const snap = await firestore.collection('fiscal_emission_operations').doc(docId).get();
+      if (snap.exists) {
+        return snap.data() as CloudEmissionOperationDoc;
+      }
+      return null;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    if (fs.existsSync(SHARED_OPERATIONS_FILE)) {
+      try {
+        const allOps: Record<string, CloudEmissionOperationDoc> = JSON.parse(
+          fs.readFileSync(SHARED_OPERATIONS_FILE, 'utf-8')
+        );
+        return allOps[cleanKey] || null;
+      } catch {}
+    }
+    return null;
+  }
+
+  /**
+   * Reserva o recupera atómicamente la numeración definitiva de una factura rectificativa asociada
+   * a una clave de operación estable (`operationKey`) con protección OCC contra concurrencia entre instancias.
+   *
+   * - Si la operación ya tiene un número reservado en estado `RESERVED` o `COMPLETED` y dicho número no ha sido
+   *   consumido por otra operación distinta, devuelve exactamente el mismo número sin incrementar el contador.
+   * - Si la operación aún no tiene reserva (o requiere nueva asignación), reserva atómicamente el siguiente
+   *   correlativo considerando `rectificativaCountersByYear` y todos los `fiscal_records` existentes, y persiste
+   *   la asociación duradera `operationKey -> reservedNumeroFactura` en la misma transacción.
+   */
+  public static async reserveNextRectificativaNumberForOperation(params: {
+    operationKey: string;
+    obligadoId: string;
+    invoiceId: string;
+    fechaIsoOrAeat?: string;
+    forceNewReservation?: boolean;
+  }): Promise<string> {
+    const cleanKey = (params.operationKey || '').trim();
+    const cleanObligado = (params.obligadoId || '').trim().toUpperCase();
+    if (!cleanKey || !cleanObligado) {
+      throw new Error(
+        'CloudDistributedChainCoordinator: reserveNextRectificativaNumberForOperation requiere operationKey y obligadoId válidos.'
+      );
+    }
+
+    let year = new Date().getFullYear().toString();
+    if (params.fechaIsoOrAeat) {
+      const mIso = /^(\d{4})-\d{2}-\d{2}$/.exec(params.fechaIsoOrAeat.trim());
+      const mAeat = /^\d{2}-\d{2}-(\d{4})$/.exec(params.fechaIsoOrAeat.trim());
+      if (mIso) year = mIso[1];
+      else if (mAeat) year = mAeat[1];
+    }
+    const prefix = `R-${year}-`;
+    const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
+    const mode = getCoordinatorMode();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para reserveNextRectificativaNumberForOperation (Fail-Closed).'
+        );
+      }
+
+      const opRef = firestore.collection('fiscal_emission_operations').doc(docId);
+      const stateRef = firestore.collection('fiscal_chain_state').doc(cleanObligado);
+      const recordsQuery = firestore
+        .collection('fiscal_records')
+        .where('obligadoTributarioId', '==', cleanObligado);
+
+      return await firestore.runTransaction(async (tx) => {
+        const [opSnap, stateSnap, recordsSnap] = await Promise.all([
+          tx.get(opRef),
+          tx.get(stateRef),
+          tx.get(recordsQuery)
+        ]);
+
+        const existingRecords: FiscalRecord[] = [];
+        if (recordsSnap && !recordsSnap.empty) {
+          recordsSnap.forEach((doc: any) => {
+            const rec = doc.data() as FiscalRecord;
+            if (rec) existingRecords.push(rec);
+          });
+        }
+
+        if (!params.forceNewReservation && opSnap.exists) {
+          const opData = opSnap.data() as CloudEmissionOperationDoc;
+          const candidateNum = opData.assignedNumeroFactura || opData.reservedNumeroFactura;
+          if (candidateNum && candidateNum.startsWith(prefix)) {
+            const takenByOther = existingRecords.some(
+              r =>
+                (r.tipoRegistro || 'alta').toLowerCase() === 'alta' &&
+                r.factura?.numeroFactura === candidateNum &&
+                r.invoiceId !== params.invoiceId &&
+                r.id !== opData.fiscalRecordId
+            );
+            if (!takenByOther) {
+              return candidateNum;
+            }
+          }
+        }
+
+        const current = stateSnap.exists ? (stateSnap.data() as CloudChainState) : null;
+        let maxNum = current?.rectificativaCountersByYear?.[year] || 0;
+
+        for (const rec of existingRecords) {
+          const numFac = rec?.factura?.numeroFactura || '';
+          if (numFac.startsWith(prefix)) {
+            const parsed = parseInt(numFac.slice(prefix.length), 10);
+            if (!isNaN(parsed) && parsed > maxNum) {
+              maxNum = parsed;
+            }
+          }
+        }
+
+        const nextNum = maxNum + 1;
+        const nextNumberFormatted = `${prefix}${String(nextNum).padStart(4, '0')}`;
+        const nextCounters: Record<string, number> = {
+          ...(current?.rectificativaCountersByYear || {}),
+          [year]: nextNum
+        };
+        const nowIso = new Date().toISOString();
+
+        if (stateSnap.exists && current) {
+          tx.update(stateRef, {
+            rectificativaCountersByYear: nextCounters,
+            updatedAt: nowIso
+          } as any);
+        } else {
+          const initialState: CloudChainState = {
+            obligadoTributarioId: cleanObligado,
+            latestRecordId: '',
+            latestHuella: '',
+            latestNumeroFactura: '',
+            latestFecha: '',
+            totalRecords: 0,
+            sequence: 0,
+            rectificativaCountersByYear: nextCounters,
+            updatedAt: nowIso
+          };
+          tx.set(stateRef, initialState as any);
+        }
+
+        const opDoc: CloudEmissionOperationDoc = {
+          operationKey: cleanKey,
+          obligadoTributarioId: cleanObligado,
+          invoiceId: params.invoiceId,
+          isRectificativa: true,
+          status: 'RESERVED',
+          reservedNumeroFactura: nextNumberFormatted,
+          createdAt: opSnap.exists ? (opSnap.data() as CloudEmissionOperationDoc).createdAt || nowIso : nowIso,
+          updatedAt: nowIso
+        };
+        tx.set(opRef, opDoc as any);
+
+        return nextNumberFormatted;
+      });
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    const dir = path.dirname(SHARED_STATE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const lockFile = `${SHARED_STATE_FILE}.lock`;
+    const timeoutMs = 12000;
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        try {
+          let allOps: Record<string, CloudEmissionOperationDoc> = {};
+          if (fs.existsSync(SHARED_OPERATIONS_FILE)) {
+            try {
+              allOps = JSON.parse(fs.readFileSync(SHARED_OPERATIONS_FILE, 'utf-8'));
+            } catch {}
+          }
+          let allStates: Record<string, CloudChainState> = {};
+          if (fs.existsSync(SHARED_STATE_FILE)) {
+            try {
+              allStates = JSON.parse(fs.readFileSync(SHARED_STATE_FILE, 'utf-8'));
+            } catch {}
+          }
+          let allRecords: Record<string, FiscalRecord> = {};
+          if (fs.existsSync(SHARED_RECORDS_FILE)) {
+            try {
+              allRecords = JSON.parse(fs.readFileSync(SHARED_RECORDS_FILE, 'utf-8'));
+            } catch {}
+          }
+
+          const existingOp = allOps[cleanKey];
+          if (!params.forceNewReservation && existingOp) {
+            const candidateNum = existingOp.assignedNumeroFactura || existingOp.reservedNumeroFactura;
+            if (candidateNum && candidateNum.startsWith(prefix)) {
+              const takenByOther = Object.values(allRecords).some(
+                r =>
+                  r.obligadoTributarioId === cleanObligado &&
+                  (r.tipoRegistro || 'alta').toLowerCase() === 'alta' &&
+                  r.factura?.numeroFactura === candidateNum &&
+                  r.invoiceId !== params.invoiceId &&
+                  r.id !== existingOp.fiscalRecordId
+              );
+              if (!takenByOther) {
+                return candidateNum;
+              }
+            }
+          }
+
+          const current = allStates[cleanObligado] || null;
+          let maxNum = current?.rectificativaCountersByYear?.[year] || 0;
+
+          for (const rec of Object.values(allRecords)) {
+            if (rec.obligadoTributarioId !== cleanObligado) continue;
+            const numFac = rec.factura?.numeroFactura || '';
+            if (numFac.startsWith(prefix)) {
+              const parsed = parseInt(numFac.slice(prefix.length), 10);
+              if (!isNaN(parsed) && parsed > maxNum) {
+                maxNum = parsed;
+              }
+            }
+          }
+
+          const nextNum = maxNum + 1;
+          const nextNumberFormatted = `${prefix}${String(nextNum).padStart(4, '0')}`;
+          const nextCounters: Record<string, number> = {
+            ...(current?.rectificativaCountersByYear || {}),
+            [year]: nextNum
+          };
+          const nowIso = new Date().toISOString();
+
+          if (current) {
+            allStates[cleanObligado] = {
+              ...current,
+              rectificativaCountersByYear: nextCounters,
+              updatedAt: nowIso
+            };
+          } else {
+            allStates[cleanObligado] = {
+              obligadoTributarioId: cleanObligado,
+              latestRecordId: '',
+              latestHuella: '',
+              latestNumeroFactura: '',
+              latestFecha: '',
+              totalRecords: 0,
+              sequence: 0,
+              rectificativaCountersByYear: nextCounters,
+              updatedAt: nowIso
+            };
+          }
+
+          allOps[cleanKey] = {
+            operationKey: cleanKey,
+            obligadoTributarioId: cleanObligado,
+            invoiceId: params.invoiceId,
+            isRectificativa: true,
+            status: 'RESERVED',
+            reservedNumeroFactura: nextNumberFormatted,
+            createdAt: existingOp?.createdAt || nowIso,
+            updatedAt: nowIso
+          };
+
+          const tmpState = `${SHARED_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
+          fs.writeFileSync(tmpState, JSON.stringify(allStates, null, 2), 'utf-8');
+          fs.renameSync(tmpState, SHARED_STATE_FILE);
+
+          const tmpOps = `${SHARED_OPERATIONS_FILE}.${process.pid}.${Date.now()}.tmp`;
+          fs.writeFileSync(tmpOps, JSON.stringify(allOps, null, 2), 'utf-8');
+          fs.renameSync(tmpOps, SHARED_OPERATIONS_FILE);
+
+          return nextNumberFormatted;
+        } finally {
+          fs.closeSync(fd);
+          try { fs.unlinkSync(lockFile); } catch {}
+        }
+      } catch (e: any) {
+        if (e.code === 'EEXIST') {
+          try {
+            const stats = fs.statSync(lockFile).mtimeMs;
+            if (Date.now() - stats > 5000) {
+              try { fs.unlinkSync(lockFile); } catch {}
+            }
+          } catch {}
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        } else {
+          throw e;
+        }
+      }
+    }
+    throw new Error('Timeout reservando numeración rectificativa por operación en cloud simulator');
+  }
+
+  /**
+   * Registra de forma duradera en la autoridad distribuida la finalización exitosa de una operación
+   * de emisión fiscal (`status = 'COMPLETED'`), vinculando `operationKey` con el `fiscalRecordId`
+   * y `assignedNumeroFactura` definitivos.
+   */
+  public static async markEmissionOperationCompleted(params: {
+    operationKey: string;
+    obligadoId: string;
+    invoiceId: string;
+    isRectificativa: boolean;
+    fiscalRecordId: string;
+    assignedNumeroFactura: string;
+  }): Promise<void> {
+    const cleanKey = (params.operationKey || '').trim();
+    const cleanObligado = (params.obligadoId || '').trim().toUpperCase();
+    if (!cleanKey || !cleanObligado) return;
+
+    const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
+    const mode = getCoordinatorMode();
+    const nowIso = new Date().toISOString();
+
+    if (mode === 'firestore') {
+      const firestore = getFirestoreAdmin();
+      if (!firestore) {
+        throw new Error(
+          'CloudDistributedChainCoordinator: Firestore Admin no disponible para markEmissionOperationCompleted (Fail-Closed).'
+        );
+      }
+      const opRef = firestore.collection('fiscal_emission_operations').doc(docId);
+      await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(opRef);
+        const prev = snap.exists ? (snap.data() as CloudEmissionOperationDoc) : null;
+        const completedDoc: CloudEmissionOperationDoc = {
+          operationKey: cleanKey,
+          obligadoTributarioId: cleanObligado,
+          invoiceId: params.invoiceId,
+          isRectificativa: params.isRectificativa,
+          status: 'COMPLETED',
+          reservedNumeroFactura: prev?.reservedNumeroFactura || params.assignedNumeroFactura,
+          assignedNumeroFactura: params.assignedNumeroFactura,
+          fiscalRecordId: params.fiscalRecordId,
+          createdAt: prev?.createdAt || nowIso,
+          updatedAt: nowIso
+        };
+        tx.set(opRef, completedDoc as any);
+      });
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'CloudDistributedChainCoordinator: Prohibido utilizar modo simulator en entorno de producción Cloud Run (Fail-Closed).'
+      );
+    }
+
+    const dir = path.dirname(SHARED_OPERATIONS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    let allOps: Record<string, CloudEmissionOperationDoc> = {};
+    if (fs.existsSync(SHARED_OPERATIONS_FILE)) {
+      try {
+        allOps = JSON.parse(fs.readFileSync(SHARED_OPERATIONS_FILE, 'utf-8'));
+      } catch {}
+    }
+    const prev = allOps[cleanKey];
+    allOps[cleanKey] = {
+      operationKey: cleanKey,
+      obligadoTributarioId: cleanObligado,
+      invoiceId: params.invoiceId,
+      isRectificativa: params.isRectificativa,
+      status: 'COMPLETED',
+      reservedNumeroFactura: prev?.reservedNumeroFactura || params.assignedNumeroFactura,
+      assignedNumeroFactura: params.assignedNumeroFactura,
+      fiscalRecordId: params.fiscalRecordId,
+      createdAt: prev?.createdAt || nowIso,
+      updatedAt: nowIso
+    };
+    const tmpOps = `${SHARED_OPERATIONS_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpOps, JSON.stringify(allOps, null, 2), 'utf-8');
+    fs.renameSync(tmpOps, SHARED_OPERATIONS_FILE);
+  }
+
+  /**
    * Resetea el simulador de estado en la nube (exclusivo para pruebas).
    */
   public static resetCloudState(): void {
@@ -1397,6 +1819,9 @@ export class CloudDistributedChainCoordinator {
       }
       if (fs.existsSync(SHARED_SEND_LOCKS_FILE)) {
         fs.unlinkSync(SHARED_SEND_LOCKS_FILE);
+      }
+      if (fs.existsSync(SHARED_OPERATIONS_FILE)) {
+        fs.unlinkSync(SHARED_OPERATIONS_FILE);
       }
     } catch {}
   }

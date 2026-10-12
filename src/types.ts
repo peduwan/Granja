@@ -246,6 +246,7 @@ export interface Factura {
 
   // Vinculación unívoca 1:1 con el Registro Fiscal Inmutable
   fiscalRecordId?: string;
+  idempotencyKey?: string;
 
   // --- Campos Legacy / Deprecados (RD 1007/2023 en Factura comercial) ---
   /** @deprecated En Fase 2+, utilizar FiscalRecord.huella.hash */

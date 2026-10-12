@@ -895,9 +895,16 @@ app.post("/api/fiscal/emit-invoice", requireFiscalAuthMiddleware, async (req: Fi
           }
         : invoiceDraft;
 
+    const rawOperationKey =
+      (typeof req.body.operationKey === 'string' && req.body.operationKey.trim()) ||
+      (typeof req.headers['x-idempotency-key'] === 'string' && req.headers['x-idempotency-key'].trim()) ||
+      (typeof invoiceDraft.idempotencyKey === 'string' && invoiceDraft.idempotencyKey.trim()) ||
+      undefined;
+
     const result = await emitFiscalInvoice({
       invoiceDraft: authoritativeInvoiceDraft,
       fiscalConfig: serverFiscalConfig,
+      operationKey: rawOperationKey,
       persistRecordFn: async (record) => {
         await BackendFiscalCustody.saveFiscalRecord(record);
       }

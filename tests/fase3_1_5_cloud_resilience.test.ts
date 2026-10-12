@@ -10,7 +10,8 @@
 
 import assert from 'node:assert';
 import { BackendFiscalCustody } from '../src/fiscal/backendCustodyRepository';
-import { emitFiscalInvoice } from '../src/fiscal/emissionService';
+import { CloudDistributedChainCoordinator } from '../src/fiscal/cloudDistributedChainCoordinator';
+import { emitFiscalInvoice, resetFiscalQueue } from '../src/fiscal/emissionService';
 import { createDefaultFiscalConfiguration } from '../src/fiscal/modelTransformers';
 import { generarHuellaVeriFactu } from '../src/utils/verifactu';
 import { Factura } from '../src/types';
@@ -75,6 +76,10 @@ async function main() {
   console.log('================================================================');
   console.log('  TESTS DE ARQUITECTURA CLOUD: EJECUCIÓN C1, C2 Y C3');
   console.log('================================================================');
+
+  BackendFiscalCustody.resetCustody();
+  CloudDistributedChainCoordinator.resetCloudState();
+  resetFiscalQueue();
 
   const config = createDefaultFiscalConfiguration({
     nif: NIF_EMISOR_PRUEBA,
@@ -166,6 +171,10 @@ async function main() {
       await BackendFiscalCustody.saveFiscalRecord(fakeForkedRecord as any);
     }, /Bifurcación de cadena detectada|Fallo de integridad criptográfica/);
   });
+
+  BackendFiscalCustody.resetCustody();
+  CloudDistributedChainCoordinator.resetCloudState();
+  resetFiscalQueue();
 
   console.log('================================================================');
   console.log('  C1, C2 Y C3 SUPERADOS EXITOSAMENTE!');

@@ -30,6 +30,8 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
 import https from 'node:https';
 import crypto from 'node:crypto';
 import { Factura } from '../src/types';
@@ -1881,7 +1883,7 @@ async function main() {
       // Verificar que el registro fiscal en custodia NO pasó a ACCEPTED
       const custodyRecordAfter = await BackendFiscalCustody.getFiscalRecordByIdAsync(emittedRect.fiscalRecord.id);
       assert.notStrictEqual(
-        custodyRecordAfter?.estadoEnvio,
+        custodyRecordAfter?.estado,
         'ACCEPTED',
         'El estado fiscal del registro custodiado NO debe alterarse a ACCEPTED cuando la respuesta AEAT incumple RespuestaSuministro.xsd'
       );
@@ -2038,14 +2040,13 @@ async function main() {
 
       const fsDraftA = buildRectificativaFacturaFromUiState({
         facturaOriginal: origRes.invoice,
-        numeroFactura: 'R-2026-0001',
         fecha: '2026-10-29',
-        modo: 'parcial',
+        modo: 'rectificacion_parcial',
         tipoRectificativa: 'por_diferencias',
         claveTipoFactura: 'R1',
         codigoMotivo: '01',
         motivoTexto: 'Rectificativa A en modo Firestore OCC',
-        lineasModificadas: [
+        lineasEditadas: [
           {
             id: 'lin-fs-a',
             loteEnvasadoId: 'lot-1',
@@ -2063,14 +2064,13 @@ async function main() {
 
       const fsDraftB = buildRectificativaFacturaFromUiState({
         facturaOriginal: origRes.invoice,
-        numeroFactura: 'R-2026-0001', // Mismo borrador inicial -> el coordinador Firestore resolverá R-2026-0001 y R-2026-0002
         fecha: '2026-10-29',
-        modo: 'parcial',
+        modo: 'rectificacion_parcial',
         tipoRectificativa: 'por_diferencias',
         claveTipoFactura: 'R1',
         codigoMotivo: '01',
         motivoTexto: 'Rectificativa B en modo Firestore OCC',
-        lineasModificadas: [
+        lineasEditadas: [
           {
             id: 'lin-fs-b',
             loteEnvasadoId: 'lot-1',
@@ -2117,14 +2117,73 @@ async function main() {
         'En modo Firestore OCC debe asignar R-2026-0001 y R-2026-0002 sin duplicados ni huecos'
       );
 
-      // 4. Verificar el documento de estado en la colección Firestore `fiscal_chain_state`
+      // 4. Verificar el documento de estado en la colección Firestore `fiscal_chain_state` y operaciones en `fiscal_emission_operations`
       const chainStateDoc = collections.fiscal_chain_state.get(OBLIGADO_NIF);
       assert.ok(chainStateDoc, 'Debe existir el documento de estado en fiscal_chain_state de Firestore');
       assert.strictEqual(chainStateDoc.totalRecords, 3);
       assert.strictEqual(chainStateDoc.sequence, 3);
       assert.strictEqual(chainStateDoc.rectificativaCountersByYear?.['2026'], 2);
       assert.strictEqual(collections.fiscal_records.size, 3, 'Deben existir los 3 FiscalRecord en la colección fiscal_records de Firestore');
+      assert.ok((collections.fiscal_emission_operations?.size ?? 0) >= 3, 'Deben haberse registrado las operaciones de emisión en la colección fiscal_emission_operations de Firestore');
       assert.ok(transactionCount >= 4, `Se deben haber ejecutado transacciones OCC reales en Firestore (ejecutadas: ${transactionCount})`);
+
+      // 4.b Verificar recuperación distribuida post-fallo e idempotencia cross-instancia en modo Firestore
+      const fsCrashDraft = {
+        ...buildRectificativaFacturaFromUiState({
+          facturaOriginal: origRes.invoice,
+          fecha: '2026-10-30',
+          modo: 'anulacion_total',
+          tipoRectificativa: 'por_diferencias',
+          claveTipoFactura: 'R1',
+          codigoMotivo: '01',
+          motivoTexto: 'Rectificativa C con fallo post-reserva en modo Firestore'
+        }),
+        id: 'inv-fs-crash-op-c',
+        idempotencyKey: 'FS-OP-CRASH-C'
+      };
+
+      await assert.rejects(
+        async () => {
+          await emitFiscalInvoice({
+            invoiceDraft: fsCrashDraft,
+            fiscalConfig,
+            operationKey: 'FS-OP-CRASH-C',
+            _simulateIndependentCloudRunInstance: true,
+            persistRecordFn: async () => {
+              throw new Error('FIRESTORE_INSTANCE_1_DIED_AFTER_RESERVE');
+            }
+          });
+        },
+        /FIRESTORE_INSTANCE_1_DIED_AFTER_RESERVE/
+      );
+
+      // En una nueva instancia sin memoria local, el reintento con la misma operationKey recupera R-2026-0003 desde Firestore
+      resetFiscalQueue();
+      BackendFiscalCustody.clearLocalReplicaCacheForInstanceSimulation();
+
+      const fsRecoveredRes = await emitFiscalInvoice({
+        invoiceDraft: fsCrashDraft,
+        fiscalConfig,
+        operationKey: 'FS-OP-CRASH-C',
+        _simulateIndependentCloudRunInstance: true
+      });
+      assert.strictEqual(
+        fsRecoveredRes.fiscalRecord.factura.numeroFactura,
+        'R-2026-0003',
+        'En modo Firestore una segunda instancia debe recuperar R-2026-0003 reservado en fiscal_emission_operations'
+      );
+
+      // Reintento adicional tras pérdida de respuesta en tercera instancia: devuelve el mismo registro sin duplicar
+      resetFiscalQueue();
+      BackendFiscalCustody.clearLocalReplicaCacheForInstanceSimulation();
+      const fsIdempotentRes = await emitFiscalInvoice({
+        invoiceDraft: { ...fsCrashDraft, id: 'inv-fs-crash-op-c-new-draft-id' },
+        fiscalConfig,
+        operationKey: 'FS-OP-CRASH-C',
+        _simulateIndependentCloudRunInstance: true
+      });
+      assert.strictEqual(fsIdempotentRes.fiscalRecord.id, fsRecoveredRes.fiscalRecord.id);
+      assert.strictEqual(collections.fiscal_records.size, 4);
 
       // 5. Ejecutar remisión Outbox completa en modo Firestore y verificar persistencia en fiscal_submissions y fiscal_events
       AeatFlowControlManager.reset();
@@ -2138,7 +2197,7 @@ async function main() {
       });
 
       assert.strictEqual(outboxRes.submission?.estado, 'ACCEPTED');
-      assert.strictEqual(outboxRes.cantidadRegistros, 3);
+      assert.strictEqual(outboxRes.cantidadRegistros, 4);
       assert.ok(collections.fiscal_submissions.size >= 1, 'La sumisión debe haberse persistido en la colección fiscal_submissions de Firestore');
       assert.ok(collections.fiscal_events.size >= 1, 'Los eventos deben haberse persistido en la colección fiscal_events de Firestore');
     } finally {
@@ -2426,7 +2485,265 @@ async function main() {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // 19. AUDITORÍA CORRECTIVA FINAL: EXACTITUD DEL NÚMERO RESERVADO, IDEMPOTENCIA DISTRIBUIDA E INSTALACIÓN LIMPIA
+  // ---------------------------------------------------------------------------
+  await runTest("19: [Auditoría Correctiva Final P1/P2] reserveNextRectificativaNumeroAsync devuelve exactamente el número reservado (sin sustitución por custodyNext), migración de contador con rectificativas previas e idempotencia distribuida entre instancias independientes", async () => {
+    await resetTestEnvironment();
+
+    const orig = await emitFiscalInvoice({
+      invoiceDraft: createOriginalF1Invoice({
+        id: 'inv-audit-final-orig',
+        numeroFactura: 'FAC-2026-1901',
+        fecha: '2026-10-10'
+      }),
+      fiscalConfig
+    });
+
+    // 19.1 (P1): Intercalado determinista de dos reservas (A y B) y la persistencia de B antes de que A retorne:
+    // Antes de la corrección, si B reservaba R-2026-0002 y persistía su FiscalRecord mientras A (que reservó R-2026-0001)
+    // seguía dentro de reserveNextRectificativaNumeroAsync(), la segunda lectura de A calculaba custodyNext = R-2026-0003
+    // (no reservado en el contador distribuido) y sustituía R-2026-0001 por R-2026-0003.
+    const origReserveFn = CloudDistributedChainCoordinator.reserveNextRectificativaNumber.bind(
+      CloudDistributedChainCoordinator
+    );
+    let interceptedFirstCall = false;
+    let interleavedReservationB: string | null = null;
+    let interleavedEmittedRecordB: FiscalRecord | null = null;
+
+    (CloudDistributedChainCoordinator as any).reserveNextRectificativaNumber = async (
+      obligadoId: string,
+      fechaIsoOrAeat?: string
+    ): Promise<string> => {
+      const reserved = await origReserveFn(obligadoId, fechaIsoOrAeat);
+      if (!interceptedFirstCall) {
+        interceptedFirstCall = true;
+        // Mientras la operación A acaba de reservar `reserved` (R-2026-0001),
+        // la operación B reserva atómicamente el siguiente número (R-2026-0002) Y persiste su registro en custodia
+        // antes de que reserveNextRectificativaNumeroAsync() de A termine.
+        interleavedReservationB = await origReserveFn(obligadoId, fechaIsoOrAeat);
+        const draftB = {
+          ...buildRectificativaFacturaFromUiState({
+            facturaOriginal: orig.invoice,
+            numeroFacturaOverride: interleavedReservationB,
+            fecha: '2026-10-25',
+            modo: 'anulacion_total',
+            tipoRectificativa: 'por_diferencias',
+            claveTipoFactura: 'R1',
+            codigoMotivo: '01',
+            motivoTexto: 'Rectificativa intercalada B persistida antes del retorno de A'
+          }),
+          id: 'inv-audit-interleaved-b',
+          numeroFactura: interleavedReservationB,
+          numeracionAutoritativaBackend: false
+        };
+        const resB = await emitFiscalInvoice({
+          invoiceDraft: draftB,
+          fiscalConfig,
+          _simulateIndependentCloudRunInstance: true
+        });
+        interleavedEmittedRecordB = resB.fiscalRecord;
+      }
+      return reserved;
+    };
+
+    try {
+      const returnedToA = await BackendFiscalCustody.reserveNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-25');
+      assert.strictEqual(
+        interleavedReservationB,
+        'R-2026-0002',
+        'La operación B intercalada debe haber reservado R-2026-0002'
+      );
+      assert.strictEqual(
+        (interleavedEmittedRecordB as FiscalRecord | null)?.factura.numeroFactura,
+        'R-2026-0002',
+        'La operación B intercalada ya persistió R-2026-0002 en custodia'
+      );
+      assert.strictEqual(
+        returnedToA,
+        'R-2026-0001',
+        'reserveNextRectificativaNumeroAsync DEBE devolver exactamente R-2026-0001 reservado para A, jamás R-2026-0003 calculado por segunda lectura'
+      );
+      const stateAfterInterleave = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+      assert.strictEqual(
+        stateAfterInterleave?.rectificativaCountersByYear?.['2026'],
+        2,
+        'El contador distribuido en la autoridad sigue en 2 (R-2026-0001 y R-2026-0002 reservados)'
+      );
+    } finally {
+      (CloudDistributedChainCoordinator as any).reserveNextRectificativaNumber = origReserveFn;
+    }
+
+    // 19.2 (P1): Migración / inicialización del contador cuando ya existen rectificativas anteriores
+    // (por ejemplo, existen R-2026-0001..R-2026-0009 en fiscal_records pero rectificativaCountersByYear['2026'] no existe o es 0)
+    const legacyDraft9 = {
+      ...buildRectificativaFacturaFromUiState({
+        facturaOriginal: orig.invoice,
+        numeroFacturaOverride: 'R-2026-0009',
+        fecha: '2026-10-26',
+        modo: 'rectificacion_parcial',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '02',
+        motivoTexto: 'Rectificativa histórica preexistente R-2026-0009',
+        lineasEditadas: [
+          {
+            ...orig.invoice.lineas[0],
+            id: 'lin-legacy-9',
+            cantidadEstuches: -1,
+            precioUnitario: 100,
+            subtotal: -100
+          }
+        ]
+      }),
+      id: 'inv-audit-legacy-0009',
+      numeroFactura: 'R-2026-0009',
+      numeracionAutoritativaBackend: false
+    };
+    await emitFiscalInvoice({
+      invoiceDraft: legacyDraft9,
+      fiscalConfig
+    });
+
+    // Simular estado heredado pre-contador eliminando rectificativaCountersByYear del estado compartido en disco
+    const sharedStateFile = path.resolve(process.cwd(), 'data', 'cloud_shared_chain_state.json');
+    if (fs.existsSync(sharedStateFile)) {
+      const rawStates = JSON.parse(fs.readFileSync(sharedStateFile, 'utf-8'));
+      if (rawStates[OBLIGADO_NIF]) {
+        delete rawStates[OBLIGADO_NIF].rectificativaCountersByYear;
+        fs.writeFileSync(sharedStateFile, JSON.stringify(rawStates, null, 2), 'utf-8');
+      }
+    }
+
+    // Al reservar ahora, la transacción lee tanto el contador (ausente/0) como las rectificativas existentes (R-2026-0009)
+    // y migra/inicializa automáticamente el contador en 10 (R-2026-0010)
+    const migratedReserved = await BackendFiscalCustody.reserveNextRectificativaNumeroAsync(OBLIGADO_NIF, '2026-10-26');
+    assert.strictEqual(
+      migratedReserved,
+      'R-2026-0010',
+      'La reserva atómica debe considerar las rectificativas históricas existentes y asignar R-2026-0010'
+    );
+    const migratedState = await CloudDistributedChainCoordinator.getLatestState(OBLIGADO_NIF);
+    assert.strictEqual(
+      migratedState?.rectificativaCountersByYear?.['2026'],
+      10,
+      'El contador distribuido debe quedar inicializado/migrado en 10'
+    );
+
+    // 19.3 (P2): Idempotencia distribuida entre instancias independientes de Cloud Run:
+    // Escenario A: La instancia 1 reserva número (R-2026-0011) para la operación 'OP-DIST-CRASH-01', pero falla antes de persistir el FiscalRecord.
+    // La memoria de la instancia 1 se pierde por completo (resetFiscalQueue + clearLocalReplicaCacheForInstanceSimulation).
+    // La instancia 2 recibe el reintento con la misma clave de operación: recupera R-2026-0011 de la autoridad distribuida sin consumir R-2026-0012.
+    const crashOpDraft = {
+      ...buildRectificativaFacturaFromUiState({
+        facturaOriginal: orig.invoice,
+        fecha: '2026-10-27',
+        modo: 'rectificacion_parcial',
+        tipoRectificativa: 'por_diferencias',
+        claveTipoFactura: 'R1',
+        codigoMotivo: '02',
+        motivoTexto: 'Operación distribuida con fallo post-reserva en instancia 1',
+        lineasEditadas: [
+          {
+            ...orig.invoice.lineas[0],
+            id: 'lin-dist-crash-1',
+            cantidadEstuches: -2,
+            precioUnitario: 100,
+            subtotal: -200
+          }
+        ]
+      }),
+      id: 'inv-dist-crash-op-01',
+      idempotencyKey: 'OP-DIST-CRASH-01'
+    };
+
+    await assert.rejects(
+      async () => {
+        await emitFiscalInvoice({
+          invoiceDraft: crashOpDraft,
+          fiscalConfig,
+          operationKey: 'OP-DIST-CRASH-01',
+          _simulateIndependentCloudRunInstance: true,
+          persistRecordFn: async () => {
+            throw new Error('CLOUD_RUN_INSTANCE_1_TERMINATED_AFTER_RESERVATION');
+          }
+        });
+      },
+      /CLOUD_RUN_INSTANCE_1_TERMINATED_AFTER_RESERVATION/
+    );
+
+    // Verificar que la reserva quedó persistida de forma duradera en la autoridad distribuida (no solo en un Map local)
+    const persistedOpAfterCrash = await CloudDistributedChainCoordinator.getEmissionOperation(
+      `${OBLIGADO_NIF}:OP-DIST-CRASH-01`
+    );
+    assert.ok(persistedOpAfterCrash, 'Debe existir el registro duradero de la operación en la autoridad distribuida');
+    assert.strictEqual(persistedOpAfterCrash.status, 'RESERVED');
+    assert.strictEqual(persistedOpAfterCrash.reservedNumeroFactura, 'R-2026-0011');
+
+    // Simular pérdida total de estado en memoria y disco local (nueva instancia Cloud Run #2)
+    resetFiscalQueue();
+    BackendFiscalCustody.clearLocalReplicaCacheForInstanceSimulation();
+
+    // Reintentar la operación en la Instancia #2: debe recuperar R-2026-0011 y completar la emisión
+    const recoveredOnInstance2 = await emitFiscalInvoice({
+      invoiceDraft: crashOpDraft,
+      fiscalConfig,
+      operationKey: 'OP-DIST-CRASH-01',
+      _simulateIndependentCloudRunInstance: true
+    });
+    assert.strictEqual(
+      recoveredOnInstance2.fiscalRecord.factura.numeroFactura,
+      'R-2026-0011',
+      'La instancia 2 de Cloud Run debe recuperar la reserva duradera R-2026-0011 sin consumir R-2026-0012'
+    );
+
+    const persistedOpCompleted = await CloudDistributedChainCoordinator.getEmissionOperation(
+      `${OBLIGADO_NIF}:OP-DIST-CRASH-01`
+    );
+    assert.strictEqual(persistedOpCompleted?.status, 'COMPLETED');
+    assert.strictEqual(persistedOpCompleted?.assignedNumeroFactura, 'R-2026-0011');
+    assert.strictEqual(persistedOpCompleted?.fiscalRecordId, recoveredOnInstance2.fiscalRecord.id);
+
+    // Escenario B: Pérdida de respuesta HTTP después de completar la emisión en la Instancia #2.
+    // El cliente reintenta la operación contra una Instancia #3 completamente limpia (incluso si el cliente generó un nuevo id de borrador pero mantuvo operationKey):
+    resetFiscalQueue();
+    BackendFiscalCustody.clearLocalReplicaCacheForInstanceSimulation();
+
+    const recordsBeforeInstance3Retry = (await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(OBLIGADO_NIF)).length;
+    const retryOnInstance3 = await emitFiscalInvoice({
+      invoiceDraft: {
+        ...crashOpDraft,
+        id: 'inv-dist-client-new-draft-id-on-retry'
+      },
+      fiscalConfig,
+      operationKey: 'OP-DIST-CRASH-01',
+      _simulateIndependentCloudRunInstance: true
+    });
+    const recordsAfterInstance3Retry = (await BackendFiscalCustody.getAllFiscalRecordsByObligadoAsync(OBLIGADO_NIF)).length;
+
+    assert.strictEqual(
+      retryOnInstance3.fiscalRecord.id,
+      recoveredOnInstance2.fiscalRecord.id,
+      'La instancia 3 debe devolver exactamente el FiscalRecord ya completado mediante operationKey distribuida'
+    );
+    assert.strictEqual(retryOnInstance3.fiscalRecord.factura.numeroFactura, 'R-2026-0011');
+    assert.strictEqual(
+      recordsAfterInstance3Retry,
+      recordsBeforeInstance3Retry,
+      'El reintento en otra instancia no debe duplicar registros ni incrementar contadores'
+    );
+  });
+
   await resetTestEnvironment();
+
+  // Verificar que tras resetTestEnvironment una instalación limpia no conserva artefactos JSON en data/
+  const residualDataFiles = ['fiscal_records.json', 'cloud_shared_records.json', 'cloud_shared_chain_state.json', 'cloud_shared_emission_operations.json']
+    .filter(f => fs.existsSync(path.resolve(process.cwd(), 'data', f)));
+  assert.strictEqual(
+    residualDataFiles.length,
+    0,
+    `No deben quedar archivos residuales de prueba en data/: ${residualDataFiles.join(', ')}`
+  );
 
   console.log('========================================================================');
   console.log(`  RESULTADO SUITE E2E RECTIFICATIVAS Y ANULACIONES: ${passed}/${total} TESTS OK`);

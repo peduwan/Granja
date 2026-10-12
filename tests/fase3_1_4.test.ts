@@ -585,6 +585,10 @@ async function main() {
     }, /Modo real de transporte AEAT requerido/);
   });
 
+  BackendFiscalCustody.resetCustody();
+  AeatFlowControlManager.reset();
+  resetFiscalQueue();
+
   // -----------------------------------------------------------------------------
   // RESUMEN FINAL
   // -----------------------------------------------------------------------------

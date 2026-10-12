@@ -20,8 +20,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { BackendFiscalCustody } from '../src/fiscal/backendCustodyRepository';
-import { emitFiscalInvoice } from '../src/fiscal/emissionService';
-import { executeAeatSubmission } from '../src/fiscal/aeatTransport';
+import { emitFiscalInvoice, resetFiscalQueue } from '../src/fiscal/emissionService';
+import { executeAeatSubmission, AeatFlowControlManager } from '../src/fiscal/aeatTransport';
 import { createFiscalSubmission } from '../src/fiscal/submissionService';
 import { createDefaultFiscalConfiguration } from '../src/fiscal/modelTransformers';
 import {
@@ -471,6 +471,10 @@ async function main() {
       await verifyFiscalToken(tamperedToken);
     }, /Fallo en la verificación criptográfica de la firma del token/);
   });
+
+  BackendFiscalCustody.resetCustody();
+  AeatFlowControlManager.reset();
+  resetFiscalQueue();
 
   console.log('================================================================');
   console.log('  AUDITORÍA DE SEGURIDAD EXHAUSTIVA: 10/10 PUNTOS SUPERADOS!');
