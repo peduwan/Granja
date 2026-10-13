@@ -1397,14 +1397,27 @@ export class CloudDistributedChainCoordinator {
     return null;
   }
 
+  public static normalizeOperationKey(operationKey: string, obligadoId?: string): string {
+    const raw = (operationKey || '').trim().toUpperCase();
+    if (!raw) return '';
+    if (raw.includes(':')) return raw;
+    if (obligadoId && obligadoId.trim()) {
+      return `${obligadoId.trim().toUpperCase()}:${raw}`;
+    }
+    return raw;
+  }
+
   /**
    * Consulta en la autoridad distribuida (Firestore / Cloud Simulator) el estado duradero de una operación
    * de emisión fiscal identificada por su clave estable (`operationKey`).
    * Permite idempotencia distribuida entre múltiples instancias de Cloud Run.
    */
-  public static async getEmissionOperation(operationKey: string): Promise<CloudEmissionOperationDoc | null> {
+  public static async getEmissionOperation(
+    operationKey: string,
+    obligadoId?: string
+  ): Promise<CloudEmissionOperationDoc | null> {
     if (!operationKey || !operationKey.trim()) return null;
-    const cleanKey = operationKey.trim();
+    const cleanKey = this.normalizeOperationKey(operationKey, obligadoId);
     const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
     const mode = getCoordinatorMode();
 
@@ -1415,10 +1428,30 @@ export class CloudDistributedChainCoordinator {
           'CloudDistributedChainCoordinator: Firestore Admin no disponible para getEmissionOperation (Fail-Closed).'
         );
       }
-      const snap = await firestore.collection('fiscal_emission_operations').doc(docId).get();
+      let snap = await firestore.collection('fiscal_emission_operations').doc(docId).get();
+      if (!snap.exists && !operationKey.includes(':')) {
+        const fallbackDocId = Buffer.from(operationKey.trim().toUpperCase(), 'utf-8').toString('base64url');
+        snap = await firestore.collection('fiscal_emission_operations').doc(fallbackDocId).get();
+      }
       if (snap.exists) {
         return snap.data() as CloudEmissionOperationDoc;
       }
+
+      // Consulta de respaldo por operationKey si no se encontró por docId
+      try {
+        const query = firestore
+          .collection('fiscal_emission_operations')
+          .where('operationKey', '==', cleanKey);
+        const queryWithLimit = typeof (query as any).limit === 'function' ? (query as any).limit(1) : query;
+        const querySnap = await queryWithLimit.get();
+        if (querySnap && !querySnap.empty) {
+          let found: CloudEmissionOperationDoc | null = null;
+          querySnap.forEach((d: any) => {
+            if (!found) found = d.data() as CloudEmissionOperationDoc;
+          });
+          if (found) return found;
+        }
+      } catch {}
       return null;
     }
 
@@ -1456,8 +1489,8 @@ export class CloudDistributedChainCoordinator {
     fechaIsoOrAeat?: string;
     forceNewReservation?: boolean;
   }): Promise<string> {
-    const cleanKey = (params.operationKey || '').trim();
     const cleanObligado = (params.obligadoId || '').trim().toUpperCase();
+    const cleanKey = this.normalizeOperationKey(params.operationKey, cleanObligado);
     if (!cleanKey || !cleanObligado) {
       throw new Error(
         'CloudDistributedChainCoordinator: reserveNextRectificativaNumberForOperation requiere operationKey y obligadoId válidos.'
@@ -1728,8 +1761,8 @@ export class CloudDistributedChainCoordinator {
     fiscalRecordId: string;
     assignedNumeroFactura: string;
   }): Promise<void> {
-    const cleanKey = (params.operationKey || '').trim();
     const cleanObligado = (params.obligadoId || '').trim().toUpperCase();
+    const cleanKey = this.normalizeOperationKey(params.operationKey, cleanObligado);
     if (!cleanKey || !cleanObligado) return;
 
     const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
@@ -1824,5 +1857,30 @@ export class CloudDistributedChainCoordinator {
         fs.unlinkSync(SHARED_OPERATIONS_FILE);
       }
     } catch {}
+  }
+
+  /**
+   * Limpia las colecciones de prueba en el emulador de Firestore (exclusivo para testing con FIRESTORE_EMULATOR_HOST).
+   */
+  public static async resetEmulatorCloudState(): Promise<void> {
+    const firestore = getFirestoreAdmin();
+    if (!firestore) return;
+    const collectionsToClear = [
+      'fiscal_chain_state',
+      'fiscal_records',
+      'fiscal_submissions',
+      'fiscal_events',
+      'aeat_flow_control',
+      'aeat_send_locks',
+      'fiscal_emission_operations'
+    ];
+    for (const colName of collectionsToClear) {
+      try {
+        const snap = await firestore.collection(colName).get();
+        const batch = firestore.batch();
+        snap.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+      } catch {}
+    }
   }
 }

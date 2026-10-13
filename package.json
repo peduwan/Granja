@@ -14,7 +14,8 @@
     "test:fase4_1": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase4_1.test.ts",
     "test:fase4_2": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/fase4_2.test.ts",
     "test:rectificativas": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/rectificativas_e2e.test.ts",
-    "test:p2_aeat": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/p2_aeat_respuesta_y_mtls.test.ts"
+    "test:p2_aeat": "export NODE_ENV=test; export FISCAL_COORDINATOR_MODE=simulator; tsx tests/p2_aeat_respuesta_y_mtls.test.ts",
+    "test:firestore": "tsx tests/firestore_emulator_integration.test.ts"
   },
   "dependencies": {
     "@google-cloud/firestore": "^9.3.0",
@@ -44,7 +45,7 @@
     "sharp": "^0.35.4",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2",
+    "typescript": "^5.7.2",
     "vite-plugin-pwa": "^1.3.0"
   }
 }

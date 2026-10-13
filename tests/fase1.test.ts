@@ -754,6 +754,8 @@ await runTest('FASE 1.3 - Test A: Nueva emisión NUNCA utiliza Invoice.hashAnter
 // -----------------------------------------------------------------------------
 await runTest('FASE 1.3 - Test B: Dos emisiones simultáneas se serializan y encadenan secuencialmente sin colisión', async () => {
   resetFiscalQueue();
+  const { BackendFiscalCustody } = await import('../src/fiscal/backendCustodyRepository');
+  BackendFiscalCustody.resetCustody();
   const config = createDefaultFiscalConfiguration({
     nif: 'B12345678',
     nombreRazon: 'Granja Concurrente S.L.'
