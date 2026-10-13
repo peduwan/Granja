@@ -1400,10 +1400,35 @@ export class CloudDistributedChainCoordinator {
   public static normalizeOperationKey(operationKey: string, obligadoId?: string): string {
     const raw = (operationKey || '').trim().toUpperCase();
     if (!raw) return '';
-    if (raw.includes(':')) return raw;
-    if (obligadoId && obligadoId.trim()) {
-      return `${obligadoId.trim().toUpperCase()}:${raw}`;
+
+    const cleanObligado = (obligadoId || '').trim().toUpperCase();
+
+    if (raw.includes(':')) {
+      const colonIndex = raw.indexOf(':');
+      const prefix = raw.slice(0, colonIndex).trim();
+      const suffix = raw.slice(colonIndex + 1).trim();
+
+      if (!suffix) {
+        throw new Error(
+          `CloudDistributedChainCoordinator: La clave de operación '${raw}' no contiene un identificador de operación válido tras el prefijo.`
+        );
+      }
+
+      if (cleanObligado) {
+        if (prefix !== cleanObligado) {
+          throw new Error(
+            `CloudDistributedChainCoordinator: La clave de operación '${raw}' presenta un prefijo de obligado tributario ('${prefix}') que no coincide con el obligado emisor autenticado ('${cleanObligado}'). Violación de aislamiento multi-inquilino rechazada.`
+          );
+        }
+        return `${cleanObligado}:${suffix}`;
+      }
+      return `${prefix}:${suffix}`;
     }
+
+    if (cleanObligado) {
+      return `${cleanObligado}:${raw}`;
+    }
+
     return raw;
   }
 

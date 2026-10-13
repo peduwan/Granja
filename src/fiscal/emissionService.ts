@@ -288,7 +288,10 @@ async function executeEmitFiscalInvoice(
           let existingRecord: FiscalRecord | null = null;
 
           if (operationKey) {
-            const existingOp = await CloudDistributedChainCoordinator.getEmissionOperation(operationKey);
+            const existingOp = await CloudDistributedChainCoordinator.getEmissionOperation(
+              operationKey,
+              obligadoTributarioId
+            );
             if (existingOp) {
               if (existingOp.status === 'COMPLETED' && existingOp.fiscalRecordId) {
                 existingRecord = await BackendFiscalCustody.getFiscalRecordByIdAsync(existingOp.fiscalRecordId);

@@ -29,76 +29,130 @@ import { emitFiscalInvoice, resetFiscalQueue } from '../src/fiscal/emissionServi
 import { createDefaultFiscalConfiguration } from '../src/fiscal/modelTransformers';
 import { Factura } from '../src/types';
 
-const EMULATOR_PORT = 8089;
-const EMULATOR_HOST = `127.0.0.1:${EMULATOR_PORT}`;
+const EMULATOR_PORT = process.env.FIRESTORE_EMULATOR_PORT
+  ? parseInt(process.env.FIRESTORE_EMULATOR_PORT, 10)
+  : (process.env.FIRESTORE_EMULATOR_HOST && process.env.FIRESTORE_EMULATOR_HOST.includes(':')
+      ? parseInt(process.env.FIRESTORE_EMULATOR_HOST.split(':')[1], 10)
+      : 8089);
+const EMULATOR_HOST = process.env.FIRESTORE_EMULATOR_HOST || `127.0.0.1:${EMULATOR_PORT}`;
 const OBLIGADO_NIF_TEST = 'B12345678';
 const OBLIGADO_NIF_CONCURRENTE = 'B98765432';
 
 let emulatorProcess: ChildProcess | null = null;
+let emulatorWasAlreadyRunning = false;
+
+function findEmulatorJar(): string | null {
+  if (process.env.FIRESTORE_EMULATOR_JAR && fs.existsSync(process.env.FIRESTORE_EMULATOR_JAR)) {
+    return process.env.FIRESTORE_EMULATOR_JAR;
+  }
+  const candidateDirs = [
+    path.join(process.env.HOME || '/root', '.cache', 'firebase', 'emulators'),
+    '/root/.cache/firebase/emulators',
+    path.join(process.cwd(), '.firebase', 'emulators')
+  ];
+  for (const dir of candidateDirs) {
+    if (fs.existsSync(dir)) {
+      try {
+        const files = fs.readdirSync(dir);
+        const jarFile = files.find((f) => f.startsWith('cloud-firestore-emulator-') && f.endsWith('.jar'));
+        if (jarFile) return path.join(dir, jarFile);
+      } catch {}
+    }
+  }
+
+  // Si no está en caché, intentar descargarlo automáticamente con firebase CLI si está disponible
+  try {
+    console.log('Descargando emulador oficial de Firestore mediante Firebase CLI...');
+    const { execSync } = require('node:child_process');
+    execSync('firebase setup:emulators:firestore || npx firebase setup:emulators:firestore', { stdio: 'inherit' });
+    for (const dir of candidateDirs) {
+      if (fs.existsSync(dir)) {
+        const files = fs.readdirSync(dir);
+        const jarFile = files.find((f) => f.startsWith('cloud-firestore-emulator-') && f.endsWith('.jar'));
+        if (jarFile) return path.join(dir, jarFile);
+      }
+    }
+  } catch (err: any) {
+    console.warn('No se pudo descargar automáticamente el emulador de Firestore:', err.message);
+  }
+
+  return null;
+}
+
+function checkEmulatorHttp(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const [host, portStr] = EMULATOR_HOST.split(':');
+    const port = parseInt(portStr || '8089', 10);
+    const req = http.get({ host, port, path: '/' }, (res) => {
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1000, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
 
 function waitForEmulatorReady(timeoutMs = 15000): Promise<void> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const check = () => {
-      const req = http.get(`http://${EMULATOR_HOST}/`, (res) => {
-        if (res.statusCode === 200) {
-          resolve();
-        } else {
-          retry();
-        }
-      });
-      req.on('error', () => retry());
-      req.end();
-    };
-
-    const retry = () => {
-      if (Date.now() - start > timeoutMs) {
-        reject(new Error(`Timeout (${timeoutMs}ms) esperando a que arranque el emulador de Firestore`));
+    const check = async () => {
+      const ok = await checkEmulatorHttp();
+      if (ok) {
+        resolve();
+      } else if (Date.now() - start > timeoutMs) {
+        reject(new Error(`Timeout (${timeoutMs}ms) esperando a que arranque el emulador de Firestore en ${EMULATOR_HOST}`));
       } else {
         setTimeout(check, 300);
       }
     };
-
     check();
   });
 }
 
-function startFirestoreEmulator(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const jarPath = '/root/.cache/firebase/emulators/cloud-firestore-emulator-v1.22.0.jar';
-    if (!fs.existsSync(jarPath)) {
-      return reject(new Error(`No se encontró el jar del emulador en ${jarPath}`));
-    }
+async function startFirestoreEmulator(): Promise<void> {
+  const alreadyUp = await checkEmulatorHttp();
+  if (alreadyUp) {
+    emulatorWasAlreadyRunning = true;
+    console.log(`✓ Emulador detectado ya en ejecución en http://${EMULATOR_HOST}`);
+    return;
+  }
 
-    emulatorProcess = spawn(
-      'java',
-      [
-        '-jar',
-        jarPath,
-        '--host',
-        '127.0.0.1',
-        '--port',
-        String(EMULATOR_PORT),
-        '--rules',
-        path.resolve(process.cwd(), 'firestore.rules')
-      ],
-      {
-        stdio: ['ignore', 'pipe', 'pipe']
-      }
+  const jarPath = findEmulatorJar();
+  if (!jarPath) {
+    throw new Error(
+      `No se encontró el jar del emulador de Firestore. Configure FIRESTORE_EMULATOR_JAR o inicie el emulador externamente en ${EMULATOR_HOST}`
     );
+  }
 
-    emulatorProcess.on('error', (err) => {
-      reject(err);
-    });
+  console.log(`Iniciando emulador desde jar: ${jarPath} en puerto ${EMULATOR_PORT}...`);
+  emulatorProcess = spawn(
+    'java',
+    [
+      '-jar',
+      jarPath,
+      '--host',
+      '127.0.0.1',
+      '--port',
+      String(EMULATOR_PORT),
+      '--rules',
+      path.resolve(process.cwd(), 'firestore.rules')
+    ],
+    {
+      stdio: ['ignore', 'pipe', 'pipe']
+    }
+  );
 
-    waitForEmulatorReady()
-      .then(resolve)
-      .catch(reject);
+  emulatorProcess.on('error', (err) => {
+    console.error('Error lanzando proceso java del emulador:', err);
   });
+
+  await waitForEmulatorReady();
 }
 
 function stopFirestoreEmulator(): void {
-  if (emulatorProcess) {
+  if (emulatorProcess && !emulatorWasAlreadyRunning) {
     try {
       emulatorProcess.kill('SIGTERM');
     } catch {}
@@ -150,7 +204,7 @@ function createDummyInvoice(numFactura: string, idSuffix?: string): Factura {
   };
 }
 
-function createDummyRectificativa(originalFac: Factura, idSuffix?: string): Factura {
+function createDummyRectificativa(originalFac: Factura, idSuffix?: string, emisorNif = OBLIGADO_NIF_TEST): Factura {
   const uid = idSuffix || Math.random().toString(36).slice(2, 7);
   return {
     id: `rect-test-${Date.now()}-${uid}`,
@@ -166,7 +220,7 @@ function createDummyRectificativa(originalFac: Factura, idSuffix?: string): Fact
     esRectificativa: true,
     facturasRectificadas: [
       {
-        idEmisorFactura: OBLIGADO_NIF_TEST,
+        idEmisorFactura: emisorNif,
         numeroFactura: originalFac.numeroFactura,
         fechaExpedicion: originalFac.fecha
       }
@@ -489,6 +543,126 @@ async function main() {
 
       const allRecords = await CloudDistributedChainCoordinator.getRecordsByObligado(OBLIGADO_NIF_TEST);
       assert.strictEqual(allRecords.length, 3);
+    });
+
+    await runTest('3.4: Aislamiento multi-inquilino: Obligado A y B usan idéntica clave relativa sin colisión de documentos ni números', async () => {
+      const sharedRelativeKey = 'OP-SHARED-CROSS-TENANT';
+
+      // Factura base para Obligado B
+      const baseDraftB = createDummyInvoice('FAC-2026-B-BASE', 'b-base');
+      const resBaseB = await emitFiscalInvoice({
+        invoiceDraft: baseDraftB,
+        fiscalConfig: configConcurrente,
+        _simulateIndependentCloudRunInstance: true
+      });
+      assert.ok(resBaseB.invoice.fiscalRecordId);
+
+      const rectDraftA = createDummyRectificativa(baseInvoice, 'draft-iso-a');
+      const rectDraftB = createDummyRectificativa(resBaseB.invoice, 'draft-iso-b', OBLIGADO_NIF_CONCURRENTE);
+
+      // 1. Obligado A reserva con la clave compartida
+      const reservedA = await CloudDistributedChainCoordinator.reserveNextRectificativaNumberForOperation({
+        operationKey: sharedRelativeKey,
+        obligadoId: OBLIGADO_NIF_TEST,
+        invoiceId: rectDraftA.id,
+        fechaIsoOrAeat: rectDraftA.fecha
+      });
+
+      // 2. Obligado B reserva con la misma clave compartida
+      const reservedB = await CloudDistributedChainCoordinator.reserveNextRectificativaNumberForOperation({
+        operationKey: sharedRelativeKey,
+        obligadoId: OBLIGADO_NIF_CONCURRENTE,
+        invoiceId: rectDraftB.id,
+        fechaIsoOrAeat: rectDraftB.fecha
+      });
+
+      // 3. Verificar que ambas reservas son independientes y existen como documentos distintos
+      const opDocA = await CloudDistributedChainCoordinator.getEmissionOperation(sharedRelativeKey, OBLIGADO_NIF_TEST);
+      const opDocB = await CloudDistributedChainCoordinator.getEmissionOperation(sharedRelativeKey, OBLIGADO_NIF_CONCURRENTE);
+
+      assert.ok(opDocA);
+      assert.ok(opDocB);
+      assert.strictEqual(opDocA.operationKey, `${OBLIGADO_NIF_TEST}:${sharedRelativeKey}`);
+      assert.strictEqual(opDocB.operationKey, `${OBLIGADO_NIF_CONCURRENTE}:${sharedRelativeKey}`);
+      assert.strictEqual(opDocA.obligadoTributarioId, OBLIGADO_NIF_TEST);
+      assert.strictEqual(opDocB.obligadoTributarioId, OBLIGADO_NIF_CONCURRENTE);
+      assert.strictEqual(opDocA.reservedNumeroFactura, reservedA);
+      assert.strictEqual(opDocB.reservedNumeroFactura, reservedB);
+
+      // 4. Completar emisiones de ambos obligados
+      const resEmittedA = await emitFiscalInvoice({
+        invoiceDraft: rectDraftA,
+        operationKey: sharedRelativeKey,
+        fiscalConfig: config,
+        _simulateIndependentCloudRunInstance: true
+      });
+
+      const resEmittedB = await emitFiscalInvoice({
+        invoiceDraft: rectDraftB,
+        operationKey: sharedRelativeKey,
+        fiscalConfig: configConcurrente,
+        _simulateIndependentCloudRunInstance: true
+      });
+
+      assert.strictEqual(resEmittedA.fiscalRecord.factura.numeroFactura, reservedA);
+      assert.strictEqual(resEmittedB.fiscalRecord.factura.numeroFactura, reservedB);
+      assert.notStrictEqual(resEmittedA.fiscalRecord.id, resEmittedB.fiscalRecord.id);
+
+      // Comprobar que en Firestore las operaciones se completaron de forma aislada
+      const completedDocA = await CloudDistributedChainCoordinator.getEmissionOperation(sharedRelativeKey, OBLIGADO_NIF_TEST);
+      const completedDocB = await CloudDistributedChainCoordinator.getEmissionOperation(sharedRelativeKey, OBLIGADO_NIF_CONCURRENTE);
+      assert.strictEqual(completedDocA?.status, 'COMPLETED');
+      assert.strictEqual(completedDocB?.status, 'COMPLETED');
+      assert.strictEqual(completedDocA?.fiscalRecordId, resEmittedA.fiscalRecord.id);
+      assert.strictEqual(completedDocB?.fiscalRecordId, resEmittedB.fiscalRecord.id);
+    });
+
+    await runTest('3.5: Prevención de spoofing: Obligado A intenta usar clave con prefijo de Obligado B -> RECHAZADO tajantemente', async () => {
+      const spoofedKey = `${OBLIGADO_NIF_CONCURRENTE}:OP-ATTACK-001`;
+      const rectDraftA = createDummyRectificativa(baseInvoice, 'draft-spoof');
+
+      // Intentar reservar con prefijo discrepante
+      await assert.rejects(
+        async () => {
+          await CloudDistributedChainCoordinator.reserveNextRectificativaNumberForOperation({
+            operationKey: spoofedKey,
+            obligadoId: OBLIGADO_NIF_TEST,
+            invoiceId: rectDraftA.id,
+            fechaIsoOrAeat: rectDraftA.fecha
+          });
+        },
+        (err: any) => {
+          return (
+            err.message.includes('Violación de aislamiento multi-inquilino') ||
+            err.message.includes('no coincide con el obligado emisor autenticado')
+          );
+        }
+      );
+
+      // Intentar emitir pasando la clave spoofed
+      await assert.rejects(
+        async () => {
+          await emitFiscalInvoice({
+            invoiceDraft: rectDraftA,
+            operationKey: spoofedKey,
+            fiscalConfig: config,
+            _simulateIndependentCloudRunInstance: true
+          });
+        },
+        (err: any) => {
+          return (
+            err.message.includes('Violación de aislamiento multi-inquilino') ||
+            err.message.includes('no coincide con el obligado emisor autenticado')
+          );
+        }
+      );
+
+      // Comprobar que NUNCA se creó el documento para el obligado usurpado
+      const shouldNotExist = await CloudDistributedChainCoordinator.getEmissionOperation(
+        spoofedKey,
+        OBLIGADO_NIF_CONCURRENTE
+      );
+      assert.strictEqual(shouldNotExist, null);
     });
 
     // -------------------------------------------------------------------------
