@@ -2674,7 +2674,8 @@ async function main() {
 
     // Verificar que la reserva quedó persistida de forma duradera en la autoridad distribuida (no solo en un Map local)
     const persistedOpAfterCrash = await CloudDistributedChainCoordinator.getEmissionOperation(
-      `${OBLIGADO_NIF}:OP-DIST-CRASH-01`
+      'OP-DIST-CRASH-01',
+      OBLIGADO_NIF
     );
     assert.ok(persistedOpAfterCrash, 'Debe existir el registro duradero de la operación en la autoridad distribuida');
     assert.strictEqual(persistedOpAfterCrash.status, 'RESERVED');
@@ -2698,7 +2699,8 @@ async function main() {
     );
 
     const persistedOpCompleted = await CloudDistributedChainCoordinator.getEmissionOperation(
-      `${OBLIGADO_NIF}:OP-DIST-CRASH-01`
+      'OP-DIST-CRASH-01',
+      OBLIGADO_NIF
     );
     assert.strictEqual(persistedOpCompleted?.status, 'COMPLETED');
     assert.strictEqual(persistedOpCompleted?.assignedNumeroFactura, 'R-2026-0011');

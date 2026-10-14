@@ -844,6 +844,7 @@ export class CloudDistributedChainCoordinator {
    * En modo firestore, NUNCA cae a disco local si Firestore devuelve error.
    */
   public static async getRecordById(recordId: string): Promise<FiscalRecord | null> {
+    if (!recordId || !recordId.trim()) return null;
     const mode = getCoordinatorMode();
 
     if (mode === 'firestore') {
@@ -853,7 +854,7 @@ export class CloudDistributedChainCoordinator {
           'CloudDistributedChainCoordinator: Firestore Admin no disponible en modo firestore para getRecordById (Fail-Closed).'
         );
       }
-      const snap = await firestore.collection('fiscal_records').doc(recordId).get();
+      const snap = await firestore.collection('fiscal_records').doc(recordId.trim()).get();
       if (snap.exists) {
         return snap.data() as FiscalRecord;
       }
@@ -1397,11 +1398,16 @@ export class CloudDistributedChainCoordinator {
     return null;
   }
 
-  public static normalizeOperationKey(operationKey: string, obligadoId?: string): string {
+  public static normalizeOperationKey(operationKey: string, obligadoId: string): string {
     const raw = (operationKey || '').trim().toUpperCase();
     if (!raw) return '';
 
     const cleanObligado = (obligadoId || '').trim().toUpperCase();
+    if (!cleanObligado) {
+      throw new Error(
+        'CloudDistributedChainCoordinator: normalizeOperationKey exige un obligadoId válido para garantizar el aislamiento multi-inquilino.'
+      );
+    }
 
     if (raw.includes(':')) {
       const colonIndex = raw.indexOf(':');
@@ -1414,35 +1420,34 @@ export class CloudDistributedChainCoordinator {
         );
       }
 
-      if (cleanObligado) {
-        if (prefix !== cleanObligado) {
-          throw new Error(
-            `CloudDistributedChainCoordinator: La clave de operación '${raw}' presenta un prefijo de obligado tributario ('${prefix}') que no coincide con el obligado emisor autenticado ('${cleanObligado}'). Violación de aislamiento multi-inquilino rechazada.`
-          );
-        }
-        return `${cleanObligado}:${suffix}`;
+      if (prefix !== cleanObligado) {
+        throw new Error(
+          `CloudDistributedChainCoordinator: La clave de operación '${raw}' presenta un prefijo de obligado tributario ('${prefix}') que no coincide con el obligado emisor autenticado ('${cleanObligado}'). Violación de aislamiento multi-inquilino rechazada.`
+        );
       }
-      return `${prefix}:${suffix}`;
+      return `${cleanObligado}:${suffix}`;
     }
 
-    if (cleanObligado) {
-      return `${cleanObligado}:${raw}`;
-    }
-
-    return raw;
+    return `${cleanObligado}:${raw}`;
   }
 
   /**
    * Consulta en la autoridad distribuida (Firestore / Cloud Simulator) el estado duradero de una operación
    * de emisión fiscal identificada por su clave estable (`operationKey`).
-   * Permite idempotencia distribuida entre múltiples instancias de Cloud Run.
+   * Exige obligadoId obligatorio para garantizar el aislamiento fiscal y gobierno de acceso.
    */
   public static async getEmissionOperation(
     operationKey: string,
-    obligadoId?: string
+    obligadoId: string
   ): Promise<CloudEmissionOperationDoc | null> {
     if (!operationKey || !operationKey.trim()) return null;
-    const cleanKey = this.normalizeOperationKey(operationKey, obligadoId);
+    const cleanObligado = (obligadoId || '').trim().toUpperCase();
+    if (!cleanObligado) {
+      throw new Error(
+        'CloudDistributedChainCoordinator: getEmissionOperation exige un obligadoId válido para garantizar el aislamiento multi-inquilino.'
+      );
+    }
+    const cleanKey = this.normalizeOperationKey(operationKey, cleanObligado);
     const docId = Buffer.from(cleanKey, 'utf-8').toString('base64url');
     const mode = getCoordinatorMode();
 
@@ -1454,12 +1459,14 @@ export class CloudDistributedChainCoordinator {
         );
       }
       let snap = await firestore.collection('fiscal_emission_operations').doc(docId).get();
-      if (!snap.exists && !operationKey.includes(':')) {
-        const fallbackDocId = Buffer.from(operationKey.trim().toUpperCase(), 'utf-8').toString('base64url');
-        snap = await firestore.collection('fiscal_emission_operations').doc(fallbackDocId).get();
-      }
       if (snap.exists) {
-        return snap.data() as CloudEmissionOperationDoc;
+        const data = snap.data() as CloudEmissionOperationDoc;
+        if (data && data.obligadoTributarioId && data.obligadoTributarioId !== cleanObligado) {
+          throw new Error(
+            `CloudDistributedChainCoordinator: Discrepancia crítica en getEmissionOperation. El documento pertenece a '${data.obligadoTributarioId}' pero fue consultado para '${cleanObligado}'.`
+          );
+        }
+        return data;
       }
 
       // Consulta de respaldo por operationKey si no se encontró por docId
@@ -1472,7 +1479,12 @@ export class CloudDistributedChainCoordinator {
         if (querySnap && !querySnap.empty) {
           let found: CloudEmissionOperationDoc | null = null;
           querySnap.forEach((d: any) => {
-            if (!found) found = d.data() as CloudEmissionOperationDoc;
+            if (!found) {
+              const item = d.data() as CloudEmissionOperationDoc;
+              if (item.obligadoTributarioId === cleanObligado) {
+                found = item;
+              }
+            }
           });
           if (found) return found;
         }
@@ -1491,7 +1503,13 @@ export class CloudDistributedChainCoordinator {
         const allOps: Record<string, CloudEmissionOperationDoc> = JSON.parse(
           fs.readFileSync(SHARED_OPERATIONS_FILE, 'utf-8')
         );
-        return allOps[cleanKey] || null;
+        const item = allOps[cleanKey] || null;
+        if (item && item.obligadoTributarioId && item.obligadoTributarioId !== cleanObligado) {
+          throw new Error(
+            `CloudDistributedChainCoordinator: Discrepancia en simulator getEmissionOperation para obligado '${cleanObligado}'.`
+          );
+        }
+        return item;
       } catch {}
     }
     return null;

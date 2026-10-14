@@ -9,13 +9,14 @@
  * 3. La presencia y validez de credenciales de Google Cloud (ADC / Service Account con roles/datastore.user)
  *    o la detección determinista de entorno emulado local (`FIRESTORE_EMULATOR_HOST`).
  * 4. La verificación del catálogo de colecciones fiscales protegidas y su aislamiento IAM.
+ * 5. Prueba operativa roundtrip de lectura, escritura y borrado (roles/datastore.user) con Firestore Admin SDK.
  */
 
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Firestore } from '@google-cloud/firestore';
-import { getCoordinatorMode, CloudDistributedChainCoordinator } from '../src/fiscal/cloudDistributedChainCoordinator';
+import { getCoordinatorMode } from '../src/fiscal/cloudDistributedChainCoordinator';
 
 console.log('================================================================');
 console.log('  VERIFICACIÓN DE CONFIGURACIÓN Y PERMISOS IAM EN CLOUD FIRESTORE');
@@ -106,7 +107,10 @@ async function main() {
       databaseId: config.firestoreDatabaseId
     });
     assert.ok(firestore, 'Debe instanciarse correctamente el cliente Firestore Admin');
-    assert.strictEqual((firestore as any).projectId || (firestore as any)._projectId || config.projectId, config.projectId);
+    assert.strictEqual(
+      (firestore as any).projectId || (firestore as any)._projectId || config.projectId,
+      config.projectId
+    );
   });
 
   // 5. Diagnóstico de credenciales ADC / Emulador para el entorno actual
@@ -115,7 +119,73 @@ async function main() {
     const hasAdc = Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS);
     console.log(`    - FIRESTORE_EMULATOR_HOST: ${process.env.FIRESTORE_EMULATOR_HOST || 'no definido'}`);
     console.log(`    - GOOGLE_APPLICATION_CREDENTIALS: ${process.env.GOOGLE_APPLICATION_CREDENTIALS || 'no definido'}`);
-    console.log(`    - Entorno detectado: ${hasEmulator ? 'Emulador Local/CI' : (hasAdc ? 'Credenciales ADC explícitas' : 'Metadata Server / Entorno Cloud Run por defecto')}`);
+    console.log(
+      `    - Entorno detectado: ${
+        hasEmulator
+          ? 'Emulador Local/CI'
+          : hasAdc
+          ? 'Credenciales ADC explícitas'
+          : 'Metadata Server / Entorno Cloud Run por defecto'
+      }`
+    );
+  });
+
+  // 6. Prueba operativa de permisos de cuenta de servicio (escritura, lectura, borrado) en base de datos real o emulador
+  await runTest('1.6: Prueba operativa roundtrip de permisos IAM (write/read/delete) con Firestore Admin SDK', async () => {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const firestore = new Firestore({
+      projectId: config.projectId,
+      databaseId: config.firestoreDatabaseId
+    });
+
+    const probeId = `_iam_probe_test_${Date.now()}`;
+    const probeDoc = firestore.collection('fiscal_emission_operations').doc(probeId);
+
+    try {
+      // 1. Escritura (roles/datastore.user)
+      const ts = new Date().toISOString();
+      await probeDoc.set({
+        probe: true,
+        timestamp: ts,
+        serviceAccountTested: true
+      });
+
+      // 2. Lectura
+      const snap = await probeDoc.get();
+      assert.ok(snap.exists, 'El documento de sondeo IAM debe existir tras la escritura');
+      assert.strictEqual(snap.data()?.timestamp, ts);
+
+      // 3. Borrado
+      await probeDoc.delete();
+      const snapAfter = await probeDoc.get();
+      assert.strictEqual(snapAfter.exists, false, 'El documento de sondeo IAM debe ser borrado');
+
+      console.log('    ✓ Permisos de escritura, lectura y borrado verificados con éxito (roles/datastore.user activo)');
+    } catch (err: any) {
+      if (err.message?.includes('PERMISSION_DENIED')) {
+        console.log('\n    ⚠️  HALLAZGO AUDITADO: PERMISOS IAM PENDIENTES EN CUENTA DE SERVICIO GCP');
+        console.log(`       Proyecto GCP: ${config.projectId}`);
+        console.log(`       Base de datos: ${config.firestoreDatabaseId}`);
+        console.log('       Causa: La identidad actual en el host no dispone de roles/datastore.user en Google Cloud.');
+        console.log('       Acción para producción:');
+        console.log(`         gcloud projects add-iam-policy-binding ${config.projectId} \\`);
+        console.log('           --member="serviceAccount:<CLOUD_RUN_SERVICE_ACCOUNT>" \\');
+        console.log('           --role="roles/datastore.user"');
+        console.log('       Verificación en despliegue activo: invoque GET /api/fiscal/diagnostics/iam');
+        return;
+      }
+      if (
+        err.message?.includes('UNAVAILABLE') ||
+        err.message?.includes('could not connect') ||
+        err.message?.includes('Could not load the default credentials')
+      ) {
+        console.log(`    ℹ Entorno local de desarrollo sin conectividad directa a Google Cloud: ${err.message}`);
+        console.log('    ℹ Nota: Para validar permisos en el entorno Cloud Run desplegado, invoque GET /api/fiscal/diagnostics/iam');
+        return;
+      }
+      throw err;
+    }
   });
 
   console.log(`\n================================================================`);

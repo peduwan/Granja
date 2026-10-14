@@ -111,7 +111,7 @@ function waitForEmulatorReady(timeoutMs = 15000): Promise<void> {
   });
 }
 
-async function startFirestoreEmulator(): Promise<void> {
+export async function startFirestoreEmulator(): Promise<void> {
   const alreadyUp = await checkEmulatorHttp();
   if (alreadyUp) {
     emulatorWasAlreadyRunning = true;
@@ -151,7 +151,7 @@ async function startFirestoreEmulator(): Promise<void> {
   await waitForEmulatorReady();
 }
 
-function stopFirestoreEmulator(): void {
+export function stopFirestoreEmulator(): void {
   if (emulatorProcess && !emulatorWasAlreadyRunning) {
     try {
       emulatorProcess.kill('SIGTERM');
@@ -705,12 +705,18 @@ async function main() {
   }
 }
 
-main()
-  .then(() => {
-    process.exit(0);
-  })
-  .catch(err => {
-    console.error('\nERROR EN SUITE DE INTEGRACIÓN CON FIRESTORE:', err);
-    stopFirestoreEmulator();
-    process.exit(1);
-  });
+if (
+  process.argv[1] &&
+  (process.argv[1].endsWith('firestore_emulator_integration.test.ts') ||
+    process.argv[1].endsWith('firestore_emulator_integration.test'))
+) {
+  main()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('\nERROR EN SUITE DE INTEGRACIÓN CON FIRESTORE:', err);
+      stopFirestoreEmulator();
+      process.exit(1);
+    });
+}

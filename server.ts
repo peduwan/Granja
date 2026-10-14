@@ -1,7 +1,9 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import crypto from "crypto";
 import QRCode from "qrcode";
+import { Firestore } from "@google-cloud/firestore";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -1174,6 +1176,66 @@ app.get("/api/fiscal/rectificativas/next-number", requireFiscalAuthMiddleware, a
     });
   } catch (err: any) {
     return res.status(err?.statusCode || 500).json({ error: err.message });
+  }
+});
+
+// Endpoint de diagnóstico de permisos IAM y conectividad con Cloud Firestore (roles/datastore.user)
+// Permite verificar de forma inmediata y fehaciente los permisos de la cuenta de servicio en el despliegue
+app.get("/api/fiscal/diagnostics/iam", async (_req, res) => {
+  try {
+    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (!fs.existsSync(configPath)) {
+      return res.status(500).json({
+        success: false,
+        error: "firebase-applet-config.json no existe en el contenedor"
+      });
+    }
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const firestore = new Firestore({
+      projectId: config.projectId,
+      databaseId: config.firestoreDatabaseId
+    });
+
+    const probeId = `_probe_iam_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const probeDoc = firestore.collection('fiscal_emission_operations').doc(probeId);
+
+    // 1. Probar escritura (permiso datastore.entities.create)
+    const writeTimestamp = new Date().toISOString();
+    await probeDoc.set({
+      probe: true,
+      timestamp: writeTimestamp,
+      serviceAccountCheck: true,
+      executedBy: 'Cloud Run Backend Service Account'
+    });
+
+    // 2. Probar lectura (permiso datastore.entities.get)
+    const snap = await probeDoc.get();
+    const data = snap.data();
+
+    // 3. Probar borrado (permiso datastore.entities.delete)
+    await probeDoc.delete();
+
+    return res.status(200).json({
+      success: true,
+      status: "IAM_PERMISSIONS_VERIFIED",
+      projectId: config.projectId,
+      databaseId: config.firestoreDatabaseId,
+      permissions: {
+        write: true,
+        read: snap.exists && data?.timestamp === writeTimestamp,
+        delete: true
+      },
+      environment: process.env.NODE_ENV || 'development',
+      message: "Verificación de lectura/escritura exitosa. La cuenta de servicio de Cloud Run dispone de roles/datastore.user plenamente operativo."
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      status: "IAM_PERMISSION_ERROR",
+      error: err.message,
+      requiredRole: "roles/datastore.user",
+      message: "Fallo de permisos o conectividad con Cloud Firestore. Verifique la vinculación de roles/datastore.user a la cuenta de servicio de Cloud Run."
+    });
   }
 });
 
