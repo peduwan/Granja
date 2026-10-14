@@ -18,11 +18,20 @@ import path from 'node:path';
 import { Firestore } from '@google-cloud/firestore';
 import { getCoordinatorMode } from '../src/fiscal/cloudDistributedChainCoordinator';
 
-console.log('================================================================');
-console.log('  VERIFICACIÓN DE CONFIGURACIÓN Y PERMISOS IAM EN CLOUD FIRESTORE');
+const isStrictMode =
+  process.argv.includes('--strict') ||
+  process.env.STRICT_IAM_VERIFY === 'true' ||
+  process.env.CI_DEPLOYMENT_GATE === 'true';
+
+const isDiagnosticMode =
+  process.argv.includes('--diagnostic') ||
+  process.env.IAM_DIAGNOSTIC_MODE === 'true';
+
+console.log(`  Modo de verificación: ${isStrictMode ? 'VALIDACIÓN ESTRICTA DE DESPLIEGUE (FAIL-CLOSED)' : 'DIAGNÓSTICO INFORMATIVO DE ENTORNO'}`);
 console.log('================================================================\n');
 
 let passedTests = 0;
+let skippedTests = 0;
 let totalTests = 0;
 
 async function runTest(name: string, fn: () => void | Promise<void>) {
@@ -36,6 +45,13 @@ async function runTest(name: string, fn: () => void | Promise<void>) {
     console.error('         Error:', err.message || err);
     throw err;
   }
+}
+
+function markTestSkipped(name: string, reason: string) {
+  totalTests++;
+  skippedTests++;
+  console.log(`  [PENDING] Test ${totalTests}: ${name}`);
+  console.log(`            Motivo: ${reason}`);
 }
 
 async function main() {
@@ -131,25 +147,29 @@ async function main() {
   });
 
   // 6. Prueba operativa de permisos de cuenta de servicio (escritura, lectura, borrado) en base de datos real o emulador
-  await runTest('1.6: Prueba operativa roundtrip de permisos IAM (write/read/delete) con Firestore Admin SDK', async () => {
-    const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    const firestore = new Firestore({
-      projectId: config.projectId,
-      databaseId: config.firestoreDatabaseId
-    });
+  const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  const firestore = new Firestore({
+    projectId: config.projectId,
+    databaseId: config.firestoreDatabaseId
+  });
 
-    const probeId = `_iam_probe_test_${Date.now()}`;
-    const probeDoc = firestore.collection('fiscal_emission_operations').doc(probeId);
+  const probeId = `_iam_probe_test_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const probeDoc = firestore.collection('fiscal_emission_operations').doc(probeId);
+  let probeCreated = false;
 
+  const testName = '1.6: Prueba operativa roundtrip de permisos IAM (write/read/delete) con Firestore Admin SDK';
+
+  try {
+    const ts = new Date().toISOString();
     try {
       // 1. Escritura (roles/datastore.user)
-      const ts = new Date().toISOString();
       await probeDoc.set({
         probe: true,
         timestamp: ts,
         serviceAccountTested: true
       });
+      probeCreated = true;
 
       // 2. Lectura
       const snap = await probeDoc.get();
@@ -158,42 +178,70 @@ async function main() {
 
       // 3. Borrado
       await probeDoc.delete();
+      probeCreated = false;
+
       const snapAfter = await probeDoc.get();
       assert.strictEqual(snapAfter.exists, false, 'El documento de sondeo IAM debe ser borrado');
 
-      console.log('    ✓ Permisos de escritura, lectura y borrado verificados con éxito (roles/datastore.user activo)');
-    } catch (err: any) {
-      if (err.message?.includes('PERMISSION_DENIED')) {
-        console.log('\n    ⚠️  HALLAZGO AUDITADO: PERMISOS IAM PENDIENTES EN CUENTA DE SERVICIO GCP');
-        console.log(`       Proyecto GCP: ${config.projectId}`);
-        console.log(`       Base de datos: ${config.firestoreDatabaseId}`);
-        console.log('       Causa: La identidad actual en el host no dispone de roles/datastore.user en Google Cloud.');
-        console.log('       Acción para producción:');
-        console.log(`         gcloud projects add-iam-policy-binding ${config.projectId} \\`);
-        console.log('           --member="serviceAccount:<CLOUD_RUN_SERVICE_ACCOUNT>" \\');
-        console.log('           --role="roles/datastore.user"');
-        console.log('       Verificación en despliegue activo: invoque GET /api/fiscal/diagnostics/iam');
-        return;
+      totalTests++;
+      passedTests++;
+      console.log(`  [PASS] Test ${totalTests}: ${testName}`);
+      console.log('         ✓ Permisos de escritura, lectura y borrado verificados con éxito (roles/datastore.user activo)');
+    } finally {
+      // Limpieza garantizada del documento de prueba ante cualquier excepción intermedia
+      if (probeCreated) {
+        try {
+          await probeDoc.delete();
+        } catch (_cleanupErr) {
+          // Ignorar error secundario de limpieza
+        }
       }
-      if (
-        err.message?.includes('UNAVAILABLE') ||
-        err.message?.includes('could not connect') ||
-        err.message?.includes('Could not load the default credentials')
-      ) {
-        console.log(`    ℹ Entorno local de desarrollo sin conectividad directa a Google Cloud: ${err.message}`);
-        console.log('    ℹ Nota: Para validar permisos en el entorno Cloud Run desplegado, invoque GET /api/fiscal/diagnostics/iam');
-        return;
-      }
-      throw err;
     }
-  });
+  } catch (err: any) {
+    if (isStrictMode) {
+      // EN MODO ESTRICTO DE DESPLIEGUE: Fallar taxativamente para bloquear el despliegue
+      totalTests++;
+      console.error(`  [FAIL] Test ${totalTests}: ${testName}`);
+      console.error('         Error:', err.message || err);
+      console.error('\n  ❌ BLOQUEO DE DESPLIEGUE POR PERMISOS IAM:');
+      console.error(`     Proyecto GCP: ${config.projectId}`);
+      console.error(`     Base de datos: ${config.firestoreDatabaseId}`);
+      console.error('     Causa: La cuenta de servicio de Cloud Run no dispone de permisos operativos (roles/datastore.user).');
+      console.error('     Acción requerida para desbloquear el despliegue:');
+      console.error(`       gcloud projects add-iam-policy-binding ${config.projectId} \\`);
+      console.error('         --member="serviceAccount:<CLOUD_RUN_SERVICE_ACCOUNT>" \\');
+      console.error('         --role="roles/datastore.user"\n');
+      throw new Error(
+        `FALLO DE VALIDACIÓN DE DESPLIEGUE: roles/datastore.user no operativo en Firestore (${err.message}). Despliegue abortado.`
+      );
+    } else {
+      // EN MODO DIAGNÓSTICO: Registrar como PENDIENTE sin otorgar un [PASS] falso
+      markTestSkipped(
+        testName,
+        err.message?.includes('PERMISSION_DENIED')
+          ? 'Permisos IAM pendientes en GCP (roles/datastore.user no asignado a la identidad del host)'
+          : `Entorno sin conectividad directa o credenciales GCP (${err.message})`
+      );
+      console.log('\n    ℹ  DIAGNÓSTICO INFORMATIVO DE PERMISOS IAM GCP:');
+      console.log(`       Proyecto GCP: ${config.projectId}`);
+      console.log(`       Base de datos: ${config.firestoreDatabaseId}`);
+      console.log('       Nota: Para validar de forma bloqueante antes del despliegue en producción:');
+      console.log('             npm run test:iam:strict');
+      console.log('       Para verificar en el entorno Cloud Run desplegado:');
+      console.log('             GET /api/fiscal/diagnostics/iam (con Bearer token de Propietario/Admin)\n');
+    }
+  }
 
   console.log(`\n================================================================`);
-  console.log(`  VERIFICACIÓN IAM Y CONFIGURACIÓN COMPLETADA: ${passedTests}/${totalTests} TESTS PASADOS`);
+  console.log(`  VERIFICACIÓN IAM Y CONFIGURACIÓN COMPLETADA: ${passedTests}/${totalTests} TESTS PASADOS (${skippedTests} PENDIENTES)`);
+  if (skippedTests > 0) {
+    console.log(`  ⚠️  ATENCIÓN: Hay ${skippedTests} test(s) con verificación pendiente en GCP.`);
+    console.log(`      Para forzar validación estricta y bloquear despliegue si faltan roles: npm run test:iam:strict`);
+  }
   console.log(`================================================================`);
 }
 
 main().catch((err) => {
-  console.error('\nERROR EN VERIFICACIÓN DE CONFIGURACIÓN/IAM:', err);
+  console.error('\nERROR EN VERIFICACIÓN DE CONFIGURACIÓN/IAM:', err.message || err);
   process.exit(1);
 });

@@ -1179,9 +1179,54 @@ app.get("/api/fiscal/rectificativas/next-number", requireFiscalAuthMiddleware, a
   }
 });
 
+// Control de concurrencia y limitación de frecuencia para el endpoint de diagnóstico IAM
+let isIamDiagnosticActive = false;
+let lastIamDiagnosticTimestamp = 0;
+const IAM_DIAGNOSTIC_COOLDOWN_MS = 5000;
+
 // Endpoint de diagnóstico de permisos IAM y conectividad con Cloud Firestore (roles/datastore.user)
-// Permite verificar de forma inmediata y fehaciente los permisos de la cuenta de servicio en el despliegue
-app.get("/api/fiscal/diagnostics/iam", async (_req, res) => {
+// Protegido con autenticación criptográfica estricta y restringido a operadores administradores/propietarios
+app.get("/api/fiscal/diagnostics/iam", requireFiscalAuthMiddleware, async (req: FiscalAuthenticatedRequest, res) => {
+  // 1. Autorización: solo usuarios propietarios o administradores fiscales pueden invocar diagnósticos de infraestructura
+  if (!req.fiscalUser?.isOwner) {
+    return res.status(403).json({
+      success: false,
+      status: "IAM_DIAGNOSTIC_FORBIDDEN",
+      error: "Acceso denegado: El diagnóstico de permisos IAM y sondeo de infraestructura en Cloud Firestore está reservado exclusivamente a operadores con rol de Propietario o Administrador Fiscal."
+    });
+  }
+
+  // 2. Control de concurrencia: evitar ejecuciones simultáneas de sondeo
+  if (isIamDiagnosticActive) {
+    return res.status(429).json({
+      success: false,
+      status: "IAM_DIAGNOSTIC_CONCURRENT",
+      error: "Diagnóstico IAM actualmente en ejecución. Por favor espere a que finalice la prueba en curso."
+    });
+  }
+
+  // 3. Limitación de frecuencia (Rate Limiting)
+  const now = Date.now();
+  const elapsed = now - lastIamDiagnosticTimestamp;
+  if (elapsed < IAM_DIAGNOSTIC_COOLDOWN_MS) {
+    const waitSeconds = Math.ceil((IAM_DIAGNOSTIC_COOLDOWN_MS - elapsed) / 1000);
+    return res.status(429).json({
+      success: false,
+      status: "IAM_DIAGNOSTIC_RATE_LIMITED",
+      error: `Límite de frecuencia excedido: el diagnóstico IAM solo puede ejecutarse una vez cada ${IAM_DIAGNOSTIC_COOLDOWN_MS / 1000} segundos para prevenir costes y saturación de cuota. Reintente en ${waitSeconds}s.`
+    });
+  }
+
+  isIamDiagnosticActive = true;
+  lastIamDiagnosticTimestamp = Date.now();
+
+  let probeCreated = false;
+  let probeDocRef: any = null;
+  let writeOk = false;
+  let readOk = false;
+  let deleteOk = false;
+  let config: any = null;
+
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
     if (!fs.existsSync(configPath)) {
@@ -1190,52 +1235,91 @@ app.get("/api/fiscal/diagnostics/iam", async (_req, res) => {
         error: "firebase-applet-config.json no existe en el contenedor"
       });
     }
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     const firestore = new Firestore({
       projectId: config.projectId,
       databaseId: config.firestoreDatabaseId
     });
 
     const probeId = `_probe_iam_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const probeDoc = firestore.collection('fiscal_emission_operations').doc(probeId);
+    probeDocRef = firestore.collection('fiscal_emission_operations').doc(probeId);
 
     // 1. Probar escritura (permiso datastore.entities.create)
     const writeTimestamp = new Date().toISOString();
-    await probeDoc.set({
+    await probeDocRef.set({
       probe: true,
       timestamp: writeTimestamp,
       serviceAccountCheck: true,
-      executedBy: 'Cloud Run Backend Service Account'
+      executedBy: `Cloud Run Backend Service Account (${req.fiscalUser.email})`
     });
+    writeOk = true;
+    probeCreated = true;
 
     // 2. Probar lectura (permiso datastore.entities.get)
-    const snap = await probeDoc.get();
+    const snap = await probeDocRef.get();
     const data = snap.data();
+    readOk = Boolean(snap.exists && data?.timestamp === writeTimestamp);
 
     // 3. Probar borrado (permiso datastore.entities.delete)
-    await probeDoc.delete();
+    await probeDocRef.delete();
+    deleteOk = true;
+    probeCreated = false;
+
+    // Verificación exhaustiva: el resultado global SOLO es satisfactorio si las tres comprobaciones son verdaderas
+    const permissions = {
+      write: writeOk,
+      read: readOk,
+      delete: deleteOk
+    };
+    const allGranted = permissions.write && permissions.read && permissions.delete;
+
+    if (!allGranted) {
+      return res.status(503).json({
+        success: false,
+        status: "IAM_PERMISSIONS_INSUFFICIENT",
+        projectId: config.projectId,
+        databaseId: config.firestoreDatabaseId,
+        permissions,
+        error: "Permisos IAM insuficientes o incompletos: una o más operaciones requeridas fallaron.",
+        message: "El resultado global requiere que escritura, lectura y borrado sean satisfactorios con roles/datastore.user."
+      });
+    }
 
     return res.status(200).json({
       success: true,
       status: "IAM_PERMISSIONS_VERIFIED",
       projectId: config.projectId,
       databaseId: config.firestoreDatabaseId,
-      permissions: {
-        write: true,
-        read: snap.exists && data?.timestamp === writeTimestamp,
-        delete: true
-      },
+      permissions,
       environment: process.env.NODE_ENV || 'development',
-      message: "Verificación de lectura/escritura exitosa. La cuenta de servicio de Cloud Run dispone de roles/datastore.user plenamente operativo."
+      message: "Verificación de lectura, escritura y borrado exitosa. La cuenta de servicio de Cloud Run dispone de roles/datastore.user plenamente operativo."
     });
   } catch (err: any) {
+    const permissions = {
+      write: writeOk,
+      read: readOk,
+      delete: deleteOk
+    };
     return res.status(500).json({
       success: false,
       status: "IAM_PERMISSION_ERROR",
       error: err.message,
       requiredRole: "roles/datastore.user",
+      projectId: config?.projectId,
+      databaseId: config?.firestoreDatabaseId,
+      permissions,
       message: "Fallo de permisos o conectividad con Cloud Firestore. Verifique la vinculación de roles/datastore.user a la cuenta de servicio de Cloud Run."
     });
+  } finally {
+    // Limpieza garantizada del documento de sondeo incluso ante fallo en lectura o excepción intermedia
+    if (probeCreated && probeDocRef) {
+      try {
+        await probeDocRef.delete();
+      } catch (cleanupErr: any) {
+        console.error(`[IAM DIAGNOSTIC] Error al limpiar documento de sondeo residual ${probeDocRef.id}:`, cleanupErr?.message);
+      }
+    }
+    isIamDiagnosticActive = false;
   }
 });
 
