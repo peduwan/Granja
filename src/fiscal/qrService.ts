@@ -49,7 +49,7 @@ export interface FiscalQrPayloadData {
 }
 
 export interface FiscalQrOptions {
-  readonly environment?: 'production' | 'testing';
+  readonly environment?: 'production' | 'test' | 'testing';
   readonly baseUrl?: string;
 }
 
@@ -153,10 +153,11 @@ export function buildFiscalQrPayload(record: FiscalRecord): FiscalQrPayloadData 
 export function buildFiscalQrUrl(record: FiscalRecord, options?: FiscalQrOptions): string {
   const data = buildFiscalQrPayload(record);
 
+  const isProduction = options?.environment === 'production';
   const baseUrl = options?.baseUrl || (
-    options?.environment === 'testing'
-      ? AEAT_QR_ENDPOINTS.testing
-      : AEAT_QR_ENDPOINTS.production
+    isProduction
+      ? AEAT_QR_ENDPOINTS.production
+      : AEAT_QR_ENDPOINTS.testing
   );
 
   const params = new URLSearchParams();
@@ -171,15 +172,16 @@ export function buildFiscalQrUrl(record: FiscalRecord, options?: FiscalQrOptions
 /**
  * Genera la representación Data URI en formato Base64 PNG del código QR tributario
  * cumpliendo estrictamente con el estándar ISO/IEC 18004 y nivel M de corrección de errores.
+ * Margen reglamentario: 4 módulos de zona de silencio.
  */
-export async function generateQrDataUri(url: string): Promise<string> {
+export async function generateQrDataUri(url: string, margin: number = 4): Promise<string> {
   if (!url || typeof url !== 'string' || url.trim() === '') {
     throw new Error('FiscalQrService: Se requiere una URL no vacía para generar el código QR.');
   }
 
   return await QRCode.toDataURL(url, {
     errorCorrectionLevel: QR_SPEC_CONSTANTS.ERROR_CORRECTION_LEVEL,
-    margin: QR_SPEC_CONSTANTS.MIN_QUIET_ZONE_MM,
+    margin,
     width: 320,
     color: {
       dark: '#000000',

@@ -1,0 +1,53 @@
+name: CI Pipeline — Veri*Factu SIF AgroTech
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  audit-and-quality:
+    name: Security Audit, Types & Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [ 20.x, 22.x ]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Dependency Security Audit (High/Critical Threshold)
+        run: npm audit --audit-level=high
+
+      - name: Static Type Check & Linting
+        run: npm run lint
+
+      - name: Active Security Configuration Audit (M4/M5)
+        run: npx tsx scripts/verify-security-config.ts
+
+      - name: Run Complete Test Suite
+        env:
+          NODE_ENV: test
+          FISCAL_COORDINATOR_MODE: simulator
+          AEAT_ENV: test
+          SIF_NIF: 53541125T
+          SIF_NOMBRE_RAZON: Eduardo
+          SIF_INSTALACION_ID: "2.0"
+          SIF_FECHA_ACTIVACION: "2026-02-04T00:00:00.000Z"
+          ROOT_OWNER_EMAIL: peduwan@gmail.com
+        run: npm test
+
+      - name: Production Build & XSD Worker Bundle
+        run: npm run build

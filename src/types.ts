@@ -92,6 +92,9 @@ export interface LoteEnvasado {
   estado: 'en_stock' | 'agotado' | 'parcial';
   notas?: string;
   creadoEn: string;
+  codigoLote?: string;
+  codigoLotePuestaOrigen?: string;
+  consumoLotesPuesta?: ComponenteLoteEstuche[];
 }
 
 export interface Cliente {
@@ -125,6 +128,8 @@ export interface LineaDocumentoVenta {
     huevosPorEstuche: number;
     totalHuevosEntregados: number;
   }>;
+  tipoIva?: number;
+  tipoRecargo?: number;
 }
 
 export interface TotalesFiscales {
@@ -135,6 +140,7 @@ export interface TotalesFiscales {
   porcentajeRecargo: number; // 0.5%
   cuotaRecargo: number;
   totalDocumento: number;
+  total?: number; // Alias unificado retrocompatible
 }
 
 export interface Albaran {
@@ -235,6 +241,9 @@ export interface Factura {
   clienteCif: string;
   clienteDireccion: string;
   clienteRecargoEquivalencia: boolean;
+  nombreCliente?: string; // Alias retrocompatible
+  cifCliente?: string; // Alias retrocompatible
+  direccionCliente?: string; // Alias retrocompatible
   albaranesAsociados: Array<{ id: string; numeroAlbaran: string; fecha: string }>;
   lineas: LineaDocumentoVenta[];
   totales: TotalesFiscales;

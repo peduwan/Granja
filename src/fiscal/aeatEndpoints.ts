@@ -37,22 +37,58 @@ export const AEAT_OFFICIAL_ENDPOINTS = {
 } as const;
 
 /**
- * Normaliza cualquier variante de nombre de entorno a uno de los tres estados válidos:
- * 'production' | 'test' | 'mock'
+ * Normaliza y valida estrictamente el entorno de conexión con la AEAT.
+ * Contrato estricto: Solo se admiten 'production' o 'test' (y 'mock' en desarrollo).
+ * En caso de valor desconocido, erróneo o intento de usar 'mock' en producción, lanza error fatal.
  */
 export function normalizeAeatEnvironment(envInput?: string): AeatEnvironment {
-  const raw = envInput || (typeof process !== 'undefined' ? (process.env.AEAT_ENV || process.env.AEAT_ENVIRONMENT) : undefined);
-  if (!raw) {
-    return 'mock';
+  const isProdNode = typeof process !== 'undefined' && process.env.NODE_ENV === 'production';
+  const isTestNode = typeof process !== 'undefined' && process.env.NODE_ENV === 'test';
+
+  let raw = envInput;
+  if (!raw && typeof process !== 'undefined') {
+    if (process.env.AEAT_ENV) {
+      raw = process.env.AEAT_ENV;
+    } else if (process.env.AEAT_ENVIRONMENT) {
+      console.warn('[AEAT_ENV_DEPRECATION] Uso de AEAT_ENVIRONMENT detectado. Por favor, migre a AEAT_ENV.');
+      raw = process.env.AEAT_ENVIRONMENT;
+    }
   }
+
+  if (!raw) {
+    if (isProdNode) {
+      throw new Error(
+        '[AEAT_ENV_FATAL] Variable de entorno AEAT_ENV obligatoria en producción. ' +
+        "Debe configurarse explícitamente como 'test' o 'production'."
+      );
+    }
+    return isTestNode ? 'mock' : 'test';
+  }
+
   const clean = raw.trim().toLowerCase();
-  if (clean === 'production' || clean === 'produccion' || clean === 'prod') {
+
+  if (clean === 'production' || clean === 'produccion') {
     return 'production';
   }
-  if (clean === 'test' || clean === 'pruebas' || clean === 'testing' || clean === 'pre' || clean === 'preproduccion') {
+
+  if (clean === 'test' || clean === 'pruebas' || clean === 'testing') {
     return 'test';
   }
-  return 'mock';
+
+  if (clean === 'mock') {
+    if (isProdNode) {
+      throw new Error(
+        '[AEAT_ENV_FATAL] Prohibido terminantemente el modo mock en entorno de producción (NODE_ENV=production). ' +
+        "Debe utilizarse 'test' o 'production'."
+      );
+    }
+    return 'mock';
+  }
+
+  throw new Error(
+    `[AEAT_ENV_FATAL] Valor de entorno AEAT no permitido: '${raw}'. ` +
+    "Solo se admiten estrictamente 'test' o 'production' (y 'mock' en desarrollo local)."
+  );
 }
 
 /**

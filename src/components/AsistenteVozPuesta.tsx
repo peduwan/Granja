@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Nave, LotePuesta } from '../types';
 import { Mic, MicOff, Sparkles, Loader2, CheckCircle2, AlertCircle, RefreshCw, Volume2, ArrowRight, X } from 'lucide-react';
+import { auth } from '../utils/firebase';
 
 interface AsistenteVozPuestaProps {
   naves: Nave[];
@@ -70,9 +71,20 @@ export const AsistenteVozPuesta: React.FC<AsistenteVozPuestaProps> = ({
     setResultado(null);
 
     try {
+      let authHeaders: Record<string, string> = {};
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (token) {
+          authHeaders['Authorization'] = `Bearer ${token}`;
+        }
+      } catch {}
+
       const resp = await fetch('/api/interpretar-puesta-voz', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders
+        },
         body: JSON.stringify({
           texto: textoLimpio,
           naves: naves.map(n => ({ id: n.id, codigo: n.codigo, nombre: n.nombre }))
@@ -80,7 +92,8 @@ export const AsistenteVozPuesta: React.FC<AsistenteVozPuestaProps> = ({
       });
 
       if (!resp.ok) {
-        throw new Error(`Error en el servidor: ${resp.status}`);
+        const errJson = await resp.json().catch(() => ({}));
+        throw new Error(errJson.message || `Error en el servidor (${resp.status}): no se pudo interpretar la voz.`);
       }
 
       const resData = await resp.json();
@@ -92,7 +105,7 @@ export const AsistenteVozPuesta: React.FC<AsistenteVozPuestaProps> = ({
       }
     } catch (err: any) {
       console.error('Error procesando voz:', err);
-      setErrorVoz('No se pudo conectar con el asistente de voz. Comprueba tu conexión o introduce los datos manualmente.');
+      setErrorVoz(err.message || 'No se pudo conectar con el asistente de voz. Comprueba tu conexión o introduce los datos manualmente.');
     } finally {
       setProcesando(false);
       procesandoRef.current = false;

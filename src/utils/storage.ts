@@ -2,9 +2,11 @@ import { AppData, TotalesFiscales, LineaDocumentoVenta, FiscalConfiguration, Fis
 import { createDefaultFiscalConfiguration } from '../fiscal/modelTransformers';
 
 
+import { ROOT_OWNER_EMAIL } from '../config/serverConfig';
+export { ROOT_OWNER_EMAIL };
 const STORAGE_KEY = 'avicola_gestion_data_v1';
 
-export function getDefaultFiscalConfig(cif: string = 'B45123987', nombre: string = 'Granja Avícola El Valle S.L.'): FiscalConfiguration {
+export function getDefaultFiscalConfig(cif: string = '', nombre: string = 'Mi Explotación Avícola'): FiscalConfiguration {
   return createDefaultFiscalConfiguration({
     nif: cif,
     nombreRazon: nombre
@@ -658,7 +660,7 @@ export function getInitialData(): AppData {
     fiscalRecordRefs: [],
     fiscalSubmissions: [],
     fiscalEvents: [],
-    fiscalConfig: getDefaultFiscalConfig('B45123987', 'Granja Avícola El Valle S.L.'),
+    fiscalConfig: getDefaultFiscalConfig('', 'Granja Avícola El Valle S.L.'),
     otrasSalidas: [],
     config: {
       contadorAlbaran: 2,
@@ -666,7 +668,7 @@ export function getInitialData(): AppData {
       contadorRectificativa: 1,
       contadorEnvasado: 2,
       nombreEmpresa: 'Granja Avícola El Valle S.L.',
-      cifEmpresa: 'B45123987',
+      cifEmpresa: '',
       direccionEmpresa: 'Camino de las Huertas, km 2.4',
       poblacionEmpresa: 'Toledo',
       provinciaEmpresa: 'Toledo',
@@ -692,8 +694,6 @@ export function getInitialData(): AppData {
     isZeroDayClean: false
   };
 }
-
-export const ROOT_OWNER_EMAIL = 'peduwan@gmail.com';
 
 /**
  * Genera una estructura de datos completamente vacía y limpia para inicio Día Cero

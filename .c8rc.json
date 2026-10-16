@@ -1,0 +1,27 @@
+{
+  "all": true,
+  "include": [
+    "src/**/*.ts",
+    "server.ts"
+  ],
+  "exclude": [
+    "**/*.d.ts",
+    "tests/**",
+    "dist/**",
+    "node_modules/**"
+  ],
+  "extension": [
+    ".ts"
+  ],
+  "reporter": [
+    "text",
+    "text-summary",
+    "html"
+  ],
+  "lines": 80,
+  "functions": 80,
+  "branches": 80,
+  "statements": 80,
+  "check-coverage": true,
+  "checkCoverage": true
+}

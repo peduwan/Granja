@@ -2,94 +2,139 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // Función que identifica al Propietario / Super Administrador raíz
+    // Función que identifica al Propietario / Super Administrador raíz (B3)
     function isOwner() {
       return request.auth != null &&
-        request.auth.token.email.lower() == 'peduwan@gmail.com';
+        request.auth.token.email.lower() == 'peduwan@gmail.com' &&
+        request.auth.token.email_verified == true;
     }
 
-    // Función que valida si la cuenta de Google autenticada está autorizada por el propietario
-    function isAuthorizedUser() {
+    // Función que valida si un usuario pertenece a una granja (A2 Multi-Tenant)
+    function isFarmMember(farmData) {
       return request.auth != null && (
         isOwner() ||
-        exists(/databases/$(database)/documents/authorized_users/$(request.auth.token.email.lower()))
+        (farmData.keys().hasAll(['members']) && request.auth.token.email.lower() in farmData.members) ||
+        (farmData.keys().hasAll(['ownerEmail']) && request.auth.token.email.lower() == farmData.ownerEmail.lower())
       );
     }
 
-    // Datos operativos de la explotación avícola
-    match /farms/{farmId} {
-      allow read: if isAuthorizedUser();
-      allow write: if isAuthorizedUser();
+    // Función que comprueba si el usuario pertenece a la granja dueña del NIF (obligadoId)
+    function isMemberOfObligado(obligadoId) {
+      return request.auth != null && (
+        isOwner() ||
+        (
+          exists(/databases/$(database)/documents/farms/$(obligadoId)) &&
+          isFarmMember(get(/databases/$(database)/documents/farms/$(obligadoId)).data)
+        )
+      );
     }
 
-    // Lista blanca de usuarios autorizados: lectura para autenticados, solo el propietario puede otorgar o revocar
+    // Datos operativos de la explotación avícola: Aislamiento Real Multi-Tenant
+    match /farms/{farmId} {
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isFarmMember(resource.data))
+      );
+      allow create: if request.auth != null && (
+        isOwner() ||
+        isFarmMember(request.resource.data)
+      );
+      allow update, delete: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isFarmMember(resource.data))
+      );
+    }
+
+    // Lista blanca de usuarios autorizados: lectura solo por el propio usuario o el propietario raíz
     match /authorized_users/{userEmail} {
-      allow read: if request.auth != null;
+      allow read: if request.auth != null && (
+        isOwner() ||
+        request.auth.token.email.lower() == userEmail.lower()
+      );
       allow write: if isOwner();
     }
 
-    // Perfiles individuales de usuario
+    // Perfiles individuales de usuario: lectura y escritura limitada al propio usuario autenticado o isOwner()
     match /users/{userId} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null && (request.auth.uid == userId || isOwner());
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || isOwner()
+      );
+      allow write: if request.auth != null && (
+        request.auth.uid == userId || isOwner()
+      );
     }
 
     // --- COLECCIÓN HISTÓRICA / AUDITORÍA LEGACY ---
-    // Queda como histórica: Solo lectura para auditoría. No admite nuevas escrituras.
-    // Las nuevas emisiones se registran exclusivamente en /fiscal_records/{recordId}
     match /registros_facturacion/{registroId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isMemberOfObligado(resource.data.nifEmisor))
+      );
       allow write: if false;
     }
 
     match /facturas_inmutables/{facturaId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null;
       allow write: if false;
     }
 
-    // Arquitectura SIF (Fase 3.1.6): Autoridad Exclusiva de Backend
+    // Arquitectura SIF (Fase 3.1.6 & A2): Autoridad Exclusiva de Backend + Aislamiento por Obligado/Granja
     // Prohibida estrictamente cualquier escritura directa desde el cliente web SDK.
-    // Solo lectura para usuarios autorizados. La emisión, sellado y custodia residen exclusivamente en backend.
+    // Solo lectura para miembros autorizados de la granja dueña de ese NIF (obligadoId) o el propietario raíz.
     match /fiscal_records/{recordId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isMemberOfObligado(resource.data.obligadoTributarioId))
+      );
       allow write: if false;
     }
 
-    // Cerrojo distribuido y estado de cadena por obligado tributario (Gestionado exclusivamente por Backend)
+    // Cerrojo distribuido y estado de cadena por obligado tributario
     match /fiscal_chain_state/{obligadoId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        isMemberOfObligado(obligadoId)
+      );
       allow write: if false;
     }
 
-    // Historial y Cola Outbox de Sumisiones AEAT (Gestionado exclusivamente por Backend)
+    // Historial y Cola Outbox de Sumisiones AEAT
     match /fiscal_submissions/{submissionId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isMemberOfObligado(resource.data.obligadoTributarioId))
+      );
       allow write: if false;
     }
 
-    // Libro de Auditoría de Eventos del SIF (Inmutable: Gestionado exclusivamente por Backend)
+    // Libro de Auditoría de Eventos del SIF
     match /fiscal_events/{eventId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && isMemberOfObligado(resource.data.obligadoTributarioId))
+      );
       allow write: if false;
     }
 
-    // Control de Flujo Oficial AEAT (<TiempoEsperaEnvio>) distribuido (Gestionado exclusivamente por Backend)
+    // Control de Flujo Oficial AEAT (<TiempoEsperaEnvio>) distribuido
     match /aeat_flow_control/{obligadoId} {
-      allow read: if isAuthorizedUser();
+      allow read: if request.auth != null && (
+        isOwner() ||
+        isMemberOfObligado(obligadoId)
+      );
       allow write: if false;
     }
 
     // Cerrojo Distribuido de Envío AEAT en Vuelo (Gestionado exclusivamente por Backend)
     match /aeat_send_locks/{obligadoId} {
-      allow read: if isAuthorizedUser();
+      allow read: if isOwner();
       allow write: if false;
     }
 
     // Registro Distribuido de Idempotencia de Operaciones de Emisión Fiscal (Gestionado exclusivamente por Backend)
     match /fiscal_emission_operations/{operationId} {
-      allow read: if isAuthorizedUser();
+      allow read: if isOwner();
       allow write: if false;
     }
   }
 }
-

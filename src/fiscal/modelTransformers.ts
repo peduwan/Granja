@@ -24,6 +24,9 @@ import {
   DEFAULT_MOTIVO_BY_CLAVE,
   ClaveTipoFacturaRectificativaAEAT
 } from './rectificativaUiBuilder';
+import { getSifIdentityConfig } from '../config/sifIdentity';
+
+export const TIPOS_IVA_OFICIALES = [0, 2, 4, 5, 7.5, 10, 21];
 
 /**
  * Función canónica de transformación: INVOICE -> FISCAL RECORD
@@ -82,14 +85,33 @@ export function createFiscalRecordFromInvoice(
 
   // 1. Agrupar desglose de IVA por tipo impositivo a partir de las líneas
   const desgloseMap = new Map<number, { base: number; cuotaIva: number; cuotaRecargo: number; recargoPct: number }>();
+  const facturaIdent = invoice.numeroFactura || invoice.id || 'S/N';
 
   if (invoice.lineas && invoice.lineas.length > 0) {
-    for (const linea of invoice.lineas) {
-      const tipoIva = (linea as any).tipoIva ?? invoice.totales?.porcentajeIva ?? 4.0;
+    invoice.lineas.forEach((linea, idx) => {
+      const rawTipoIva = (linea as any).tipoIva ?? invoice.totales?.porcentajeIva;
+      const lineaDesc = linea.nombreFormato || (linea as any).descripcion || `Línea ${idx + 1}`;
+
+      if (rawTipoIva === undefined || rawTipoIva === null || typeof rawTipoIva !== 'number' || !TIPOS_IVA_OFICIALES.includes(rawTipoIva)) {
+        throw new Error(
+          `Factura ${facturaIdent}: Línea ${idx + 1} ("${lineaDesc}"): Falta el tipo impositivo de IVA obligatorio (tipoIva).`
+        );
+      }
+
+      const tipoIva = Number(rawTipoIva);
       const subtotal = linea.subtotal ?? 0;
-      const recargoPct = invoice.totales?.aplicaRecargo
-        ? ((linea as any).tipoRecargo ?? invoice.totales?.porcentajeRecargo ?? (tipoIva === 4 ? 0.5 : 1.4))
-        : 0;
+
+      let recargoPct = 0;
+      if (invoice.totales?.aplicaRecargo === true) {
+        const rawRecargo = (linea as any).tipoRecargo ?? invoice.totales?.porcentajeRecargo;
+        if (rawRecargo === undefined || rawRecargo === null || typeof rawRecargo !== 'number' || Number.isNaN(rawRecargo) || rawRecargo <= 0) {
+          throw new Error(
+            `Factura ${facturaIdent}: Línea ${idx + 1} ("${lineaDesc}"): Aplica recargo de equivalencia pero no se especificó un porcentaje válido (tipoRecargo).`
+          );
+        }
+        recargoPct = Number(rawRecargo);
+      }
+
       const cuotaIva = Number(((subtotal * tipoIva) / 100).toFixed(2));
       const cuotaRecargo = recargoPct > 0 ? Number(((subtotal * recargoPct) / 100).toFixed(2)) : 0;
 
@@ -98,7 +120,7 @@ export function createFiscalRecordFromInvoice(
       current.cuotaIva = Number((current.cuotaIva + cuotaIva).toFixed(2));
       current.cuotaRecargo = Number((current.cuotaRecargo + cuotaRecargo).toFixed(2));
       desgloseMap.set(tipoIva, current);
-    }
+    });
 
     // Si hay un único tipo impositivo y coincide con invoice.totales, alinear con totales de cabecera para evitar diferencias de céntimo por redondeo línea a línea
     if (desgloseMap.size === 1 && invoice.totales) {
@@ -112,13 +134,29 @@ export function createFiscalRecordFromInvoice(
     }
   } else {
     // Si no hay líneas detalladas, usar los totales globales de la factura
+    const rawTipo = invoice.totales?.porcentajeIva;
+    if (rawTipo === undefined || rawTipo === null || typeof rawTipo !== 'number' || !TIPOS_IVA_OFICIALES.includes(rawTipo)) {
+      throw new Error(
+        `Factura ${facturaIdent}: Falta el tipo impositivo de IVA obligatorio en los totales de la factura.`
+      );
+    }
     const base = invoice.totales?.baseImponible ?? 0;
-    const tipo = invoice.totales?.porcentajeIva ?? 4.0;
+    const tipo = Number(rawTipo);
     const cuota = invoice.totales?.cuotaIva ?? Number(((base * tipo) / 100).toFixed(2));
-    const recargo = invoice.totales?.cuotaRecargo ?? 0;
-    const recargoPct = invoice.totales?.aplicaRecargo
-      ? (invoice.totales?.porcentajeRecargo || (tipo === 4 ? 0.5 : 1.4))
-      : 0;
+
+    let recargo = 0;
+    let recargoPct = 0;
+    if (invoice.totales?.aplicaRecargo === true) {
+      const rawRecargo = invoice.totales?.porcentajeRecargo;
+      if (rawRecargo === undefined || rawRecargo === null || typeof rawRecargo !== 'number' || Number.isNaN(rawRecargo) || rawRecargo <= 0) {
+        throw new Error(
+          `Factura ${facturaIdent}: Aplica recargo de equivalencia pero no se especificó un porcentaje válido (porcentajeRecargo).`
+        );
+      }
+      recargoPct = Number(rawRecargo);
+      recargo = invoice.totales?.cuotaRecargo ?? Number(((base * recargoPct) / 100).toFixed(2));
+    }
+
     desgloseMap.set(tipo, { base, cuotaIva: cuota, cuotaRecargo: recargo, recargoPct });
   }
 
@@ -658,15 +696,7 @@ export function createDefaultFiscalConfiguration(params: {
     entornoAeat: params.entorno || 'pruebas',
     versionEspecificacion: '1.0',
     sistemaInformatico: {
-      nombreRazon: 'Gestión Avícola Software S.L.',
-      nif: 'B99999999',
-      nombreSistemaInformatico: 'Gestión Avícola SIF',
-      idSistemaInformatico: '01',
-      version: '1.0.0',
-      numeroInstalacion: 'INST-001',
-      tipoUsoPosibleSoloVerifactu: 'S',
-      tipoUsoPosibleMultiOT: 'N',
-      indicadorMultiplesOT: 'N'
+      ...getSifIdentityConfig()
     },
     remisionAutomatica: true,
     reintentosMaximos: 3,
@@ -677,7 +707,7 @@ export function createDefaultFiscalConfiguration(params: {
       certificadoConfigurado: false
     },
     certificadoConfigurado: false,
-    fechaActivacion: new Date().toISOString()
+    fechaActivacion: getSifIdentityConfig().fechaActivacion
   };
 
   return deepFreeze(config);

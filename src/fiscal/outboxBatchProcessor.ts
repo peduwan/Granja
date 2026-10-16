@@ -42,7 +42,8 @@ import {
   MAX_RETRY_ATTEMPTS
 } from './aeatTransport';
 import { AeatCertificateProvider } from './aeatCertificateProvider';
-import { getAeatSoapEndpoint } from './aeatEndpoints';
+import { getAeatSoapEndpoint, normalizeAeatEnvironment } from './aeatEndpoints';
+import { getSifIdentityConfig } from '../config/sifIdentity';
 import { MockScenario, MockRecordLineSpec } from './mockAeatTransport';
 
 export class FiscalSubmissionHttpError extends Error {
@@ -107,10 +108,11 @@ export interface AuthoritativeSubmitResponse extends Omit<Partial<AeatTransportR
  * Construye autoritativamente en servidor la configuración fiscal para un obligado tributario.
  */
 export function buildServerAuthoritativeFiscalConfig(record: FiscalRecord): FiscalConfiguration {
-  const isProdEnv = process.env.AEAT_ENVIRONMENT === 'produccion' || process.env.AEAT_ENVIRONMENT === 'production';
+  const aeatEnv = normalizeAeatEnvironment();
+  const isProdEnv = aeatEnv === 'production';
   const entornoAeat = isProdEnv ? 'produccion' : 'pruebas';
   const hasCert = AeatCertificateProvider.hasCertificate();
-  const endpointUrl = getAeatSoapEndpoint(isProdEnv ? 'production' : 'test');
+  const endpointUrl = getAeatSoapEndpoint(aeatEnv);
 
   return {
     obligadoTributarioId: record.obligadoTributarioId,
@@ -120,15 +122,7 @@ export function buildServerAuthoritativeFiscalConfig(record: FiscalRecord): Fisc
     entornoAeat,
     versionEspecificacion: '1.0',
     sistemaInformatico: {
-      nombreRazon: 'Gestión Avícola Software S.L.',
-      nif: 'B99999999',
-      nombreSistemaInformatico: 'Gestión Avícola SIF',
-      idSistemaInformatico: '01',
-      version: '1.0.0',
-      numeroInstalacion: 'INST-001',
-      tipoUsoPosibleSoloVerifactu: 'S',
-      tipoUsoPosibleMultiOT: 'N',
-      indicadorMultiplesOT: 'N'
+      ...getSifIdentityConfig()
     },
     remisionAutomatica: true,
     reintentosMaximos: 3,

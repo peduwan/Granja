@@ -7,14 +7,24 @@ import { buildFiscalQrUrl, generateQrDataUri as qrServiceGenerateDataUri } from 
 /**
  * Motor Criptográfico y Generador de Registros Veri*Factu
  * Cumplimiento con Ley 11/2021 (Antifraude), Real Decreto 1007/2023 y Orden HAC/1177/2024.
- */
+import { getSifIdentityConfig } from '../config/sifIdentity';
 
-export const SOFTWARE_INFO = {
-  nombre: 'Gestión Avícola',
-  version: '1.0.0',
-  fabricante: 'Gestión Avícola AgroTech Software S.L.',
-  nifFabricante: 'B99000001'
-};
+export function getSoftwareInfo() {
+  const sif = getSifIdentityConfig();
+  return {
+    nombre: sif.nombreSistemaInformatico,
+    version: sif.version,
+    fabricante: sif.nombreRazon,
+    nifFabricante: sif.nif
+  };
+}
+
+export const SOFTWARE_INFO = new Proxy({} as any, {
+  get: (_target, prop) => {
+    const info = getSoftwareInfo();
+    return (info as any)[prop];
+  }
+});
 
 /**
  * Calcula el Hash criptográfico SHA-256 en formato hexadecimal mayúsculas.

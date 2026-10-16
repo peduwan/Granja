@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { LotePuesta, FormatoEnvase } from '../types';
+import { auth } from '../utils/firebase';
 import {
   Mic,
   MicOff,
@@ -72,9 +73,20 @@ export const AsistenteVozEnvasado: React.FC<AsistenteVozEnvasadoProps> = ({
     const lotesConStock = lotesPuesta.filter(l => l.huevosDisponibles > 0);
 
     try {
+      let authHeaders: Record<string, string> = {};
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (token) {
+          authHeaders['Authorization'] = `Bearer ${token}`;
+        }
+      } catch {}
+
       const resp = await fetch('/api/interpretar-envasado-voz', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders
+        },
         body: JSON.stringify({
           texto: textoLimpio,
           lotes: (lotesConStock.length > 0 ? lotesConStock : lotesPuesta).map(l => ({
@@ -93,7 +105,8 @@ export const AsistenteVozEnvasado: React.FC<AsistenteVozEnvasadoProps> = ({
       });
 
       if (!resp.ok) {
-        throw new Error(`Error en el servidor: ${resp.status}`);
+        const errJson = await resp.json().catch(() => ({}));
+        throw new Error(errJson.message || `Error en el servidor (${resp.status}): no se pudo interpretar el envasado.`);
       }
 
       const resData = await resp.json();
@@ -105,7 +118,7 @@ export const AsistenteVozEnvasado: React.FC<AsistenteVozEnvasadoProps> = ({
       }
     } catch (err: any) {
       console.error('Error procesando voz envasado:', err);
-      setErrorVoz('No se pudo conectar con el asistente de voz. Puedes dictar de nuevo o rellenar manualmente.');
+      setErrorVoz(err.message || 'No se pudo conectar con el asistente de voz. Puedes dictar de nuevo o rellenar manualmente.');
     } finally {
       setProcesando(false);
       procesandoRef.current = false;

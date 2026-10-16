@@ -91,7 +91,8 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
   useEffect(() => {
     if (!facturaOriginal || !isOpen) return;
     let cancelled = false;
-    const obligado = (fiscalConfig?.nifEmisor || config?.cifEmpresa || 'B12345678').trim().toUpperCase();
+    const obligado = (fiscalConfig?.nifEmisor || config?.cifEmpresa || '').trim().toUpperCase();
+    if (!obligado) return;
 
     previewNextRectificativaNumberViaBackend({
       obligadoTributarioId: obligado,
@@ -217,10 +218,16 @@ export const ModalFacturaRectificativa: React.FC<ModalFacturaRectificativaProps>
     setValidationError(null);
 
     try {
+      const cifObligado = (config?.cifEmpresa || fiscalConfig?.nifEmisor || '').trim().toUpperCase();
+      if (!cifObligado) {
+        setValidationError('Debe configurar el CIF/NIF de la explotación avícola en el perfil de la empresa antes de emitir una factura rectificativa.');
+        return;
+      }
+
       const effectiveFiscalConfig: FiscalConfiguration =
         fiscalConfig ||
         createDefaultFiscalConfiguration({
-          nif: config?.cifEmpresa || 'B12345678',
+          nif: cifObligado,
           nombreRazon: config?.nombreEmpresa || 'Granja Avícola S.L.'
         });
 

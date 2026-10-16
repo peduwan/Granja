@@ -30,7 +30,8 @@ import {
   Check,
   RotateCcw,
   AlertTriangle,
-  RefreshCw
+  RefreshCw,
+  Terminal
 } from 'lucide-react';
 import {
   Albaran,
@@ -50,6 +51,7 @@ import { calcularTotales, padNumero, formatearFechaES, getDefaultFiscalConfig } 
 import { AsistenteVozVenta, DatosVentaInterpretados } from './AsistenteVozVenta';
 import { ModalFacturaRectificativa } from './ModalFacturaRectificativa';
 import { ModalAuditoriaVeriFactu } from './ModalAuditoriaVeriFactu';
+import { ModalLogAeat } from './ModalLogAeat';
 import {
   descargarXmlVeriFactu,
   descargarLibroVeriFactuXml
@@ -134,12 +136,27 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
   // Estado para seguimiento de remisiones AEAT Veri*Factu (Fase 3.1)
   const [submissionsByFactura, setSubmissionsByFactura] = useState<Record<string, FiscalSubmission>>({});
   const [enviandoAeat, setEnviandoAeat] = useState<Record<string, boolean>>({});
+  const [isEmitiendoFactura, setIsEmitiendoFactura] = useState(false);
+  const [errorFiscalModal, setErrorFiscalModal] = useState<{ titulo: string; mensaje: string } | null>(null);
+  const [facturaLogModal, setFacturaLogModal] = useState<Factura | null>(null);
 
   const handleEnviarAeat = async (factura: Factura) => {
     if (!factura.fiscalRecordId) {
-      alert("Esta factura no dispone de registro fiscal sellado.");
+      setErrorFiscalModal({
+        titulo: 'Factura sin Registro Fiscal',
+        mensaje: 'Esta factura no dispone de un registro fiscal sellado en backend. Solo las facturas con huella criptográfica oficial pueden ser remitidas a la AEAT.'
+      });
       return;
     }
+
+    if (!auth.currentUser) {
+      setErrorFiscalModal({
+        titulo: 'Inicio de Sesión Requerido',
+        mensaje: 'Para remitir facturas a los servicios web de la AEAT, debes iniciar sesión con tu cuenta de usuario en el menú lateral ("Iniciar Sesión / Nube").'
+      });
+      return;
+    }
+
     setEnviandoAeat(prev => ({ ...prev, [factura.id]: true }));
     try {
       const activeFiscalConfig = fiscalConfig || getDefaultFiscalConfig();
@@ -175,7 +192,45 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
       }));
     } catch (err: any) {
       console.error("Error al remitir factura a AEAT:", err);
-      alert(`Error en el transporte AEAT: ${err.message}`);
+      let errorMsg = err.message || 'Error en el transporte AEAT';
+      let titulo = 'Error en Transporte AEAT';
+
+      if (errorMsg.includes('401') || errorMsg.includes('Bearer')) {
+        titulo = 'Sesión Requerida';
+        errorMsg = 'Debes iniciar sesión con tu cuenta de usuario en el menú lateral ("Iniciar Sesión / Nube") para conectar con la autoridad fiscal.';
+      } else if (
+        errorMsg.includes('MISSING_PRODUCTION_MTLS_CERT') ||
+        errorMsg.includes('certificado mTLS') ||
+        errorMsg.includes('estrictamente obligatorio disponer de certificado mTLS')
+      ) {
+        titulo = 'Certificado Digital Requerido para Remisión AEAT';
+        errorMsg = 'La comunicación con los servidores de la Agencia Tributaria en producción requiere obligatoriamente un certificado digital oficial (FNMT, DNIe o certificado de representante) instalado en el servidor a través de canal seguro mTLS. Como medida de seguridad jurídica y técnica, el sistema no envía peticiones sin identificar para evitar sanciones o envíos no autorizados. Tu factura está correctamente generada, encadenada y sellada de forma inmutable con su código QR.';
+      }
+
+      // Actualizar el estado de la sumisión para que la tarjeta de la factura y el log reflejen el motivo
+      const nowIso = new Date().toISOString();
+      const errorSubmission: FiscalSubmission = {
+        id: 'sub-err-' + Date.now(),
+        obligadoTributarioId: config.cifEmpresa || 'OBLIGADO',
+        fiscalRecordId: factura.fiscalRecordId || factura.id,
+        numeroFactura: factura.numeroFactura,
+        fechaCreacion: nowIso,
+        fechaIntento: nowIso,
+        fechaEnvio: nowIso,
+        numeroIntento: 1,
+        endpoint: 'https://preverifactu.agenciatributaria.gob.es/wlpl/TIBA-V100/TIBAFacturacion',
+        xmlEnviado: '',
+        estado: 'FAILED_TECHNICAL',
+        codigoAeat: 'CERT_REQUIRED',
+        descripcion: errorMsg
+      };
+
+      setSubmissionsByFactura(prev => ({
+        ...prev,
+        [factura.id]: errorSubmission
+      }));
+
+      setErrorFiscalModal({ titulo, mensaje: errorMsg });
     } finally {
       setEnviandoAeat(prev => ({ ...prev, [factura.id]: false }));
     }
@@ -504,8 +559,17 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
       setDocumentoImprimir({ tipo: 'albaran', doc: nuevoAlbaran });
       setSubTab('albaranes');
     } else {
-      // FASE 1.3: Emisión fiscal centralizada. El registro anterior se resuelve unívocamente dentro de la sección serializada.
-      const effectiveFiscalConfig: FiscalConfiguration = fiscalConfig || getDefaultFiscalConfig(config.cifEmpresa, config.nombreEmpresa);
+      // FASE 1.3 & M3: Bloqueo de emisión si la granja no tiene CIF/NIF configurado
+      const cifGranja = (config.cifEmpresa || fiscalConfig?.nifEmisor || '').trim();
+      if (!cifGranja) {
+        setErrorFiscalModal({
+          titulo: 'Configuración Fiscal Incompleta',
+          mensaje: 'La explotación avícola no tiene un CIF/NIF registrado en su configuración de perfil. Debe registrar el CIF de la granja antes de emitir facturas legales.'
+        });
+        return;
+      }
+
+      const effectiveFiscalConfig: FiscalConfiguration = fiscalConfig || getDefaultFiscalConfig(cifGranja, config.nombreEmpresa);
 
       const invoiceDraft: Factura = {
         id: 'fac-' + Date.now(),
@@ -528,83 +592,172 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
         esRectificativa: false
       };
 
+      setIsEmitiendoFactura(true);
+      try {
+        if (!auth.currentUser) {
+          setErrorFiscalModal({
+            titulo: 'Inicio de Sesión Requerido',
+            mensaje: 'Para emitir facturas con sellado legal Veri*Factu, debes iniciar sesión con tu cuenta de usuario. Pulsa en "Iniciar Sesión / Nube" en el menú lateral.'
+          });
+          return;
+        }
+
+        const { invoice: nuevaFactura, fiscalRecordRef } = await emitFiscalInvoiceViaBackend({
+          invoiceDraft,
+          fiscalConfig: effectiveFiscalConfig
+        });
+
+        onAddFacturaDirecta(nuevaFactura, consumoEstuches, fiscalRecordRef);
+        setMostrarModalNuevoDoc(false);
+        setDocumentoImprimir({ tipo: 'factura', doc: nuevaFactura });
+        setSubTab('facturas');
+      } catch (err: any) {
+        console.error('Error al emitir factura directa:', err);
+        let errorMsg = err?.message || 'Error desconocido al emitir la factura.';
+        let titulo = 'Error en Emisión Fiscal Veri*Factu';
+        if (errorMsg.includes('401') || errorMsg.includes('Bearer') || errorMsg.includes('Acceso no autorizado')) {
+          titulo = 'Sesión Requerida o Expirada';
+          errorMsg = 'Debes iniciar sesión con tu cuenta de usuario autorizada en el menú lateral ("Iniciar Sesión / Nube") para emitir facturas fiscales.';
+        } else if (errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('roles/datastore.user')) {
+          titulo = 'Permisos de Base de Datos Pendientes en GCP';
+          errorMsg = 'La cuenta de servicio de Cloud Run aún no tiene concedido el rol roles/datastore.user en Google Cloud Firestore. Asigna este rol a la cuenta de servicio en GCP IAM para permitir escrituras en la base de datos de producción.';
+        } else if (errorMsg.includes('403') || errorMsg.includes('Acceso denegado')) {
+          titulo = 'Usuario No Autorizado';
+          errorMsg = 'Tu cuenta de usuario no tiene asignado el rol de Propietario o Administrador con permiso fiscal en este NIF.';
+        }
+        setErrorFiscalModal({ titulo, mensaje: errorMsg });
+      } finally {
+        setIsEmitiendoFactura(false);
+      }
+    }
+  };
+
+  const handleCrearFacturaDesdeAlbaranes = async (overrideIds?: string[]) => {
+    const idsToInvoice = overrideIds && overrideIds.length > 0 ? overrideIds : albaranesSeleccionadosIds;
+    if (idsToInvoice.length === 0) {
+      setErrorFiscalModal({
+        titulo: 'Ningún albarán seleccionado',
+        mensaje: 'Debes marcar la casilla de al menos un albarán pendiente para generar su factura correspondiente.'
+      });
+      return;
+    }
+
+    const seleccionados = albaranes.filter(a => idsToInvoice.includes(a.id));
+    if (seleccionados.length === 0) {
+      setErrorFiscalModal({
+        titulo: 'Albarán no encontrado',
+        mensaje: 'No se han podido encontrar los albaranes seleccionados en el sistema.'
+      });
+      return;
+    }
+
+    const primerAlbaran = seleccionados[0];
+    const todosMismoCliente = seleccionados.every(a => a.clienteId === primerAlbaran.clienteId);
+
+    if (!todosMismoCliente) {
+      setErrorFiscalModal({
+        titulo: 'Clientes diferentes',
+        mensaje: 'Todos los albaranes agrupados en una misma factura deben pertenecer obligatoriamente al mismo cliente.'
+      });
+      return;
+    }
+
+    setIsEmitiendoFactura(true);
+    try {
+      if (!auth.currentUser) {
+        setErrorFiscalModal({
+          titulo: 'Inicio de Sesión Requerido',
+          mensaje: 'Para emitir facturas legales conforme a la Ley Antifraude y el Reglamento Veri*Factu (RD 1007/2023), el backend exige autenticación de usuario. Por favor, abre el menú lateral y pulsa en "Iniciar Sesión / Nube".'
+        });
+        return;
+      }
+
+      const lineasUnificadas: LineaDocumentoVenta[] = [];
+      seleccionados.forEach(alb => {
+        alb.lineas.forEach(l => {
+          lineasUnificadas.push({
+            ...l,
+            id: 'lin-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7)
+          });
+        });
+      });
+
+      const totales = calcularTotales(lineasUnificadas, primerAlbaran.clienteRecargoEquivalencia);
+      const numeroFacturaAgrupada = `FAC-${anioActual}-${padNumero(contadorFactura)}`;
+
+      // FASE 1.3 & M3: Bloqueo de emisión si la granja no tiene CIF/NIF configurado
+      const cifGranja = (config.cifEmpresa || fiscalConfig?.nifEmisor || '').trim();
+      if (!cifGranja) {
+        setErrorFiscalModal({
+          titulo: 'Configuración Fiscal Incompleta',
+          mensaje: 'La explotación avícola no tiene un CIF/NIF registrado en su configuración de perfil. Debe registrar el CIF de la granja antes de emitir facturas legales.'
+        });
+        return;
+      }
+
+      const effectiveFiscalConfig: FiscalConfiguration = fiscalConfig || getDefaultFiscalConfig(cifGranja, config.nombreEmpresa);
+
+      const invoiceDraft: Factura = {
+        id: 'fac-' + Date.now(),
+        numeroFactura: numeroFacturaAgrupada,
+        fecha: hoy,
+        clienteId: primerAlbaran.clienteId,
+        clienteNombre: primerAlbaran.clienteNombre,
+        clienteCif: primerAlbaran.clienteCif,
+        clienteDireccion: primerAlbaran.clienteDireccion,
+        clienteRecargoEquivalencia: primerAlbaran.clienteRecargoEquivalencia,
+        albaranesAsociados: seleccionados.map(a => ({
+          id: a.id,
+          numeroAlbaran: a.numeroAlbaran,
+          fecha: a.fecha
+        })),
+        lineas: lineasUnificadas,
+        totales,
+        estadoPago: 'pendiente',
+        formaPago: 'transferencia',
+        esVentaDirecta: false,
+        notas: `Factura recapitulativa correspondiente a los albaranes: ${seleccionados.map(a => a.numeroAlbaran).join(', ')}.`,
+        creadoEn: new Date().toISOString(),
+        tipoFactura: 'F1',
+        esRectificativa: false
+      };
+
       const { invoice: nuevaFactura, fiscalRecordRef } = await emitFiscalInvoiceViaBackend({
         invoiceDraft,
         fiscalConfig: effectiveFiscalConfig
       });
 
-      onAddFacturaDirecta(nuevaFactura, consumoEstuches, fiscalRecordRef);
-      setMostrarModalNuevoDoc(false);
-      setDocumentoImprimir({ tipo: 'factura', doc: nuevaFactura });
+      onFacturarAlbaranes(nuevaFactura, idsToInvoice, fiscalRecordRef);
+      setAlbaranesSeleccionadosIds([]);
       setSubTab('facturas');
+      setDocumentoImprimir({ tipo: 'factura', doc: nuevaFactura });
+    } catch (err: any) {
+      console.error('Error al facturar albaranes:', err);
+      let errorMsg = err?.message || 'Error desconocido al emitir la factura.';
+      let titulo = 'Error en Emisión Fiscal Veri*Factu';
+
+      if (errorMsg.includes('401') || errorMsg.includes('Bearer') || errorMsg.includes('Acceso no autorizado')) {
+        titulo = 'Sesión Requerida o Expirada';
+        errorMsg = 'Debes iniciar sesión con tu cuenta de usuario autorizada en el menú lateral ("Iniciar Sesión / Nube") para emitir facturas fiscales en el servidor.';
+      } else if (errorMsg.includes('PERMISSION_DENIED') || errorMsg.includes('roles/datastore.user')) {
+        titulo = 'Permisos de Base de Datos Pendientes en GCP';
+        errorMsg = 'La cuenta de servicio de Cloud Run aún no tiene concedido el rol roles/datastore.user en Google Cloud Firestore. Asigna este rol a la cuenta de servicio en GCP IAM para permitir escrituras en la base de datos de producción.';
+      } else if (errorMsg.includes('403') || errorMsg.includes('Acceso denegado')) {
+        titulo = 'Usuario No Autorizado';
+        errorMsg = 'Tu cuenta de usuario no tiene asignado el rol de Propietario o Administrador con permiso para emitir registros en este NIF.';
+      }
+
+      setErrorFiscalModal({
+        titulo,
+        mensaje: errorMsg
+      });
+    } finally {
+      setIsEmitiendoFactura(false);
     }
   };
 
-  const handleCrearFacturaDesdeAlbaranes = async () => {
-    if (albaranesSeleccionadosIds.length === 0) {
-      alert('Selecciona al menos un albarán para facturar.');
-      return;
-    }
-
-    const seleccionados = albaranes.filter(a => albaranesSeleccionadosIds.includes(a.id));
-    const primerAlbaran = seleccionados[0];
-    const todosMismoCliente = seleccionados.every(a => a.clienteId === primerAlbaran.clienteId);
-
-    if (!todosMismoCliente) {
-      alert('Todos los albaranes agrupados en una factura deben pertenecer al mismo cliente.');
-      return;
-    }
-
-    const lineasUnificadas: LineaDocumentoVenta[] = [];
-    seleccionados.forEach(alb => {
-      alb.lineas.forEach(l => {
-        lineasUnificadas.push({
-          ...l,
-          id: 'lin-' + Date.now() + '-' + Math.random()
-        });
-      });
-    });
-
-    const totales = calcularTotales(lineasUnificadas, primerAlbaran.clienteRecargoEquivalencia);
-    const numeroFacturaAgrupada = `FAC-${anioActual}-${padNumero(contadorFactura)}`;
-
-    // FASE 1.3: Emisión fiscal centralizada. Resolución serializada sin depender de fiscalRecordRefs[0].
-    const effectiveFiscalConfig: FiscalConfiguration = fiscalConfig || getDefaultFiscalConfig(config.cifEmpresa, config.nombreEmpresa);
-
-    const invoiceDraft: Factura = {
-      id: 'fac-' + Date.now(),
-      numeroFactura: numeroFacturaAgrupada,
-      fecha: hoy,
-      clienteId: primerAlbaran.clienteId,
-      clienteNombre: primerAlbaran.clienteNombre,
-      clienteCif: primerAlbaran.clienteCif,
-      clienteDireccion: primerAlbaran.clienteDireccion,
-      clienteRecargoEquivalencia: primerAlbaran.clienteRecargoEquivalencia,
-      albaranesAsociados: seleccionados.map(a => ({
-        id: a.id,
-        numeroAlbaran: a.numeroAlbaran,
-        fecha: a.fecha
-      })),
-      lineas: lineasUnificadas,
-      totales,
-      estadoPago: 'pendiente',
-      formaPago: 'transferencia',
-      esVentaDirecta: false,
-      notas: `Factura recapitulativa correspondiente a los albaranes: ${seleccionados.map(a => a.numeroAlbaran).join(', ')}.`,
-      creadoEn: new Date().toISOString(),
-      tipoFactura: 'F1',
-      esRectificativa: false
-    };
-
-    const { invoice: nuevaFactura, fiscalRecordRef } = await emitFiscalInvoiceViaBackend({
-      invoiceDraft,
-      fiscalConfig: effectiveFiscalConfig
-    });
-
-    onFacturarAlbaranes(nuevaFactura, albaranesSeleccionadosIds, fiscalRecordRef);
-    setAlbaranesSeleccionadosIds([]);
-    setSubTab('facturas');
-    setDocumentoImprimir({ tipo: 'factura', doc: nuevaFactura });
+  const handleFacturarAlbaranDirecto = (albaranId: string) => {
+    handleCrearFacturaDesdeAlbaranes([albaranId]);
   };
 
   // Filtrados
@@ -903,6 +1056,31 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
                             <Printer className="w-3.5 h-3.5 text-amber-700" />
                             <span>Imprimir Albarán</span>
                           </button>
+
+                          {alb.estado === 'pendiente_facturar' && !alb.facturaId && !facturas.some(f => f.albaranesAsociados?.some(a => a.id === alb.id || a.numeroAlbaran === alb.numeroAlbaran)) && (
+                            <button
+                              type="button"
+                              disabled={isEmitiendoFactura}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleFacturarAlbaranDirecto(alb.id);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer shadow-xs"
+                              title="Generar factura oficial Veri*Factu para este albarán"
+                            >
+                              {isEmitiendoFactura ? (
+                                <>
+                                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                  <span>Facturando...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Receipt className="w-3.5 h-3.5" />
+                                  <span>Facturar este Albarán</span>
+                                </>
+                              )}
+                            </button>
+                          )}
 
                           {alb.estado === 'facturado' || Boolean(alb.facturaId) || facturas.some(f => f.albaranesAsociados?.some(a => a.id === alb.id || a.numeroAlbaran === alb.numeroAlbaran)) ? (
                             <div
@@ -1302,6 +1480,18 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
                           </div>
 
                           <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setFacturaLogModal(fac);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-stone-100 hover:bg-stone-200 text-stone-700 transition-colors cursor-pointer border border-stone-200 shadow-2xs"
+                              title="Ver trazabilidad paso a paso y log técnico de la remisión a la AEAT"
+                            >
+                              <Terminal className="w-3.5 h-3.5 text-stone-600" />
+                              <span>Ver Log AEAT</span>
+                            </button>
                             {(() => {
                               const sub = submissionsByFactura[fac.id];
                               const isSending = enviandoAeat[fac.id];
@@ -1449,11 +1639,18 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
               </span>
               <button
                 type="button"
-                onClick={handleCrearFacturaDesdeAlbaranes}
-                disabled={albaranesSeleccionadosIds.length === 0}
-                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs cursor-pointer"
+                onClick={() => handleCrearFacturaDesdeAlbaranes()}
+                disabled={albaranesSeleccionadosIds.length === 0 || isEmitiendoFactura}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs cursor-pointer inline-flex items-center gap-2"
               >
-                Generar Factura Recapitulativa
+                {isEmitiendoFactura ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Emitiendo Factura...</span>
+                  </>
+                ) : (
+                  <span>Generar Factura Recapitulativa</span>
+                )}
               </button>
             </div>
           </div>
@@ -2005,6 +2202,52 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
           facturas={facturas}
           config={config}
           onClose={() => setMostrarModalAuditoria(false)}
+        />
+      )}
+
+      {/* Modal de Error y Avisos de Emisión Fiscal Veri*Factu */}
+      {errorFiscalModal && (
+        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-stone-200 space-y-4">
+            <div className="flex items-center gap-3 text-rose-700">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-rose-600" />
+              </div>
+              <div>
+                <h4 className="font-bold text-stone-900 text-sm leading-tight">
+                  {errorFiscalModal.titulo}
+                </h4>
+                <span className="text-[11px] text-stone-500">Aviso del Sistema Fiscal Veri*Factu</span>
+              </div>
+            </div>
+
+            <p className="text-xs text-stone-700 leading-relaxed bg-stone-50 p-3 rounded-xl border border-stone-200">
+              {errorFiscalModal.mensaje}
+            </p>
+
+            <div className="flex justify-end pt-2">
+              <button
+                type="button"
+                onClick={() => setErrorFiscalModal(null)}
+                className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors"
+              >
+                Entendido / Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Modal Log y Trazabilidad Paso a Paso AEAT */}
+      {facturaLogModal && (
+        <ModalLogAeat
+          factura={facturaLogModal}
+          submission={submissionsByFactura[facturaLogModal.id]}
+          isSending={enviandoAeat[facturaLogModal.id]}
+          onClose={() => setFacturaLogModal(null)}
+          onReintentar={() => {
+            const f = facturaLogModal;
+            handleEnviarAeat(f);
+          }}
         />
       )}
     </>

@@ -664,11 +664,11 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#FAF8F5] text-stone-900 flex flex-col lg:flex-row font-sans relative">
-      {/* Toast Flotante Global de la App */}
+    <div className="min-h-screen bg-[#fbfbfd] dark:bg-[#000000] text-[#1d1d1f] dark:text-[#f5f5f7] flex flex-col lg:flex-row relative font-sans selection:bg-blue-500/20 selection:text-blue-900">
+      {/* Toast Flotante Global estilo macOS HUD */}
       {toastNotification && (
-        <div className="fixed top-5 right-5 z-50 bg-stone-900 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center gap-3 text-xs font-semibold animate-in fade-in slide-in-from-top-4 border border-stone-700 max-w-md">
-          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+        <div className="fixed top-5 right-5 z-50 apple-panel-glass text-neutral-900 dark:text-white px-4 py-2.5 rounded-full shadow-xl flex items-center gap-2.5 text-xs font-medium animate-in fade-in slide-in-from-top-4 border border-black/[0.08] dark:border-white/[0.12] max-w-md">
+          <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" strokeWidth={2} />
           <span>{toastNotification}</span>
         </div>
       )}
@@ -696,20 +696,20 @@ export default function App() {
       />
 
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Barra de Notificación de Conexión / Modo Offline */}
+        {/* Barra de Notificación de Conexión estilo macOS Status Bar */}
         {(!isOnline || syncMessage) && (
-          <div className={`py-2 px-4 text-xs font-semibold flex items-center justify-between transition-all print:hidden ${
-            !isOnline ? 'bg-amber-800 text-amber-100' : 'bg-stone-800 text-stone-200'
+          <div className={`py-1.5 px-4 text-xs font-medium flex items-center justify-between transition-all print:hidden apple-toolbar-glass ${
+            !isOnline ? 'text-amber-700 dark:text-amber-400' : 'text-neutral-700 dark:text-neutral-300'
           }`}>
             <div className="max-w-7xl mx-auto w-full flex items-center gap-2">
               {!isOnline ? (
                 <>
-                  <WifiOff className="w-4 h-4 text-amber-300 shrink-0" />
-                  <span>Modo Local Offline: Sin conexión a internet. Los datos se guardan de forma segura en este dispositivo y se sincronizarán al recuperar la señal.</span>
+                  <WifiOff className="w-3.5 h-3.5 text-amber-500 shrink-0" strokeWidth={2} />
+                  <span>Modo Local Offline: Datos guardados en este dispositivo. Se sincronizarán al recuperar la conexión.</span>
                 </>
               ) : (
                 <>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" strokeWidth={2} />
                   <span>{syncMessage}</span>
                 </>
               )}
@@ -792,9 +792,9 @@ export default function App() {
           )}
         </main>
 
-        <footer className="bg-stone-200/80 border-t border-stone-300 py-3 text-center text-xs text-stone-600 print:hidden">
+        <footer className="py-4 text-center text-[11px] text-neutral-400 dark:text-neutral-500 border-t border-black/[0.04] dark:border-white/[0.04] print:hidden">
           <p>
-            {data.config.nombreEmpresa} • RGSEAA: {data.config.registroSanitario} • Base de Datos Híbrida (Firestore + LocalStorage Offline) • Trazabilidad RD 226/2008 y Reg. UE 589/2008
+            {data.config.nombreEmpresa} • RGSEAA: {data.config.registroSanitario} • Cloud Firestore & Veri*Factu RD 1007/2023
           </p>
         </footer>
       </div>
@@ -806,51 +806,51 @@ export default function App() {
         currentUser={user}
       />
 
-      {/* Modal: Confirmación Inicio Día Cero (Limpio sin datos) */}
+      {/* Modal: Confirmación Inicio Día Cero estilo macOS Sheet */}
       {showZeroDayModal && (
-        <div className="fixed inset-0 bg-stone-900/70 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-stone-200 space-y-5 relative">
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
+          <div className="apple-card max-w-lg w-full p-6 space-y-5 relative shadow-2xl bg-white dark:bg-neutral-900">
             <button
               type="button"
               onClick={() => setShowZeroDayModal(false)}
-              className="absolute top-4 right-4 p-1.5 text-stone-400 hover:text-stone-700 hover:bg-stone-100 rounded-lg transition-colors cursor-pointer"
+              className="absolute top-4 right-4 p-1.5 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors cursor-pointer"
             >
-              <X className="w-5 h-5" />
+              <X className="w-4 h-4" strokeWidth={2} />
             </button>
 
             <div className="flex items-center gap-3">
-              <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-900 flex items-center justify-center shrink-0 border border-amber-300 shadow-sm">
-                <Sparkles className="w-6 h-6 text-amber-700" />
+              <div className="w-11 h-11 rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0 border border-amber-500/25">
+                <Sparkles className="w-5 h-5 text-amber-500" strokeWidth={1.75} />
               </div>
               <div>
-                <h3 className="text-lg font-black text-stone-900">
-                  Iniciar Granja: Día Cero (Limpio)
+                <h3 className="text-base font-semibold text-neutral-900 dark:text-white">
+                  Iniciar Granja: Día Cero
                 </h3>
-                <p className="text-xs text-stone-500">
+                <p className="text-xs text-neutral-500">
                   Configuración para una primera instalación real sin datos ficticios
                 </p>
               </div>
             </div>
 
-            <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-950 space-y-2">
-              <div className="font-bold flex items-center gap-1.5 text-amber-900">
-                <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+            <div className="p-3.5 bg-black/[0.02] dark:bg-white/[0.03] border border-black/[0.06] dark:border-white/[0.08] rounded-xl text-xs space-y-2">
+              <div className="font-semibold flex items-center gap-1.5 text-neutral-800 dark:text-neutral-200">
+                <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" strokeWidth={2} />
                 <span>¿Qué ocurrirá al iniciar en Día Cero?</span>
               </div>
-              <ul className="list-disc list-inside space-y-1 text-stone-700 leading-relaxed">
+              <ul className="list-disc list-inside space-y-1 text-neutral-600 dark:text-neutral-400 leading-relaxed">
                 <li>Se eliminarán todos los lotes de puesta, envasados, albaranes, facturas y clientes de demostración.</li>
-                <li>Los contadores de albaranes, facturas y envasado empezarán desde el número <strong>1</strong>.</li>
+                <li>Los contadores de albaranes, facturas y envasado empezarán desde el número <strong className="text-neutral-900 dark:text-white">1</strong>.</li>
                 <li>Se mantendrán los formatos estándar de estuches (12, 6 y 30 huevos) listos para usar o personalizar.</li>
-                <li>Tu cuenta de Google (<strong>{ROOT_OWNER_EMAIL}</strong>) se mantendrá como propietario indiscutible con acceso total.</li>
+                <li>Tu cuenta de Google (<strong className="text-neutral-900 dark:text-white">{ROOT_OWNER_EMAIL}</strong>) se mantendrá como propietario indiscutible con acceso total.</li>
               </ul>
             </div>
 
             <div className="space-y-3 text-xs">
-              <p className="font-bold text-stone-800">
+              <p className="font-medium text-neutral-800 dark:text-neutral-200">
                 Opcional: Datos iniciales de tu explotación
               </p>
               <div>
-                <label className="block text-stone-600 mb-1 font-medium">
+                <label className="block text-neutral-600 dark:text-neutral-400 mb-1 font-medium">
                   Nombre de tu Granja / Empresa
                 </label>
                 <input
@@ -858,13 +858,13 @@ export default function App() {
                   value={zeroDayEmpresa}
                   onChange={e => setZeroDayEmpresa(e.target.value)}
                   placeholder="Ej. Avícola Pedregal S.L."
-                  className="w-full p-2.5 border border-stone-300 rounded-xl bg-stone-50 focus:bg-white focus:ring-2 focus:ring-amber-500 font-medium"
+                  className="w-full px-3 py-2 border border-black/[0.1] dark:border-white/[0.15] rounded-xl bg-black/[0.02] dark:bg-white/[0.05] focus:bg-white dark:focus:bg-neutral-800 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all font-medium text-neutral-900 dark:text-white text-xs"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-stone-600 mb-1 font-medium">
+                  <label className="block text-neutral-600 dark:text-neutral-400 mb-1 font-medium">
                     Código REGA
                   </label>
                   <input
@@ -872,12 +872,12 @@ export default function App() {
                     value={zeroDayRega}
                     onChange={e => setZeroDayRega(e.target.value)}
                     placeholder="Ej. ES45000012"
-                    className="w-full p-2.5 border border-stone-300 rounded-xl bg-stone-50 focus:bg-white focus:ring-2 focus:ring-amber-500 font-medium"
+                    className="w-full px-3 py-2 border border-black/[0.1] dark:border-white/[0.15] rounded-xl bg-black/[0.02] dark:bg-white/[0.05] focus:bg-white dark:focus:bg-neutral-800 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all font-medium text-neutral-900 dark:text-white text-xs"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-stone-600 mb-1 font-medium">
+                  <label className="block text-neutral-600 dark:text-neutral-400 mb-1 font-medium">
                     Código Centro Embalaje
                   </label>
                   <input
@@ -885,7 +885,7 @@ export default function App() {
                     value={zeroDayCentro}
                     onChange={e => setZeroDayCentro(e.target.value)}
                     placeholder="Ej. ES-10.04523-TO"
-                    className="w-full p-2.5 border border-stone-300 rounded-xl bg-stone-50 focus:bg-white focus:ring-2 focus:ring-amber-500 font-medium"
+                    className="w-full px-3 py-2 border border-black/[0.1] dark:border-white/[0.15] rounded-xl bg-black/[0.02] dark:bg-white/[0.05] focus:bg-white dark:focus:bg-neutral-800 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all font-medium text-neutral-900 dark:text-white text-xs"
                   />
                 </div>
               </div>
@@ -895,7 +895,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowZeroDayModal(false)}
-                className="flex-1 py-2.5 px-3 rounded-xl border border-stone-300 text-stone-700 font-semibold hover:bg-stone-100 transition-colors cursor-pointer text-xs"
+                className="flex-1 py-2 px-3 rounded-lg border border-black/[0.1] dark:border-white/[0.12] text-neutral-700 dark:text-neutral-300 font-medium hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors cursor-pointer text-xs"
               >
                 Cancelar
               </button>
@@ -903,29 +903,29 @@ export default function App() {
                 type="button"
                 id="btn-confirm-dia-cero"
                 onClick={handleStartZeroDay}
-                className="flex-1 py-2.5 px-3 rounded-xl bg-amber-800 hover:bg-amber-900 text-white font-bold transition-colors cursor-pointer text-xs shadow-md flex items-center justify-center gap-2"
+                className="flex-1 py-2 px-3 rounded-lg apple-btn-primary font-semibold transition-all cursor-pointer text-xs flex items-center justify-center gap-2"
               >
-                <Sparkles className="w-4 h-4 text-amber-300" />
-                <span>Iniciar Día Cero Limpio</span>
+                <Sparkles className="w-3.5 h-3.5" strokeWidth={2} />
+                <span>Iniciar Día Cero</span>
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Modal: Confirmación Cargar Datos Demo */}
+      {/* Modal: Confirmación Cargar Datos Demo estilo macOS Alert */}
       {showResetDemoModal && (
-        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
-          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-stone-200 space-y-4 text-center">
-            <div className="w-12 h-12 rounded-full bg-amber-100 text-amber-800 flex items-center justify-center mx-auto">
-              <RefreshCw className="w-6 h-6 text-amber-700" />
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
+          <div className="apple-card max-w-sm w-full p-6 space-y-4 text-center shadow-2xl bg-white dark:bg-neutral-900">
+            <div className="w-11 h-11 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center mx-auto">
+              <RefreshCw className="w-5 h-5 text-blue-500" strokeWidth={1.75} />
             </div>
 
             <div>
-              <h3 className="text-base font-bold text-stone-900">
+              <h3 className="text-sm font-semibold text-neutral-900 dark:text-white">
                 ¿Cargar datos de demostración?
               </h3>
-              <p className="text-xs text-stone-600 mt-1 leading-relaxed">
+              <p className="text-xs text-neutral-500 mt-1 leading-relaxed">
                 Se cargarán naves, lotes de prueba, clientes y facturas simuladas para explorar las funcionalidades de la aplicación.
               </p>
             </div>
@@ -934,7 +934,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowResetDemoModal(false)}
-                className="flex-1 py-2 px-3 rounded-xl border border-stone-300 text-stone-700 font-semibold hover:bg-stone-100 transition-colors cursor-pointer text-xs"
+                className="flex-1 py-2 px-3 rounded-lg border border-black/[0.1] dark:border-white/[0.12] text-neutral-700 dark:text-neutral-300 font-medium hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors cursor-pointer text-xs"
               >
                 Cancelar
               </button>
@@ -942,7 +942,7 @@ export default function App() {
                 type="button"
                 id="btn-confirm-reset-demo"
                 onClick={confirmResetDemo}
-                className="flex-1 py-2 px-3 rounded-xl bg-amber-800 hover:bg-amber-900 text-white font-bold transition-colors cursor-pointer text-xs"
+                className="flex-1 py-2 px-3 rounded-lg apple-btn-primary font-semibold transition-colors cursor-pointer text-xs"
               >
                 Cargar Demo
               </button>

@@ -125,16 +125,77 @@ export function formatFechaExpedicionFiscal(fecha: string): string {
 /**
  * Genera o normaliza la fecha, hora y huso horario de generación del registro conforme a la Orden HAC/1177/2024:
  * Formato ISO 8601 con huso horario obligatorio: YYYY-MM-DDThh:mm:ss±hh:mm o terminación 'Z'.
- * Si no se proporciona valor, genera la marca de tiempo actual del sistema con el huso horario local.
+ * Garantiza determinismo absoluto en huso peninsular 'Europe/Madrid' (CET +01:00 / CEST +02:00)
+ * independientemente del sistema operativo o contenedor anfitrión (A3).
  */
+export function getMadridTimezoneOffset(d: Date): string {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Madrid',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+
+  const parts = formatter.formatToParts(d);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    map[part.type] = part.value;
+  }
+
+  const hourNum = parseInt(map.hour === '24' ? '0' : map.hour, 10);
+  const madridAsUtc = Date.UTC(
+    parseInt(map.year, 10),
+    parseInt(map.month, 10) - 1,
+    parseInt(map.day, 10),
+    hourNum,
+    parseInt(map.minute, 10),
+    parseInt(map.second, 10)
+  );
+
+  const diffMinutes = Math.round((madridAsUtc - d.getTime()) / 60000);
+  const sign = diffMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(diffMinutes);
+  const offH = String(Math.floor(abs / 60)).padStart(2, '0');
+  const offM = String(abs % 60).padStart(2, '0');
+
+  return `${sign}${offH}:${offM}`;
+}
+
+export function formatDateTimeMadrid(d: Date): string {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Madrid',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+
+  const parts = formatter.formatToParts(d);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    map[part.type] = part.value;
+  }
+
+  const offset = getMadridTimezoneOffset(d);
+  const hh = map.hour === '24' ? '00' : map.hour;
+  return `${map.year}-${map.month}-${map.day}T${hh}:${map.minute}:${map.second}${offset}`;
+}
+
 export function formatFechaHoraHusoGenRegistro(dateInput?: Date | string): string {
   if (!dateInput) {
     const d = new Date();
-    return formatDateTimeWithTimezoneOffset(d);
+    return formatDateTimeMadrid(d);
   }
 
   if (dateInput instanceof Date) {
-    return formatDateTimeWithTimezoneOffset(dateInput);
+    return formatDateTimeMadrid(dateInput);
   }
 
   const str = String(dateInput).trim();
@@ -147,24 +208,7 @@ export function formatFechaHoraHusoGenRegistro(dateInput?: Date | string): strin
   if (isNaN(parsed.getTime())) {
     throw new Error(`formatFechaHoraHusoGenRegistro: fecha inválida: '${dateInput}'.`);
   }
-  return formatDateTimeWithTimezoneOffset(parsed);
-}
-
-function formatDateTimeWithTimezoneOffset(d: Date): string {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-
-  const offsetMinutes = -d.getTimezoneOffset();
-  const sign = offsetMinutes >= 0 ? '+' : '-';
-  const absOffset = Math.abs(offsetMinutes);
-  const offH = String(Math.floor(absOffset / 60)).padStart(2, '0');
-  const offM = String(absOffset % 60).padStart(2, '0');
-
-  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}${sign}${offH}:${offM}`;
+  return formatDateTimeMadrid(parsed);
 }
 
 /**

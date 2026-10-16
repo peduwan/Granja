@@ -19,7 +19,9 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { ROOT_OWNER_EMAIL } from '../utils/storage';
+import { ROOT_OWNER_EMAIL, getRootOwnerEmail } from '../config/serverConfig';
+
+export { ROOT_OWNER_EMAIL, getRootOwnerEmail };
 
 export interface AuthenticatedFiscalUser {
   uid: string;
@@ -105,6 +107,7 @@ export function isValidSpanishNifCifNie(nifRaw: string): boolean {
     nif === 'ES_UNKNOWN' ||
     nif === 'UNKNOWN' ||
     nif === 'B12345678' ||
+    nif === 'B45123987' ||
     nif === 'B99999999' ||
     nif === '000000000' ||
     nif.length !== 9
@@ -228,11 +231,13 @@ export async function verifyFiscalToken(token: string): Promise<AuthenticatedFis
     throw new Error('El token de autenticación no contiene email o identificador de usuario válido.');
   }
 
-  // Autorización multi-nivel: soporte para Custom Claims (adminFiscal/isOwner/role) y email raíz
-  const isOwner = payload.adminFiscal === true ||
-                  payload.isOwner === true ||
-                  payload.role === 'admin' ||
-                  email === ROOT_OWNER_EMAIL.toLowerCase();
+  // Autorización multi-nivel: verificación estricta de email_verified === true (B3)
+  const isOwner = (
+    email === ROOT_OWNER_EMAIL.toLowerCase() ||
+    payload.adminFiscal === true ||
+    payload.isOwner === true ||
+    payload.role === 'admin'
+  ) && payload.email_verified === true;
 
   // Obligados autorizados para este usuario (sin NIF por defecto ni fallback ficticio)
   const authorizedObligados = isOwner
@@ -321,3 +326,6 @@ export function assertObligadoAuthorized(
 
   return obligado;
 }
+
+export const verifyFirebaseIdToken = verifyFiscalToken;
+export type FiscalAuthenticatedUser = AuthenticatedFiscalUser;

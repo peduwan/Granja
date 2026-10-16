@@ -1,5 +1,210 @@
 @import "tailwindcss";
 
+/* -------------------------------------------------------------------------- */
+/* APPLE HUMAN INTERFACE GUIDELINES (HIG) — FOUNDATIONS & TYPOGRAPHY          */
+/* -------------------------------------------------------------------------- */
+
+:root {
+  --apple-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "SF Pro", system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --apple-mono: "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --apple-blue: #0071e3;
+  --apple-blue-hover: #0077ed;
+  --apple-blue-active: #0062c4;
+}
+
+html, body {
+  font-family: var(--apple-font);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background-color: #fbfbfd;
+  color: #1d1d1f;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-color-scheme: dark) {
+  html, body {
+    background-color: #000000;
+    color: #f5f5f7;
+  }
+}
+
+/* Tabular figures for numbers, currency, timestamps, and codes */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Native-feel macOS refined scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+@media (prefers-color-scheme: dark) {
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.35);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* APPLE MATERIALS & TRANSLUCENCY UTILITIES                                   */
+/* -------------------------------------------------------------------------- */
+
+/* Translucent Frosted Glass Panel */
+.apple-panel-glass {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-panel-glass {
+    background: rgba(28, 28, 30, 0.75);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* Translucent Toolbar */
+.apple-toolbar-glass {
+  background: rgba(251, 251, 253, 0.82);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-toolbar-glass {
+    background: rgba(18, 18, 18, 0.82);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* Apple Card Surface */
+.apple-card {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  border-radius: 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02), 0 4px 16px rgba(0, 0, 0, 0.02);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-card {
+    background: rgba(28, 28, 30, 0.65);
+    border-color: rgba(255, 255, 255, 0.07);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+}
+
+.apple-card:hover {
+  border-color: rgba(0, 0, 0, 0.09);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-card:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
+  }
+}
+
+/* Apple Segmented Control Container */
+.apple-segmented-bar {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  background: rgba(118, 118, 128, 0.12);
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  user-select: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-segmented-bar {
+    background: rgba(118, 118, 128, 0.24);
+  }
+}
+
+.apple-segmented-btn {
+  padding: 4px 12px;
+  border-radius: 7px;
+  color: #636366;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: nowrap;
+}
+
+.apple-segmented-btn:hover {
+  color: #1d1d1f;
+}
+
+.apple-segmented-btn.active {
+  background: #ffffff;
+  color: #1d1d1f;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 0.5px 1px rgba(0, 0, 0, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  .apple-segmented-btn {
+    color: #8e8e93;
+  }
+  .apple-segmented-btn:hover {
+    color: #f5f5f7;
+  }
+  .apple-segmented-btn.active {
+    background: #636366;
+    color: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  }
+}
+
+/* Apple Primary Button */
+.apple-btn-primary {
+  background: var(--apple-blue);
+  color: #ffffff;
+  border-radius: 8px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 2px rgba(0, 113, 227, 0.2);
+}
+
+.apple-btn-primary:hover {
+  background: var(--apple-blue-hover);
+  box-shadow: 0 2px 6px rgba(0, 113, 227, 0.3);
+}
+
+.apple-btn-primary:active {
+  background: var(--apple-blue-active);
+  transform: scale(0.99);
+}
+
+/* -------------------------------------------------------------------------- */
+/* PRINT MEDIA RULES (PRESERVED FOR OFFICIAL TAX / FARM DOCUMENTS)            */
+/* -------------------------------------------------------------------------- */
+
 @media print {
   /* Ocultar toda la interfaz interactiva y de navegación */
   header, nav, aside, footer, .no-print, button, input, select {
@@ -21,7 +226,7 @@
     box-shadow: none !important;
   }
 
-  /* Modales de impresión: convertirlos en flujo de página estándar (no fijos) */
+  /* Modales de impresión: convertirlos en flujo de página estándar */
   #modal-impresion-container,
   #modal-informe-puesta-container,
   #modal-informe-envasado-container,
@@ -59,7 +264,7 @@
     display: block !important;
   }
 
-  /* Hojas y Documentos Oficiales (Facturas, Albaranes, Libros Oficiales) */
+  /* Hojas y Documentos Oficiales */
   #hoja-documento-impresion,
   #hoja-informe-puesta,
   #hoja-informe-envasado,
@@ -106,7 +311,6 @@
     display: table-footer-group !important;
   }
 
-  /* Configuración de página A4 con márgenes adecuados */
   @page {
     size: A4 portrait;
     margin: 12mm 10mm;

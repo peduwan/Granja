@@ -129,7 +129,10 @@ export class MockAeatTransport {
     scenario: MockScenario,
     params?: MockTransportParams
   ): string {
-    const nif = params?.nifEmisor || params?.records?.[0]?.nifEmisor || 'B12345678';
+    const nif = (params?.nifEmisor || params?.records?.[0]?.nifEmisor || '').trim().toUpperCase();
+    if (!nif || nif === 'B12345678' || nif === 'B45123987' || nif === 'ES_UNKNOWN') {
+      throw new Error(`MockAeatTransport: nifEmisor obligatorio y no puede ser vacío ni CIF de prueba ficticio ('${nif}').`);
+    }
     const numSerie = params?.numSerie || params?.records?.[0]?.numSerie || 'FAC-2026/001';
     const fecha = params?.fechaExpedicion || params?.records?.[0]?.fechaExpedicion || '15-10-2026';
     const operacion = params?.operacion || params?.records?.[0]?.operacion || 'Alta';
