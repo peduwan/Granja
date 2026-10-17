@@ -82,7 +82,7 @@ function deepFreeze<T>(obj: T): T {
 
 function createSampleSealedRecord(): { record: FiscalRecord; config: FiscalConfiguration } {
   const config = createDefaultFiscalConfiguration({
-    nif: 'B12345678',
+    nif: 'A12345674',
     nombreRazon: 'Granja Avícola El Valle S.L.'
   });
 
@@ -165,8 +165,8 @@ await runTest('Test 2: Normalización unificada de entornos (production, test, m
   assert.strictEqual(normalizeAeatEnvironment('preproduccion'), 'test');
   assert.strictEqual(normalizeAeatEnvironment('mock'), 'mock');
   
-  // Con argumento no reconocido, normaliza a 'mock'
-  assert.strictEqual(normalizeAeatEnvironment('desconocido'), 'mock');
+  // Con argumento no reconocido, rechazo tajante según B2.2
+  assert.throws(() => normalizeAeatEnvironment('desconocido'), /Valor de entorno AEAT no permitido/);
 
   // Sin argumentos, resuelve a un entorno válido según process.env
   const fromEnv = normalizeAeatEnvironment();

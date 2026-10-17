@@ -76,7 +76,7 @@ function deepFreeze<T>(obj: T): T {
 
 function createSampleSealedRecord(): { record: FiscalRecord; config: FiscalConfiguration } {
   const config = createDefaultFiscalConfiguration({
-    nif: 'B12345678',
+    nif: 'A12345674',
     nombreRazon: 'Granja Avícola El Valle S.L.'
   });
 
@@ -387,7 +387,7 @@ await runTest('Test 14: MockAeatTransport reproduce fielmente los 8 escenarios o
 
 await runTest('Test 15: La acción "Enviar a AEAT" opera exclusivamente sobre el FiscalRecord ya emitido', async () => {
   const config = createDefaultFiscalConfiguration({
-    nif: 'B12345678',
+    nif: 'A12345674',
     nombreRazon: 'Granja Avícola El Valle S.L.'
   });
 

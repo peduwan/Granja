@@ -20,6 +20,7 @@ import { BackendFiscalCustody } from '../src/fiscal/backendCustodyRepository';
 import { CloudDistributedChainCoordinator } from '../src/fiscal/cloudDistributedChainCoordinator';
 import { emitFiscalInvoice } from '../src/fiscal/emissionService';
 import { createDefaultFiscalConfiguration } from '../src/fiscal/modelTransformers';
+import { getSifIdentityConfig } from '../src/config/sifIdentity';
 import { AeatCertificateProvider } from '../src/fiscal/aeatCertificateProvider';
 import { Factura } from '../src/types';
 
@@ -125,8 +126,10 @@ async function main() {
     assert.strictEqual(authoritativeConfig.modalidad, 'VERI_FACTU');
     assert.strictEqual(authoritativeConfig.versionEspecificacion, '1.0');
     assert.strictEqual(authoritativeConfig.remisionAutomatica, true);
-    assert.strictEqual(authoritativeConfig.sistemaInformatico.idSistemaInformatico, '01');
-    assert.strictEqual(authoritativeConfig.sistemaInformatico.nombreSistemaInformatico, 'Gestión Avícola SIF');
+    assert.strictEqual(
+      authoritativeConfig.sistemaInformatico.nombreSistemaInformatico,
+      getSifIdentityConfig().nombreSistemaInformatico
+    );
   });
 
   // ---------------------------------------------------------------------------

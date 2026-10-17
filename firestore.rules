@@ -18,6 +18,14 @@ service cloud.firestore {
       );
     }
 
+    // Función que identifica al propietario legítimo de una granja (administración de miembros y eliminación)
+    function isFarmOwner(farmData) {
+      return request.auth != null && (
+        isOwner() ||
+        (farmData.keys().hasAll(['ownerEmail']) && request.auth.token.email.lower() == farmData.ownerEmail.lower())
+      );
+    }
+
     // Función que comprueba si el usuario pertenece a la granja dueña del NIF (obligadoId)
     function isMemberOfObligado(obligadoId) {
       return request.auth != null && (
@@ -37,11 +45,22 @@ service cloud.firestore {
       );
       allow create: if request.auth != null && (
         isOwner() ||
-        isFarmMember(request.resource.data)
+        (request.resource.data.keys().hasAll(['ownerEmail']) && request.resource.data.ownerEmail.lower() == request.auth.token.email.lower())
       );
-      allow update, delete: if request.auth != null && (
+      // El propietario de la granja puede actualizar miembros y datos.
+      // Los miembros ordinarios solo pueden modificar datos operativos, con estricta prohibición de alterar members u ownerEmail.
+      allow update: if request.auth != null && (
+        isFarmOwner(resource.data) ||
+        (
+          isFarmMember(resource.data) &&
+          request.resource.data.members == resource.data.members &&
+          request.resource.data.ownerEmail == resource.data.ownerEmail
+        )
+      );
+      // Solo el propietario de la granja o el superadmin raíz pueden eliminar la explotación
+      allow delete: if request.auth != null && (
         isOwner() ||
-        (resource != null && isFarmMember(resource.data))
+        (resource != null && isFarmOwner(resource.data))
       );
     }
 
@@ -73,8 +92,16 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Facturas inmutables históricas: aislamiento estricto por obligado tributario
     match /facturas_inmutables/{facturaId} {
-      allow read: if request.auth != null;
+      allow read: if request.auth != null && (
+        isOwner() ||
+        (resource != null && (
+          (resource.data.keys().hasAll(['obligadoTributarioId']) && isMemberOfObligado(resource.data.obligadoTributarioId)) ||
+          (resource.data.keys().hasAll(['nifEmisor']) && isMemberOfObligado(resource.data.nifEmisor)) ||
+          (resource.data.keys().hasAll(['cifEmisor']) && isMemberOfObligado(resource.data.cifEmisor))
+        ))
+      );
       allow write: if false;
     }
 

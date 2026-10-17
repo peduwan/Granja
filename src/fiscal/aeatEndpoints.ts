@@ -67,11 +67,11 @@ export function normalizeAeatEnvironment(envInput?: string): AeatEnvironment {
 
   const clean = raw.trim().toLowerCase();
 
-  if (clean === 'production' || clean === 'produccion') {
+  if (clean === 'production' || clean === 'produccion' || clean === 'prod') {
     return 'production';
   }
 
-  if (clean === 'test' || clean === 'pruebas' || clean === 'testing') {
+  if (clean === 'test' || clean === 'pruebas' || clean === 'testing' || clean === 'pre' || clean === 'preproduccion') {
     return 'test';
   }
 

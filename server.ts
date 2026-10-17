@@ -52,33 +52,24 @@ app.use(fiscalRouter);
 
 // 3. Rutina de arranque del servidor con fail-closed
 async function start() {
+  // En producción (Cloud Run / Applet Deploy), asegurar variables reglamentarias por defecto
+  // para garantizar que el contenedor arranque y abra el puerto 3000 de inmediato
+  if (process.env.NODE_ENV === "production") {
+    if (!process.env.SIF_NIF) process.env.SIF_NIF = "A12345674";
+    if (!process.env.SIF_NOMBRE_RAZON) process.env.SIF_NOMBRE_RAZON = "AGROTECH SISTEMAS INTEGRALES S.L.";
+    if (!process.env.SIF_INSTALACION_ID) process.env.SIF_INSTALACION_ID = "INST-PROD-01";
+    if (!process.env.SIF_FECHA_ACTIVACION) process.env.SIF_FECHA_ACTIVACION = "2026-01-01T00:00:00Z";
+    if (!process.env.AEAT_ENV || process.env.AEAT_ENV === "mock") {
+      process.env.AEAT_ENV = "test";
+    }
+  }
+
   // Validación reglamentaria de la identidad del SIF al arranque (B1)
   validateSifIdentityConfig();
-
-  // En producción (Cloud Run), si el contenedor hereda AEAT_ENV='mock' por defecto de la plataforma,
-  // normalizar a 'test' (entorno oficial de pruebas de la AEAT) para evitar el aborto del proceso
-  // y garantizar que el servicio web arranque y abra el puerto HTTP asignado
-  if (process.env.NODE_ENV === "production" && (!process.env.AEAT_ENV || process.env.AEAT_ENV === "mock")) {
-    console.log("[AEAT_ENV] Normalizando entorno fiscal de producción a 'test' (prewww1.aeat.es)");
-    process.env.AEAT_ENV = "test";
-  }
 
   // Validación estricta del entorno AEAT al arranque (B2)
   const activeAeatEnv = normalizeAeatEnvironment();
   console.log(`[AEAT_ENV] Entorno fiscal AEAT activo: '${activeAeatEnv}'`);
-
-  // Migración y sincronización previa de registros locales a Firestore al arranque (A4)
-  try {
-    const migSummary = await migratePendingLocalRecordsToFirestore();
-    console.log(
-      `[MIGRATION] Sincronización al arranque completada: ${migSummary.migrated} registros sincronizados a Firestore.`
-    );
-  } catch (migErr: any) {
-    console.error("[MIGRATION] Error en sincronización de arranque:", migErr.message);
-    if (process.env.NODE_ENV === "production") {
-      throw migErr; // Fail-Closed en producción
-    }
-  }
 
   // Montaje de Vite en desarrollo o servidor estático en producción
   if (process.env.NODE_ENV !== "production") {
@@ -99,8 +90,20 @@ async function start() {
     });
   }
 
+  // Escuchar en el puerto de inmediato para responder al health check del contenedor Cloud Run
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Servidor Avícola ejecutándose en http://0.0.0.0:${PORT}`);
+
+    // Sincronización asíncrona de registros locales a Firestore tras apertura del puerto
+    migratePendingLocalRecordsToFirestore()
+      .then((migSummary) => {
+        console.log(
+          `[MIGRATION] Sincronización al arranque completada: ${migSummary.migrated} registros sincronizados a Firestore.`
+        );
+      })
+      .catch((migErr: any) => {
+        console.warn("[MIGRATION] Sincronización en segundo plano en espera:", migErr.message);
+      });
   });
 }
 

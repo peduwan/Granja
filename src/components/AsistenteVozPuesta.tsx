@@ -237,21 +237,21 @@ export const AsistenteVozPuesta: React.FC<AsistenteVozPuestaProps> = ({
   const naveDetectada = naves.find(n => n.id === resultado?.naveId);
 
   return (
-    <div className="bg-gradient-to-br from-amber-500/10 via-amber-50 to-stone-50 border-2 border-amber-300 rounded-xl p-4 shadow-sm mb-4">
-      {/* Cabecera del Asistente */}
-      <div className="flex items-center justify-between gap-2 mb-3">
-        <div className="flex items-center gap-2">
-          <div className="p-1.5 bg-amber-500 text-white rounded-lg shadow-xs">
-            <Sparkles className="w-4 h-4" />
+    <div className="apple-card p-4 mb-4 space-y-3">
+      {/* Cabecera del Asistente estilo Apple */}
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+            <Sparkles className="w-4 h-4" strokeWidth={1.75} />
           </div>
           <div>
-            <h4 className="text-sm font-bold text-stone-900 flex items-center gap-1.5">
+            <h4 className="text-sm font-semibold text-neutral-900 dark:text-white flex items-center gap-2">
               <span>Asistente de Voz Manos Libres</span>
-              <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 bg-amber-200/80 text-amber-900 rounded font-semibold">
-                Fase 1 · Puesta
+              <span className="text-[10px] font-medium px-2 py-0.5 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-full">
+                Puesta
               </span>
             </h4>
-            <p className="text-xs text-stone-600">
+            <p className="text-xs text-neutral-500 dark:text-neutral-400">
               Dicta la puesta directamente desde la nave o clasificadora sin teclear
             </p>
           </div>
@@ -260,38 +260,38 @@ export const AsistenteVozPuesta: React.FC<AsistenteVozPuestaProps> = ({
         <button
           type="button"
           onClick={() => setMostrarTextoManual(!mostrarTextoManual)}
-          className="text-xs text-stone-500 hover:text-stone-800 underline decoration-stone-300 hover:decoration-stone-600"
+          className="text-xs text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white transition-colors cursor-pointer"
         >
           {mostrarTextoManual ? 'Ocultar teclado' : 'Escribir dictado'}
         </button>
       </div>
 
-      {/* Botón Principal de Micrófono y Barra de Transcripción con Botón de Interpretar */}
+      {/* Botón Principal de Micrófono y Barra de Transcripción */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
         <button
           type="button"
           onClick={toggleGrabacion}
           disabled={procesando}
-          className={`flex items-center justify-center gap-2.5 px-5 py-3 rounded-xl font-semibold text-sm transition-all shadow-sm ${
+          className={`flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-medium text-xs sm:text-sm transition-all cursor-pointer ${
             escuchando
-              ? 'bg-red-600 hover:bg-red-700 text-white ring-4 ring-red-200 animate-pulse'
-              : 'bg-amber-600 hover:bg-amber-700 text-white hover:shadow-md'
-          } ${procesando ? 'opacity-70 cursor-not-allowed' : ''}`}
+              ? 'bg-rose-500 hover:bg-rose-600 text-white animate-pulse shadow-md shadow-rose-500/25 ring-2 ring-rose-400/40'
+              : 'apple-btn-primary'
+          } ${procesando ? 'opacity-70 cursor-wait' : ''}`}
         >
           {procesando ? (
             <>
-              <Loader2 className="w-5 h-5 animate-spin" />
-              <span>Interpretando con IA...</span>
+              <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
+              <span>Interpretando...</span>
             </>
           ) : escuchando ? (
             <>
-              <MicOff className="w-5 h-5" />
+              <MicOff className="w-4 h-4" strokeWidth={2} />
               <span>Detener y Procesar</span>
             </>
           ) : (
             <>
-              <Mic className="w-5 h-5" />
-              <span>Pulsar para Dictar por Voz</span>
+              <Mic className="w-4 h-4" strokeWidth={1.75} />
+              <span>Dictar por Voz</span>
             </>
           )}
         </button>

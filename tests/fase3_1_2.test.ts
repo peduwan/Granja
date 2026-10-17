@@ -70,7 +70,7 @@ function deepFreeze<T>(obj: T): T {
   return obj;
 }
 
-function createSampleSealedRecord(obligadoNif = 'B12345678'): { record: FiscalRecord; config: FiscalConfiguration } {
+function createSampleSealedRecord(obligadoNif = 'A12345674'): { record: FiscalRecord; config: FiscalConfiguration } {
   const config = createDefaultFiscalConfiguration({
     nif: obligadoNif,
     nombreRazon: 'Granja Avícola El Valle S.L.'
@@ -161,7 +161,7 @@ await runTest('Test 2: Valor inicial por defecto de TiempoEsperaEnvio es de 60 s
 
 await runTest('Test 3: Control de flujo AEAT: respuesta inicial devuelve TiempoEsperaEnvio = 60s y registra timestamp', async () => {
   AeatFlowControlManager.reset();
-  const { record, config } = createSampleSealedRecord('B12345678');
+  const { record, config } = createSampleSealedRecord('A12345674');
   const sub = createFiscalSubmission(record, config);
 
   const tBefore = Date.now();
@@ -188,7 +188,7 @@ await runTest('Test 3: Control de flujo AEAT: respuesta inicial devuelve TiempoE
 });
 
 await runTest('Test 4: Actualización dinámica: siguiente respuesta incrementa TiempoEsperaEnvio a 120s y 300s', async () => {
-  const { record, config } = createSampleSealedRecord('B12345678');
+  const { record, config } = createSampleSealedRecord('A12345674');
   const sub1 = createFiscalSubmission(record, config);
 
   // Respuesta con 120s
@@ -527,7 +527,7 @@ await runTest('Test 17: SOAP Fault de infraestructura no inventa ni altera arbit
 // -----------------------------------------------------------------------------
 
 await runTest('Test 18: Inmutabilidad física estricta del FiscalRecord a través del control de flujo y reintentos', async () => {
-  const { record, config } = createSampleSealedRecord('B12345678');
+  const { record, config } = createSampleSealedRecord('A12345674');
   const sub1 = createFiscalSubmission(record, config, { numeroIntento: 1 });
 
   const hashBefore = record.huella.hash;
@@ -556,7 +556,7 @@ await runTest('Test 18: Inmutabilidad física estricta del FiscalRecord a travé
 });
 
 await runTest('Test 19: FiscalSubmission registra exhaustivamente todos los metadatos de auditoría', async () => {
-  const { record, config } = createSampleSealedRecord('B12345678');
+  const { record, config } = createSampleSealedRecord('A12345674');
   const sub = createFiscalSubmission(record, config);
 
   const result = await executeAeatSubmission({

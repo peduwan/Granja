@@ -530,97 +530,79 @@ export const PuestaDiariaView: React.FC<PuestaDiariaViewProps> = ({
   return (
     <>
       <div className={`space-y-4 max-w-4xl mx-auto pb-20 ${mostrarModalInforme ? 'print:hidden' : ''}`}>
-        {/* 1. HERO CARD SUPERIOR ESTILO CAPTURA 2 & 3 */}
-      <div className="bg-gradient-to-r from-amber-500 via-amber-500 to-amber-600 rounded-2xl p-5 text-white shadow-md transition-all">
-        <div className="flex items-start justify-between gap-3">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <h2 className="text-xl sm:text-2xl font-black tracking-tight text-white">
-                {naveFiltroActiva ? naveFiltroActiva.nombre : 'Todos los Lotes de Puesta'}
-              </h2>
+        {/* 1. HERO CARD APPLE HIG */}
+        <div className="apple-card p-5 sm:p-6 transition-all">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                  <Egg className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <h2 className="text-lg sm:text-xl font-semibold tracking-tight text-neutral-900 dark:text-white">
+                  {naveFiltroActiva ? naveFiltroActiva.nombre : 'Todos los Lotes de Puesta'}
+                </h2>
+              </div>
+              <p className="text-neutral-500 dark:text-neutral-400 text-xs font-normal flex items-center gap-2">
+                <span>{naveFiltroActiva ? `${naveFiltroActiva.codigo} · ${naveFiltroActiva.tipoCria.split('-')[1]}` : 'Explotación Avícola Integral'}</span>
+                <span>·</span>
+                <span>{lotesFiltrados.length} registros activos</span>
+              </p>
             </div>
-            <p className="text-amber-100 text-xs sm:text-sm font-medium flex items-center gap-2">
-              <span>{naveFiltroActiva ? `${naveFiltroActiva.codigo} · ${naveFiltroActiva.tipoCria.split('-')[1]}` : 'Explotación Avícola Integral'}</span>
-              <span>•</span>
-              <span>{lotesFiltrados.length} Registros Activos</span>
-            </p>
+
+            {/* Botón '+' de acción principal Apple */}
+            <button
+              type="button"
+              onClick={() => setMostrarModalNuevoRegistro(true)}
+              className="apple-btn-primary flex items-center gap-1.5 px-4 py-2 text-xs sm:text-sm font-medium cursor-pointer self-start sm:self-auto"
+            >
+              <Plus className="w-4 h-4" strokeWidth={2} />
+              <span>Nueva Puesta</span>
+            </button>
           </div>
 
-          {/* Botón '+' de acción principal en cabecera */}
-          <button
-            type="button"
-            onClick={() => setMostrarModalNuevoRegistro(true)}
-            className="flex items-center gap-1.5 px-4 py-2 bg-white text-amber-800 hover:bg-amber-50 font-bold text-xs sm:text-sm rounded-xl shadow-sm transition-all cursor-pointer hover:shadow"
-          >
-            <Plus className="w-4 h-4 text-amber-600" />
-            <span>Nueva Puesta</span>
-          </button>
-        </div>
-
-        {/* Cifras rápidas en la tarjeta hero */}
-        <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-amber-400/40 text-xs text-white">
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Total Recogidos</span>
-            <strong className="text-sm sm:text-base font-bold">{totalesInforme.recogidos.toLocaleString()}</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Aptos Envasar</span>
-            <strong className="text-sm sm:text-base font-bold text-white">{totalesInforme.aptos.toLocaleString()}</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Calidad Comercial</span>
-            <strong className="text-sm sm:text-base font-bold text-amber-100">{porcentajeAptitud}%</strong>
+          {/* Cifras tabulares estilo Apple Metrics */}
+          <div className="grid grid-cols-3 gap-3 mt-5 pt-4 border-t border-black/[0.05] dark:border-white/[0.06]">
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Total Recogidos</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{totalesInforme.recogidos.toLocaleString()}</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Aptos Envasar</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{totalesInforme.aptos.toLocaleString()}</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Calidad Comercial</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">{porcentajeAptitud}%</strong>
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* 2. BARRA DE SUB-PESTAÑAS ESTILO CAPTURA 2 (RECORDS | ANALYSIS | EXPORT) */}
-      <div className="flex border-b border-stone-200 justify-around text-xs sm:text-sm font-bold tracking-wider text-stone-500">
-        <button
-          type="button"
-          onClick={() => setSubTab('records')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'records'
-              ? 'text-amber-600'
-              : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Registros (Histórico)</span>
-          {subTab === 'records' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('analysis')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'analysis'
-              ? 'text-amber-600'
-              : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Análisis y Calibres</span>
-          {subTab === 'analysis' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('export')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'export'
-              ? 'text-amber-600'
-              : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Libro Oficial (Export)</span>
-          {subTab === 'export' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-      </div>
+        {/* 2. BARRA DE SUB-PESTAÑAS ESTILO APPLE SEGMENTED CONTROL */}
+        <div className="flex justify-center sm:justify-start">
+          <div className="apple-segmented-bar w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={() => setSubTab('records')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'records' ? 'active' : ''}`}
+            >
+              Registros (Histórico)
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('analysis')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'analysis' ? 'active' : ''}`}
+            >
+              Análisis y Calibres
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('export')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'export' ? 'active' : ''}`}
+            >
+              Libro Oficial (Export)
+            </button>
+          </div>
+        </div>
 
       {/* 3. CONTENIDO SEGÚN LA PESTAÑA SELECCIONADA */}
 

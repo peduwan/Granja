@@ -134,87 +134,77 @@ export const TrazabilidadView: React.FC<TrazabilidadViewProps> = ({
   return (
     <>
       <div className={`space-y-4 max-w-4xl mx-auto pb-20 ${mostrarDossierImprimir ? 'print:hidden' : ''}`}>
-        {/* 1. HERO CARD SUPERIOR ESTILO LIMPIO */}
-      <div className="bg-gradient-to-r from-amber-600 via-amber-500 to-amber-600 rounded-2xl p-5 text-white shadow-md transition-all">
-        <div className="flex items-start justify-between gap-3">
-          <div className="space-y-1">
-            <h2 className="text-xl sm:text-2xl font-black tracking-tight text-white">
-              Trazabilidad 360° y Libro de Salidas
-            </h2>
-            <p className="text-amber-100 text-xs sm:text-sm font-medium flex items-center gap-2">
-              <span>Auditoría Sanitaria CEE 589/2008</span>
-              <span>•</span>
-              <span>Seguimiento Granja a Consumidor</span>
-            </p>
+        {/* 1. HERO CARD APPLE HIG */}
+        <div className="apple-card p-5 sm:p-6 transition-all">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                  <Truck className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <h2 className="text-lg sm:text-xl font-semibold tracking-tight text-neutral-900 dark:text-white">
+                  Trazabilidad 360° y Libro Sanitario
+                </h2>
+              </div>
+              <p className="text-neutral-500 dark:text-neutral-400 text-xs font-normal flex items-center gap-2">
+                <span>Auditoría Sanitaria CEE 589/2008</span>
+                <span>·</span>
+                <span>Seguimiento Granja a Consumidor</span>
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setMostrarModalSalida(true)}
+              className="apple-btn-primary flex items-center gap-1.5 px-4 py-2 text-xs sm:text-sm font-medium cursor-pointer self-start sm:self-auto"
+            >
+              <Plus className="w-4 h-4" strokeWidth={2} />
+              <span>Registrar Salida</span>
+            </button>
           </div>
 
-          <button
-            type="button"
-            onClick={() => setMostrarModalSalida(true)}
-            className="flex items-center gap-1.5 px-4 py-2 bg-white text-amber-800 hover:bg-amber-50 font-bold text-xs sm:text-sm rounded-xl shadow-sm transition-all cursor-pointer hover:shadow"
-          >
-            <Plus className="w-4 h-4 text-amber-600" />
-            <span>Registrar Salida</span>
-          </button>
+          <div className="grid grid-cols-3 gap-3 mt-5 pt-4 border-t border-black/[0.05] dark:border-white/[0.06]">
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Lotes de Puesta</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{lotesPuesta.length}</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Lotes Envasados</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{lotesEnvasados.length}</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Mermas y Salidas</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{otrasSalidas.length}</strong>
+            </div>
+          </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-amber-400/40 text-xs text-white">
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Lotes de Puesta</span>
-            <strong className="text-sm sm:text-base font-bold">{lotesPuesta.length} partidas</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Lotes Envasados</span>
-            <strong className="text-sm sm:text-base font-bold text-amber-100">{lotesEnvasados.length} partidas</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Mermas / Otras Salidas</span>
-            <strong className="text-sm sm:text-base font-bold">{otrasSalidas.length} registros</strong>
+        {/* 2. SUB-PESTAÑAS ESTILO APPLE SEGMENTED CONTROL */}
+        <div className="flex justify-center sm:justify-start">
+          <div className="apple-segmented-bar w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={() => setSubTab('auditoria')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'auditoria' ? 'active' : ''}`}
+            >
+              Árbol de Trazabilidad 360°
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('puestas')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'puestas' ? 'active' : ''}`}
+            >
+              Explorador de Lotes ({lotesPuesta.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('salidas')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'salidas' ? 'active' : ''}`}
+            >
+              Libro de Salidas ({otrasSalidas.length})
+            </button>
           </div>
         </div>
-      </div>
-
-      {/* 2. SUB-PESTAÑAS */}
-      <div className="flex border-b border-stone-200 justify-around text-xs sm:text-sm font-bold tracking-wider text-stone-500">
-        <button
-          type="button"
-          onClick={() => setSubTab('auditoria')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'auditoria' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Árbol de Trazabilidad 360°</span>
-          {subTab === 'auditoria' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('puestas')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'puestas' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Explorador de Lotes ({lotesPuesta.length})</span>
-          {subTab === 'puestas' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('salidas')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'salidas' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Libro de Salidas y Mermas ({otrasSalidas.length})</span>
-          {subTab === 'salidas' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-      </div>
 
       {/* 3. CONTENIDO SEGÚN SUB-PESTAÑA */}
 

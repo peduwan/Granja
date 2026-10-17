@@ -117,15 +117,15 @@ export const VentasModule: React.FC<VentasModuleProps> = ({
 
   return (
     <div className="space-y-4">
-      {/* Barra de Subnavegación del Módulo de Ventas */}
-      <div className="bg-white border border-stone-200 rounded-2xl p-2 sm:p-2.5 shadow-xs sticky top-0 z-20 print:hidden backdrop-blur-md bg-white/95">
-        <div className="flex items-center justify-between gap-2 overflow-x-auto no-scrollbar">
-          <div className="flex items-center gap-1.5 min-w-max">
-            <div className="hidden sm:flex items-center gap-2 px-2.5 py-1 text-stone-700 font-bold text-xs uppercase tracking-wider border-r border-stone-200 mr-1">
-              <ShoppingBag className="w-4 h-4 text-amber-700" />
-              <span>Ventas</span>
-            </div>
+      {/* Barra de Subnavegación estilo Apple Segmented Control */}
+      <div className="apple-toolbar-glass rounded-2xl p-1.5 shadow-2xs sticky top-0 z-20 print:hidden flex items-center justify-between gap-2 overflow-x-auto no-scrollbar">
+        <div className="flex items-center gap-1 min-w-max">
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 text-neutral-500 dark:text-neutral-400 font-semibold text-xs uppercase tracking-wider border-r border-black/[0.06] dark:border-white/[0.08] mr-1 select-none">
+            <ShoppingBag className="w-4 h-4 text-neutral-400" strokeWidth={1.5} />
+            <span>Ventas</span>
+          </div>
 
+          <div className="apple-segmented-bar">
             {subTabs.map(tab => {
               const isActive = activeSubTab === tab.id;
               const Icon = tab.icon;
@@ -136,25 +136,13 @@ export const VentasModule: React.FC<VentasModuleProps> = ({
                   type="button"
                   id={`ventas-tab-${tab.id}`}
                   onClick={() => onSelectSubTab(tab.id)}
-                  className={`flex items-center gap-2 px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer select-none ${
-                    isActive
-                      ? 'bg-amber-700 text-white shadow-sm shadow-amber-900/20'
-                      : 'text-stone-600 hover:text-stone-900 hover:bg-stone-100'
-                  }`}
+                  className={`apple-segmented-btn flex items-center gap-2 cursor-pointer ${isActive ? 'active' : ''}`}
                 >
-                  <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-amber-700'}`} />
-                  <span className="hidden md:inline">{tab.label}</span>
-                  <span className="md:hidden">{tab.shortLabel}</span>
-                  <span
-                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-full hidden lg:inline-block ${
-                      isActive
-                        ? 'bg-amber-800 text-amber-100'
-                        : tab.badgeHighlight
-                        ? 'bg-amber-100 text-amber-900 font-bold'
-                        : 'bg-stone-100 text-stone-600'
-                    }`}
-                  >
-                    {tab.badge}
+                  <Icon className={`w-3.5 h-3.5 shrink-0 ${isActive ? 'text-blue-500' : 'text-neutral-400'}`} strokeWidth={1.75} />
+                  <span className="hidden md:inline font-medium">{tab.label}</span>
+                  <span className="md:hidden font-medium">{tab.shortLabel}</span>
+                  <span className={`text-[11px] font-mono tabular-nums opacity-60 hidden lg:inline-block ${tab.badgeHighlight ? 'text-amber-600 dark:text-amber-400 opacity-100 font-semibold' : ''}`}>
+                    · {tab.badge}
                   </span>
                 </button>
               );

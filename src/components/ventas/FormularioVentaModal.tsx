@@ -231,48 +231,41 @@ export const FormularioVentaModal: React.FC<FormularioVentaModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 overflow-y-auto">
-      <div className="bg-white rounded-2xl max-w-2xl w-full p-5 sm:p-6 shadow-2xl space-y-4 border border-stone-200 my-auto max-h-[92vh] overflow-y-auto">
-        <div className="flex items-center justify-between pb-3 border-b border-stone-100">
+    <div className="fixed inset-0 bg-black/35 dark:bg-black/65 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50 overflow-y-auto">
+      <div className="apple-panel-glass rounded-2xl max-w-2xl w-full p-5 sm:p-6 shadow-2xl space-y-4 my-auto max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150">
+        <div className="flex items-center justify-between pb-3 border-b border-black/[0.06] dark:border-white/[0.08]">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-800 flex items-center justify-center">
-              <Receipt className="w-5 h-5" />
+            <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+              <Receipt className="w-4 h-4" strokeWidth={1.75} />
             </div>
             <div>
-              <h3 className="font-bold text-stone-900 text-base">Emitir Documento de Venta</h3>
-              <p className="text-xs text-stone-500">Genera un albarán de entrega o una factura directa</p>
+              <h3 className="font-semibold text-neutral-900 dark:text-white text-base">Emitir Documento de Venta</h3>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">Genera un albarán de entrega o una factura directa</p>
             </div>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="text-stone-400 hover:text-stone-700 p-1.5 rounded-lg hover:bg-stone-100 transition-colors"
+            className="w-7 h-7 rounded-full bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/20 flex items-center justify-center text-neutral-500 hover:text-neutral-900 dark:hover:text-white transition-colors cursor-pointer"
+            aria-label="Cerrar modal"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" strokeWidth={1.75} />
           </button>
         </div>
 
-        {/* Selector de Tipo de Documento */}
-        <div className="grid grid-cols-2 gap-2 p-1 bg-stone-100 rounded-xl text-xs font-bold">
+        {/* Selector de Tipo de Documento estilo Apple Segmented Control */}
+        <div className="apple-segmented-bar w-full grid grid-cols-2">
           <button
             type="button"
             onClick={() => setTipoNuevoDoc('albaran')}
-            className={`py-2 rounded-lg transition-all ${
-              tipoNuevoDoc === 'albaran'
-                ? 'bg-white text-amber-900 shadow-xs'
-                : 'text-stone-600 hover:text-stone-900'
-            }`}
+            className={`apple-segmented-btn text-center cursor-pointer ${tipoNuevoDoc === 'albaran' ? 'active' : ''}`}
           >
             Albarán de Entrega ({numeroAlbaranSugerido})
           </button>
           <button
             type="button"
             onClick={() => setTipoNuevoDoc('factura_directa')}
-            className={`py-2 rounded-lg transition-all ${
-              tipoNuevoDoc === 'factura_directa'
-                ? 'bg-white text-amber-900 shadow-xs'
-                : 'text-stone-600 hover:text-stone-900'
-            }`}
+            className={`apple-segmented-btn text-center cursor-pointer ${tipoNuevoDoc === 'factura_directa' ? 'active' : ''}`}
           >
             Factura Directa ({numeroFacturaSugerida})
           </button>
@@ -459,18 +452,18 @@ export const FormularioVentaModal: React.FC<FormularioVentaModalProps> = ({
             />
           </div>
 
-          <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+          <div className="flex justify-end gap-2.5 pt-3 border-t border-black/[0.06] dark:border-white/[0.08]">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2.5 text-xs font-semibold text-stone-600 hover:bg-stone-100 rounded-xl cursor-pointer"
+              className="px-4 py-2 text-xs sm:text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:bg-black/5 dark:hover:bg-white/10 rounded-lg cursor-pointer transition-colors"
             >
               Cancelar
             </button>
             <button
               type="submit"
               disabled={isEmitiendo || !stockVentaSuficiente || lineasVenta.some(l => l.cantidadEstuches <= 0)}
-              className="px-5 py-2.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs sm:text-sm rounded-xl shadow-sm cursor-pointer"
+              className="apple-btn-primary px-5 py-2 text-xs sm:text-sm font-medium disabled:opacity-40 cursor-pointer"
             >
               {isEmitiendo ? 'Emitiendo...' : 'Guardar y Emitir'}
             </button>

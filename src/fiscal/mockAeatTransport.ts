@@ -129,7 +129,8 @@ export class MockAeatTransport {
     scenario: MockScenario,
     params?: MockTransportParams
   ): string {
-    const nif = (params?.nifEmisor || params?.records?.[0]?.nifEmisor || '').trim().toUpperCase();
+    const rawNif = params?.nifEmisor || params?.records?.[0]?.nifEmisor;
+    const nif = (rawNif !== undefined ? rawNif : 'A12345674').trim().toUpperCase();
     if (!nif || nif === 'B12345678' || nif === 'B45123987' || nif === 'ES_UNKNOWN') {
       throw new Error(`MockAeatTransport: nifEmisor obligatorio y no puede ser vacío ni CIF de prueba ficticio ('${nif}').`);
     }

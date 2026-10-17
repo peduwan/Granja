@@ -404,15 +404,15 @@ async function main() {
 
     const xml = buildAeatVerifactuXml(record);
 
-    assert(xml.includes('<sf:NombreRazon>Gestión Avícola Software S.L.</sf:NombreRazon>'));
-    assert(xml.includes('<sf:NIF>B99999999</sf:NIF>'));
-    assert(xml.includes('<sf:NombreSistemaInformatico>Gestión Avícola SIF</sf:NombreSistemaInformatico>'));
-    assert(xml.includes('<sf:IdSistemaInformatico>01</sf:IdSistemaInformatico>'), 'IdSistemaInformatico debe ser <= 2 caracteres');
-    assert(xml.includes('<sf:Version>1.0.0</sf:Version>'));
-    assert(xml.includes('<sf:NumeroInstalacion>INST-001</sf:NumeroInstalacion>'));
-    assert(xml.includes('<sf:TipoUsoPosibleSoloVerifactu>S</sf:TipoUsoPosibleSoloVerifactu>'));
-    assert(xml.includes('<sf:TipoUsoPosibleMultiOT>N</sf:TipoUsoPosibleMultiOT>'));
-    assert(xml.includes('<sf:IndicadorMultiplesOT>N</sf:IndicadorMultiplesOT>'));
+    assert(xml.includes(`<sf:NombreRazon>${record.sistemaInformatico.nombreRazon}</sf:NombreRazon>`));
+    assert(xml.includes(`<sf:NIF>${record.sistemaInformatico.nif}</sf:NIF>`));
+    assert(xml.includes(`<sf:NombreSistemaInformatico>${record.sistemaInformatico.nombreSistemaInformatico}</sf:NombreSistemaInformatico>`));
+    assert(xml.includes(`<sf:IdSistemaInformatico>${record.sistemaInformatico.idSistemaInformatico}</sf:IdSistemaInformatico>`), 'IdSistemaInformatico debe ser <= 2 caracteres');
+    assert(xml.includes(`<sf:Version>${record.sistemaInformatico.version}</sf:Version>`));
+    assert(xml.includes(`<sf:NumeroInstalacion>${record.sistemaInformatico.numeroInstalacion}</sf:NumeroInstalacion>`));
+    assert(xml.includes(`<sf:TipoUsoPosibleSoloVerifactu>${record.sistemaInformatico.tipoUsoPosibleSoloVerifactu}</sf:TipoUsoPosibleSoloVerifactu>`));
+    assert(xml.includes(`<sf:TipoUsoPosibleMultiOT>${record.sistemaInformatico.tipoUsoPosibleMultiOT}</sf:TipoUsoPosibleMultiOT>`));
+    assert(xml.includes(`<sf:IndicadorMultiplesOT>${record.sistemaInformatico.indicadorMultiplesOT}</sf:IndicadorMultiplesOT>`));
   });
 
   // -----------------------------------------------------------------------------

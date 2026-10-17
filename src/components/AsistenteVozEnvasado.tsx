@@ -238,54 +238,54 @@ export const AsistenteVozEnvasado: React.FC<AsistenteVozEnvasadoProps> = ({
   const esMultilote = (resultado?.asignaciones?.length || 0) > 1;
 
   return (
-    <div className="bg-gradient-to-br from-amber-500/10 via-amber-600/5 to-stone-50 border border-amber-200/80 rounded-2xl p-4 shadow-sm mb-4">
-      {/* Cabecera del Asistente */}
-      <div className="flex items-center justify-between gap-3 mb-3">
+    <div className="apple-card p-4 mb-4 space-y-3">
+      {/* Cabecera del Asistente estilo Apple */}
+      <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-amber-600 text-white flex items-center justify-center shadow-sm">
-            <Sparkles className="w-4 h-4" />
+          <div className="w-8 h-8 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+            <Sparkles className="w-4 h-4" strokeWidth={1.75} />
           </div>
           <div>
-            <h4 className="font-bold text-stone-900 text-sm flex items-center gap-1.5">
+            <h4 className="font-semibold text-neutral-900 dark:text-white text-sm flex items-center gap-2">
               <span>Dictado de Envasado por Voz</span>
-              <span className="text-[10px] bg-amber-100 text-amber-800 font-semibold px-2 py-0.5 rounded-full">
-                Soporta Multilote
+              <span className="text-[10px] bg-blue-500/10 text-blue-600 dark:text-blue-400 font-medium px-2 py-0.5 rounded-full">
+                Multilote
               </span>
             </h4>
-            <p className="text-[11px] text-stone-500">
+            <p className="text-[11px] text-neutral-500 dark:text-neutral-400">
               Pulsa el micro y dicta la tirada (ej. 1 o 2 lotes en el estuche, mermas o máximo posible)
             </p>
           </div>
         </div>
 
-        {/* Botón Principal del Micrófono */}
+        {/* Botón Principal del Micrófono estilo Apple */}
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={toggleGrabacion}
             disabled={procesando}
-            className={`relative flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer ${
+            className={`relative flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-medium transition-all cursor-pointer ${
               escuchando
-                ? 'bg-red-600 text-white animate-pulse shadow-red-200'
+                ? 'bg-rose-500 hover:bg-rose-600 text-white animate-pulse shadow-md shadow-rose-500/25 ring-2 ring-rose-400/40'
                 : procesando
-                ? 'bg-stone-200 text-stone-600 cursor-wait'
-                : 'bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-700 hover:to-amber-600 text-white'
+                ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-300 cursor-wait'
+                : 'apple-btn-primary'
             }`}
             title={escuchando ? 'Detener escucha' : 'Comenzar a dictar por voz'}
           >
             {procesando ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
                 <span>Analizando...</span>
               </>
             ) : escuchando ? (
               <>
-                <MicOff className="w-4 h-4" />
-                <span>Escuchando... (Pulsar para parar)</span>
+                <MicOff className="w-4 h-4" strokeWidth={2} />
+                <span>Escuchando...</span>
               </>
             ) : (
               <>
-                <Mic className="w-4 h-4" />
+                <Mic className="w-4 h-4" strokeWidth={1.75} />
                 <span>Dictar Envasado</span>
               </>
             )}

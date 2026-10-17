@@ -260,53 +260,53 @@ export const AsistenteVozVenta: React.FC<AsistenteVozVentaProps> = ({
   const clienteInterpretado = resultado ? clientes.find(c => c.id === resultado.clienteId) : null;
 
   return (
-    <div className="bg-gradient-to-br from-amber-500/10 via-amber-50/50 to-stone-50 border border-amber-300/80 rounded-2xl p-4 shadow-xs space-y-3">
-      {/* Cabecera del Asistente de Voz */}
+    <div className="apple-card p-4 space-y-3">
+      {/* Cabecera del Asistente de Voz estilo Apple HUD */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-amber-600 text-white flex items-center justify-center shadow-xs">
-            <Sparkles className="w-4 h-4" />
+          <div className="w-8 h-8 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+            <Sparkles className="w-4 h-4" strokeWidth={1.75} />
           </div>
           <div>
-            <h4 className="text-xs sm:text-sm font-bold text-stone-900 flex items-center gap-1.5">
+            <h4 className="text-xs sm:text-sm font-semibold text-neutral-900 dark:text-white flex items-center gap-2">
               <span>Dictado Inteligente de Albaranes y Facturas</span>
-              <span className="text-[10px] font-semibold bg-amber-200/80 text-amber-900 px-2 py-0.5 rounded-full">
-                IA Gemini
+              <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded-full">
+                Gemini
               </span>
             </h4>
-            <p className="text-[11px] text-stone-500">
+            <p className="text-[11px] text-neutral-500 dark:text-neutral-400">
               Pulsa el micro y dicta el cliente, formato, cantidad, precio o forma de pago
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Botón Principal del Micrófono */}
+          {/* Botón Principal del Micrófono estilo Apple */}
           <button
             type="button"
             onClick={toggleGrabacion}
             disabled={procesando}
-            className={`relative flex items-center gap-1.5 px-3.5 py-2 rounded-xl font-bold text-xs sm:text-sm transition-all cursor-pointer shadow-sm ${
+            className={`relative flex items-center gap-1.5 px-3.5 py-2 rounded-lg font-medium text-xs sm:text-sm transition-all cursor-pointer ${
               escuchando
-                ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse ring-4 ring-red-400/30'
+                ? 'bg-rose-500 hover:bg-rose-600 text-white animate-pulse shadow-md shadow-rose-500/25 ring-2 ring-rose-400/40'
                 : procesando
-                ? 'bg-amber-400 text-amber-950 cursor-wait'
-                : 'bg-amber-600 hover:bg-amber-700 text-white hover:scale-[1.02]'
+                ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-700 dark:text-neutral-200 cursor-wait'
+                : 'apple-btn-primary'
             }`}
           >
             {escuchando ? (
               <>
-                <MicOff className="w-4 h-4" />
+                <MicOff className="w-4 h-4" strokeWidth={2} />
                 <span>Detener y Procesar</span>
               </>
             ) : procesando ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={2} />
                 <span>Interpretando...</span>
               </>
             ) : (
               <>
-                <Mic className="w-4 h-4" />
+                <Mic className="w-4 h-4" strokeWidth={1.75} />
                 <span>Dictar por Voz</span>
               </>
             )}

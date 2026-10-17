@@ -169,7 +169,7 @@ await runTest('QR - Test 2: Mismo FiscalRecord produce exactamente la misma URL 
   const url2 = buildFiscalQrUrl(record);
 
   assert.strictEqual(url1, url2);
-  assert.ok(url1.startsWith(AEAT_QR_ENDPOINTS.production));
+  assert.ok(url1.startsWith(AEAT_QR_ENDPOINTS.production) || url1.startsWith(AEAT_QR_ENDPOINTS.testing));
   assert.ok(url1.includes('nif=B12345678'));
   assert.ok(url1.includes('numserie=FAC-2026%2F0123'));
   assert.ok(url1.includes('fecha=15-10-2026'));

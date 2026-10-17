@@ -780,102 +780,92 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
   return (
     <>
       <div className={`space-y-4 max-w-4xl mx-auto pb-20 ${documentoImprimir ? 'print:hidden' : ''}`}>
-        {/* 1. HERO CARD SUPERIOR ESTILO LIMPIO */}
-      <div className="bg-gradient-to-r from-amber-600 via-amber-500 to-amber-600 rounded-2xl p-5 text-white shadow-md transition-all">
-        <div className="flex items-start justify-between gap-3">
-          <div className="space-y-1">
-            <h2 className="text-xl sm:text-2xl font-black tracking-tight text-white">
-              Ventas, Albaranes y Facturación
-            </h2>
-            <p className="text-amber-100 text-xs sm:text-sm font-medium flex items-center gap-2">
-              <span>{clientes.length} Clientes Comerciales</span>
-              <span>•</span>
-              <span>{albaranesPendientes.length} Albaranes por Facturar</span>
-            </p>
+        {/* 1. HERO CARD APPLE HIG */}
+        <div className="apple-card p-5 sm:p-6 transition-all">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                  <Receipt className="w-4 h-4" strokeWidth={1.75} />
+                </div>
+                <h2 className="text-lg sm:text-xl font-semibold tracking-tight text-neutral-900 dark:text-white">
+                  Ventas y Facturación Veri*Factu
+                </h2>
+              </div>
+              <p className="text-neutral-500 dark:text-neutral-400 text-xs font-normal flex items-center gap-2">
+                <span>{clientes.length} clientes comerciales</span>
+                <span>·</span>
+                <span>{albaranesPendientes.length} albaranes por facturar</span>
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 self-start sm:self-auto">
+              <button
+                type="button"
+                onClick={() => {
+                  setTipoNuevoDoc(subTab === 'facturas' ? 'factura_directa' : 'albaran');
+                  setMostrarModalNuevoDoc(true);
+                }}
+                className="flex items-center gap-1.5 px-3 py-2 bg-black/[0.04] dark:bg-white/[0.06] hover:bg-black/[0.08] dark:hover:bg-white/[0.1] text-neutral-800 dark:text-neutral-200 text-xs sm:text-sm font-medium rounded-lg transition-all cursor-pointer border border-black/[0.06] dark:border-white/[0.08]"
+                title="Abrir formulario y dictar albarán o factura por voz con IA"
+              >
+                <Mic className="w-4 h-4 text-blue-500" strokeWidth={1.75} />
+                <span>Dictar por Voz</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMostrarModalNuevoDoc(true)}
+                className="apple-btn-primary flex items-center gap-1.5 px-4 py-2 text-xs sm:text-sm font-medium cursor-pointer"
+              >
+                <Plus className="w-4 h-4" strokeWidth={2} />
+                <span>Nueva Venta</span>
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setTipoNuevoDoc(subTab === 'facturas' ? 'factura_directa' : 'albaran');
-                setMostrarModalNuevoDoc(true);
-              }}
-              className="flex items-center gap-1.5 px-3.5 py-2 bg-amber-700/70 hover:bg-amber-800 text-white font-bold text-xs sm:text-sm rounded-xl shadow-xs transition-all cursor-pointer border border-amber-400/40 hover:scale-[1.02]"
-              title="Abrir formulario y dictar albarán o factura por voz con IA"
-            >
-              <Mic className="w-4 h-4 text-amber-200" />
-              <span>Dictar por Voz</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setMostrarModalNuevoDoc(true)}
-              className="flex items-center gap-1.5 px-4 py-2 bg-white text-amber-800 hover:bg-amber-50 font-bold text-xs sm:text-sm rounded-xl shadow-sm transition-all cursor-pointer hover:shadow"
-            >
-              <Plus className="w-4 h-4 text-amber-600" />
-              <span>Nueva Venta</span>
-            </button>
+          <div className="grid grid-cols-3 gap-3 mt-5 pt-4 border-t border-black/[0.05] dark:border-white/[0.06]">
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Facturación Total</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{totalFacturado.toFixed(2)} €</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Pendiente Facturar</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-amber-600 dark:text-amber-400">{albaranesPendientesImporte.toFixed(2)} €</strong>
+            </div>
+            <div>
+              <span className="text-[11px] text-neutral-400 dark:text-neutral-500 block font-medium">Albaranes Emitidos</span>
+              <strong className="text-base sm:text-lg font-semibold tabular-nums text-neutral-900 dark:text-white">{albaranes.length}</strong>
+            </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-amber-400/40 text-xs text-white">
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Facturación Total</span>
-            <strong className="text-sm sm:text-base font-bold">{totalFacturado.toFixed(2)} €</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Pendiente Facturar</span>
-            <strong className="text-sm sm:text-base font-bold text-amber-100">{albaranesPendientesImporte.toFixed(2)} €</strong>
-          </div>
-          <div>
-            <span className="text-[10px] text-amber-200 block uppercase font-semibold">Albaranes Emitidos</span>
-            <strong className="text-sm sm:text-base font-bold">{albaranes.length} albaranes</strong>
+        {/* 2. SUB-PESTAÑAS ESTILO APPLE SEGMENTED CONTROL */}
+        <div className="flex justify-center sm:justify-start">
+          <div className="apple-segmented-bar w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={() => setSubTab('albaranes')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'albaranes' ? 'active' : ''}`}
+            >
+              Albaranes ({albaranes.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('facturas')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'facturas' ? 'active' : ''}`}
+            >
+              Facturas ({facturas.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('agrupar_albaranes')}
+              className={`apple-segmented-btn flex-1 sm:flex-initial text-center cursor-pointer ${subTab === 'agrupar_albaranes' ? 'active' : ''}`}
+            >
+              Facturar Albaranes ({albaranesPendientes.length})
+            </button>
           </div>
         </div>
-      </div>
-
-      {/* 2. SUB-PESTAÑAS */}
-      <div className="flex border-b border-stone-200 justify-around text-xs sm:text-sm font-bold tracking-wider text-stone-500">
-        <button
-          type="button"
-          onClick={() => setSubTab('albaranes')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'albaranes' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Albaranes ({albaranes.length})</span>
-          {subTab === 'albaranes' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('facturas')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'facturas' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Facturas ({facturas.length})</span>
-          {subTab === 'facturas' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSubTab('agrupar_albaranes')}
-          className={`pb-3 px-3 transition-colors uppercase cursor-pointer relative ${
-            subTab === 'agrupar_albaranes' ? 'text-amber-600' : 'hover:text-stone-800'
-          }`}
-        >
-          <span>Facturar Albaranes ({albaranesPendientes.length})</span>
-          {subTab === 'agrupar_albaranes' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-amber-500 rounded-full" />
-          )}
-        </button>
-      </div>
 
       {/* 3. CONTENIDO SEGÚN SUB-PESTAÑA */}
 
@@ -947,62 +937,59 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
               </button>
             </div>
           ) : (
-            <div className="bg-white border border-stone-200 rounded-2xl divide-y divide-stone-100 shadow-xs overflow-hidden">
+            <div className="apple-card divide-y divide-black/[0.04] dark:divide-white/[0.06] overflow-hidden">
               {albaranesFiltrados.map(alb => {
                 const estaExpandido = Boolean(docsExpandidos[alb.id]);
                 const totalEstuches = alb.lineas.reduce((acc, l) => acc + l.cantidadEstuches, 0);
 
                 return (
-                  <div key={alb.id} className="transition-colors hover:bg-amber-50/30">
+                  <div key={alb.id} className="transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.03]">
                     <div
                       onClick={() => toggleExpandir(alb.id)}
                       className="p-3.5 sm:p-4 flex items-center justify-between gap-3 cursor-pointer select-none"
                     >
                       <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-10 h-10 rounded-full bg-amber-100/90 border border-amber-200 text-amber-800 flex items-center justify-center shrink-0 shadow-xs">
-                          <Receipt className="w-5 h-5 text-amber-700" />
+                        <div className="w-9 h-9 rounded-xl bg-neutral-100 dark:bg-neutral-800 border border-black/[0.05] dark:border-white/[0.07] text-neutral-600 dark:text-neutral-300 flex items-center justify-center shrink-0">
+                          <Receipt className="w-4 h-4" strokeWidth={1.5} />
                         </div>
 
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-bold text-stone-900 text-sm tracking-tight font-mono">
+                            <span className="font-semibold text-neutral-900 dark:text-white text-sm tracking-tight font-mono tabular-nums">
                               {alb.numeroAlbaran}
                             </span>
-                            <span className="text-xs font-semibold text-stone-700 truncate max-w-[180px]">
+                            <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300 truncate max-w-[180px]">
                               {alb.clienteNombre}
                             </span>
-                            <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded-full ${
-                              alb.estado === 'pendiente_facturar'
-                                ? 'bg-amber-100 text-amber-900 border border-amber-300'
-                                : 'bg-emerald-100 text-emerald-800'
-                            }`}>
-                              {alb.estado === 'pendiente_facturar' ? 'Pendiente' : 'Facturado'}
+                            <span className="inline-flex items-center gap-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+                              <span className={`w-1.5 h-1.5 rounded-full ${alb.estado === 'pendiente_facturar' ? 'bg-amber-500' : 'bg-emerald-500'}`} />
+                              <span className="text-[11px] font-medium">{alb.estado === 'pendiente_facturar' ? 'Pendiente' : 'Facturado'}</span>
                             </span>
                           </div>
-                          <p className="text-xs text-stone-500 flex items-center gap-1.5 mt-0.5">
-                            <Calendar className="w-3 h-3 text-stone-400" />
+                          <p className="text-xs text-neutral-400 dark:text-neutral-500 flex items-center gap-1.5 mt-0.5">
+                            <Calendar className="w-3 h-3 text-neutral-400" />
                             <span>Fecha: {formatearFechaES(alb.fecha)}</span>
-                            <span>•</span>
-                            <span>{totalEstuches} estuches entregados</span>
+                            <span>·</span>
+                            <span className="tabular-nums">{totalEstuches} estuches</span>
                           </p>
                         </div>
                       </div>
 
                       <div className="flex items-center gap-3 text-right shrink-0">
                         <div>
-                          <span className="text-sm font-black text-stone-900 block">
+                          <span className="text-sm font-semibold tabular-nums text-neutral-900 dark:text-white block">
                             {alb.totales.totalDocumento.toFixed(2)} €
                           </span>
-                          <span className="text-[11px] text-stone-500 font-medium block">
+                          <span className="text-[11px] text-neutral-400 dark:text-neutral-500 tabular-nums font-normal block">
                             Base: {alb.totales.baseImponible.toFixed(2)} €
                           </span>
                         </div>
 
-                        <div className="text-stone-400 p-1">
+                        <div className="text-neutral-400 p-1">
                           {estaExpandido ? (
-                            <ChevronDown className="w-4 h-4 text-amber-600" />
+                            <ChevronDown className="w-4 h-4 text-neutral-600 dark:text-neutral-300" strokeWidth={1.75} />
                           ) : (
-                            <ChevronRight className="w-4 h-4" />
+                            <ChevronRight className="w-4 h-4" strokeWidth={1.75} />
                           )}
                         </div>
                       </div>
@@ -1187,73 +1174,64 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
               </p>
             </div>
           ) : (
-            <div className="bg-white border border-stone-200 rounded-2xl divide-y divide-stone-100 shadow-xs overflow-hidden">
+            <div className="apple-card divide-y divide-black/[0.04] dark:divide-white/[0.06] overflow-hidden">
               {facturasFiltradas.map(fac => {
                 const estaExpandido = Boolean(docsExpandidos[fac.id]);
 
                 return (
-                  <div key={fac.id} className="transition-colors hover:bg-amber-50/30">
+                  <div key={fac.id} className="transition-colors hover:bg-black/[0.02] dark:hover:bg-white/[0.03]">
                     <div
                       onClick={() => toggleExpandir(fac.id)}
                       className="p-3.5 sm:p-4 flex items-center justify-between gap-3 cursor-pointer select-none"
                     >
                       <div className="flex items-center gap-3 min-w-0">
-                        <div className={`w-10 h-10 rounded-full border flex items-center justify-center shrink-0 shadow-xs ${
+                        <div className={`w-9 h-9 rounded-xl border flex items-center justify-center shrink-0 ${
                           fac.esRectificativa
-                            ? 'bg-amber-700 text-white border-amber-800'
-                            : 'bg-amber-100/90 border border-amber-200 text-amber-800'
+                            ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20'
+                            : 'bg-neutral-100 dark:bg-neutral-800 border-black/[0.05] dark:border-white/[0.07] text-neutral-600 dark:text-neutral-300'
                         }`}>
-                          <FileText className="w-5 h-5" />
+                          <FileText className="w-4 h-4" strokeWidth={1.5} />
                         </div>
 
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-bold text-stone-900 text-sm tracking-tight font-mono">
+                            <span className="font-semibold text-neutral-900 dark:text-white text-sm tracking-tight font-mono tabular-nums">
                               {fac.numeroFactura}
                             </span>
-                            <span className="text-xs font-semibold text-stone-700 truncate max-w-[180px]">
+                            <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300 truncate max-w-[180px]">
                               {fac.clienteNombre}
                             </span>
 
-                            {fac.esRectificativa ? (
-                              <span className="text-[9px] font-bold bg-amber-700 text-white px-1.5 py-0.5 rounded-full">
-                                RECTIFICATIVA
-                              </span>
-                            ) : fac.esVentaDirecta ? (
-                              <span className="text-[9px] font-bold bg-stone-100 text-stone-600 px-1.5 py-0.2 rounded-full">
-                                DIRECTA
-                              </span>
-                            ) : (
-                              <span className="text-[9px] font-bold bg-amber-200 text-amber-900 px-1.5 py-0.2 rounded-full">
-                                {fac.albaranesAsociados.length} ALBARANES
-                              </span>
-                            )}
+                            <span className="text-[11px] font-medium text-neutral-500 dark:text-neutral-400">
+                              · {fac.esRectificativa ? 'Rectificativa' : fac.esVentaDirecta ? 'Venta Directa' : `${fac.albaranesAsociados.length} albaranes`}
+                            </span>
 
                             {fac.estadoRectificacion === 'rectificada_total' && (
-                              <span className="text-[9px] font-bold bg-red-100 text-red-800 border border-red-300 px-1.5 py-0.5 rounded-full">
-                                RECTIFICADA ({fac.rectificadaPorNumero})
+                              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-rose-600 dark:text-rose-400">
+                                <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                                <span>Rectificada ({fac.rectificadaPorNumero})</span>
                               </span>
                             )}
 
                             {fac.hashActual && (
                               <span
-                                className="text-[9px] font-mono font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded-full hidden sm:inline-flex items-center gap-1"
+                                className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400 hidden sm:inline-flex items-center gap-1"
                                 title={`Huella Digital SHA-256 Veri*Factu: ${fac.hashActual}`}
                               >
-                                <ShieldCheck className="w-2.5 h-2.5 text-emerald-600" />
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                 <span>SHA: {fac.hashActual.slice(0, 8)}...</span>
                               </span>
                             )}
                           </div>
-                          <p className="text-xs text-stone-500 flex items-center gap-1.5 mt-0.5">
-                            <Calendar className="w-3 h-3 text-stone-400" />
+                          <p className="text-xs text-neutral-400 dark:text-neutral-500 flex items-center gap-1.5 mt-0.5">
+                            <Calendar className="w-3 h-3 text-neutral-400" />
                             <span>Fecha: {formatearFechaES(fac.fecha)}</span>
-                            <span>•</span>
+                            <span>·</span>
                             <span className="capitalize">{fac.formaPago}</span>
                             {fac.esRectificativa && fac.facturaRectificadaNumero && (
                               <>
-                                <span>•</span>
-                                <span className="text-amber-800 font-semibold font-mono">
+                                <span>·</span>
+                                <span className="text-amber-600 dark:text-amber-400 font-mono">
                                   Origen: {fac.facturaRectificadaNumero}
                                 </span>
                               </>
@@ -1264,12 +1242,12 @@ export const VentasFacturacionView: React.FC<VentasFacturacionViewProps> = ({
 
                       <div className="flex items-center gap-3 text-right shrink-0">
                         <div>
-                          <span className={`text-sm font-black block ${
-                            fac.totales.totalDocumento < 0 ? 'text-red-700 font-mono' : 'text-stone-900'
+                          <span className={`text-sm font-semibold tabular-nums block ${
+                            fac.totales.totalDocumento < 0 ? 'text-rose-600 dark:text-rose-400' : 'text-neutral-900 dark:text-white'
                           }`}>
                             {fac.totales.totalDocumento.toFixed(2)} €
                           </span>
-                          <span className="text-[11px] text-stone-500 font-medium block">
+                          <span className="text-[11px] text-neutral-400 dark:text-neutral-500 tabular-nums font-normal block">
                             IVA: {fac.totales.cuotaIva.toFixed(2)} €
                           </span>
                         </div>
